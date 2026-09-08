@@ -12,8 +12,8 @@ import tempfile
 from pathlib import Path
 
 from harness.common import (HarnessError, atomic_text, cli, file_hash, identifier,
-                            now, number, object_hash, parse_json, read_json,
-                            write_json, write_jsonl)
+                            ingest_content_hash, now, number, object_hash, parse_json,
+                            read_json, write_json, write_jsonl)
 from harness.config import load_config
 from harness.freeze import remove_tree, tree_hashes, verify_wiki
 from harness.vlm import VLMClient
@@ -79,11 +79,12 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
     identifier(video_id, "video_id")
     video = video.resolve()
     source_hash = file_hash(video)
-    ingest_hash = object_hash(cfg["ingest"])
+    content_hash = ingest_content_hash(cfg)
     if output.exists():
         metadata = read_json(output / "ingest.json")
-        if (metadata["source_sha256"], metadata["ingest_config_hash"], metadata["video_id"]) != (
-                source_hash, ingest_hash, video_id):
+        stored_hash = ingest_content_hash({"ingest": metadata["ingest_config"]})
+        if (metadata["source_sha256"], stored_hash, metadata["video_id"]) != (
+                source_hash, content_hash, video_id):
             raise HarnessError("Existing ingest uses different video/settings; choose a new wiki root")
         if (output / "frozen.json").exists():
             verify_wiki(output)
@@ -121,7 +122,9 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
             raise HarnessError("Source video changed during ingest")
         metadata = {"version": 1, "video_id": video_id, "duration": duration,
                     "source_sha256": source_hash, "ingest_config": cfg["ingest"],
-                    "ingest_config_hash": ingest_hash, "created_at": now(),
+                    # Hash of content-determining settings only (not base_url/
+                    # timeout/retries); see ingest_content_hash for the rationale.
+                    "ingest_config_hash": content_hash, "created_at": now(),
                     "ffmpeg_version": media_command(["ffmpeg", "-version"]).splitlines()[0],
                     "content_hashes": tree_hashes(staging)}
         write_json(staging / "ingest.json", metadata)
@@ -131,6 +134,14 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         if staging is not None and staging.exists():
             remove_tree(staging)
         lock.unlink(missing_ok=True)
+        # If we never produced output, remove the (now empty) parent directory
+        # so a failed ingest leaves no trace at all. rmdir only succeeds when
+        # empty (non-empty = concurrent ingest or other videos: leave it).
+        if not output.exists():
+            try:
+                output.parent.rmdir()
+            except OSError:
+                pass
 
 
 def main():

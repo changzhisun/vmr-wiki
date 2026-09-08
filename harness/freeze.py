@@ -9,8 +9,8 @@ import argparse
 import shutil
 from pathlib import Path
 
-from harness.common import (HarnessError, cli, file_hash, object_hash, read_json,
-                            write_json)
+from harness.common import (HarnessError, cli, file_hash, ingest_content_hash,
+                            object_hash, read_json, write_json)
 from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_videos
 
@@ -83,13 +83,13 @@ def freeze_dataset(cfg: dict, *, split: str | None = None) -> dict:
     # Preflight every video before applying any read-only permissions.
     for vid, video in videos.items():
         metadata = read_json(root / vid / "ingest.json")
-        if metadata["video_id"] != vid or metadata["ingest_config_hash"] != object_hash(cfg["ingest"]):
+        if metadata["video_id"] != vid or ingest_content_hash({"ingest": metadata["ingest_config"]}) != ingest_content_hash(cfg):
             raise HarnessError(f"{vid}: video ID or ingest settings do not match")
         if abs(metadata["duration"] - video["duration"]) > 0.1:
             raise HarnessError(f"{vid}: media duration differs from dataset by more than 0.1s")
     seals = {vid: freeze_wiki(root / vid) for vid in videos}
     manifest = {"version": 2, "dataset": cfg["dataset"]["name"], "split": split,
-                "ingest_config_hash": object_hash(cfg["ingest"]),
+                "ingest_config_hash": ingest_content_hash(cfg),
                 "videos": {vid: seal["wiki_hash"] for vid, seal in seals.items()}}
     # Freeze individual videos only. Other splits may add new videos later;
     # experiments pin their selected video hashes in experiment.json.

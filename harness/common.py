@@ -87,6 +87,29 @@ def object_hash(value: Any) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+# Ingest settings that actually determine caption content. Transport, auth, and
+# retry settings are deliberately excluded: changing the VLM endpoint, the API
+# key environment variable, the request timeout, or the retry count must not
+# invalidate an existing ingest.
+_INGEST_CONTENT_KEYS = frozenset({"sample_interval_sec", "image_max_size", "jpeg_quality"})
+_VLM_CONTENT_KEYS = frozenset({"model", "prompt", "temperature", "max_tokens"})
+
+
+def ingest_content_hash(cfg: dict) -> str:
+    """SHA-256 of the ingest settings that determine caption content.
+
+    Excludes ``vlm.base_url``, ``vlm.api_key_env``, ``vlm.timeout_sec`` and
+    ``vlm.max_retries`` (transport/retry behavior, not output), so switching
+    VLM endpoints or tightening timeouts does not force a full re-ingest.
+    """
+    ingest = cfg["ingest"]
+    vlm = ingest["vlm"]
+    return object_hash({
+        **{key: ingest[key] for key in sorted(_INGEST_CONTENT_KEYS)},
+        "vlm": {key: vlm[key] for key in sorted(_VLM_CONTENT_KEYS)},
+    })
+
+
 def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:

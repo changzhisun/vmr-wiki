@@ -14,7 +14,7 @@ import yaml
 
 from agents.runner import DockerRunner
 from harness.common import (HarnessError, atomic_text, cli, file_hash, identifier,
-                            now, object_hash, read_json, write_json)
+                            ingest_content_hash, now, object_hash, read_json, write_json)
 from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_query_inputs
 from harness.freeze import verify_wiki
@@ -39,8 +39,9 @@ class Experiment:
         self.wiki_root = dataset_path(cfg, "wiki") / "videos"
         self.freeze = {"dataset": dataset_metadata["name"], "split": self.split, "videos": {}}
         for vid, video in self.videos.items():
+            ingest_meta = read_json(self.wiki_root / vid / "ingest.json")
             seal = verify_wiki(self.wiki_root / vid)
-            if seal["ingest_config_hash"] != object_hash(cfg["ingest"]) or seal["video_id"] != vid:
+            if ingest_content_hash({"ingest": ingest_meta["ingest_config"]}) != ingest_content_hash(cfg) or seal["video_id"] != vid:
                 raise HarnessError(f"Frozen dataset wiki mismatch: {vid}")
             self.freeze["videos"][vid] = seal["wiki_hash"]
             if abs(seal["duration"] - video["duration"]) > 0.1:

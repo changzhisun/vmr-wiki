@@ -32,7 +32,7 @@ import json, os
 from pathlib import Path
 task = json.loads(Path("task.json").read_text())
 print(os.getpid())
-result = {"query_id": task["query_id"], "video_id": task["video_id"], "moments": [
+result = {"query_id": task["query_id"], "video_id": task["video_id"], "split": task["split"], "moments": [
     {"start_sec": 0, "end_sec": 1, "score": 0.9, "evidence": "red scene"},
     {"start_sec": 2, "end_sec": 3, "score": 0.8, "evidence": "red scene"}]}
 Path("output/prediction.json").write_text(json.dumps(result))
@@ -119,7 +119,8 @@ def test_interrupted_attempt_is_finalized_without_second_process(frozen):
     with Experiment(cfg, "test", runner=runner) as experiment:
         query = experiment.queries[0]
         write_json(experiment.root / "run_metadata" / "1.json", {
-            "query_id": "1", "video_id": "video", "status": "running",
+            "query_id": "1", "video_id": "video", "dataset": cfg["dataset"]["name"],
+            "split": cfg["dataset"]["split"], "status": "running",
             "started_at": "2026-09-08T00:00:00+00:00", "finished_at": None,
         })
         result = experiment.run(query)

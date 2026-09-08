@@ -53,10 +53,11 @@ def prepared(cfg, tmp_path):
     raw = tmp_path / "annotations.jsonl"
     write_jsonl(raw, [
         {"qid": i, "vid": "video", "duration": 3.0, "query": f"Find red scene {i}",
-         "relevant_windows": [[0.0, 1.0], [2.0, 3.0]]} for i in range(1, 4)
+         "split": "train", "relevant_windows": [[0.0, 1.0], [2.0, 3.0]]} for i in range(1, 4)
     ])
     dataset = Path(cfg["paths"]["datasets"]) / "qvhighlights"
-    QVHighlightsAdapter().prepare(raw, video_root, dataset)
+    QVHighlightsAdapter().prepare(raw, video_root, dataset, split="train")
+    cfg["dataset"]["split"] = "train"
     return cfg, Captioner()
 
 

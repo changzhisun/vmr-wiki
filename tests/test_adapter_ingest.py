@@ -15,7 +15,7 @@ def test_adapter_preserves_all_gt_and_hides_labels(prepared):
     queries = read_jsonl(dataset / "queries.jsonl")
     truth = read_jsonl(dataset / "ground_truth.jsonl")
     assert len(queries) == 3
-    assert all(set(q) == {"query_id", "video_id", "query"} for q in queries)
+    assert all(set(q) == {"query_id", "video_id", "query", "split"} for q in queries)
     assert all(len(g["moments"]) == 2 for g in truth)
     assert len(read_jsonl(dataset / "videos.jsonl")) == 1
 
@@ -52,7 +52,7 @@ def test_ingest_once_query_independent_and_freeze(prepared):
     ingest_all(cfg, captioner=captioner)
     ingest_all(cfg, captioner=captioner)
     assert captioner.calls == 3
-    root = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "video"
+    root = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos" / "video"
     frames = read_jsonl(root / "frames.jsonl")
     assert [f["timestamp"] for f in frames] == [0.0, 1.0, 2.0]
     assert all(set(f) == {"frame_id", "timestamp", "frame", "caption"} for f in frames)
@@ -69,7 +69,7 @@ def test_ingest_once_query_independent_and_freeze(prepared):
 
 def test_frame_tampering_detected(frozen):
     cfg, _ = frozen
-    root = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "video"
+    root = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos" / "video"
     image = root / "frames" / "000001.jpg"
     image.chmod(0o644)
     image.write_bytes(b"corrupted")
@@ -86,4 +86,26 @@ def test_failed_ingest_has_no_partial_output(prepared):
         ingest_all(cfg, captioner=BrokenCaptioner())
     wiki = Path(cfg["paths"]["wiki"]) / "qvhighlights"
     assert list(wiki.iterdir()) == []
+
+
+def test_cache_invalidates_on_content_settings_not_on_transport(prepared):
+    cfg, captioner = prepared
+    ingest_all(cfg, captioner=captioner)
+    assert captioner.calls == 3
+
+    # Transport-only changes (endpoint, timeout, retries) must NOT invalidate
+    # an existing ingest: verification reuses the cached captions.
+    cfg["ingest"]["vlm"]["base_url"] += "/other"
+    cfg["ingest"]["vlm"]["timeout_sec"] = 30
+    cfg["ingest"]["vlm"]["max_retries"] = 5
+    ingest_all(cfg, captioner=captioner)
+    assert captioner.calls == 3
+
+    # A content-determining change (model) MUST invalidate the cache.
+    cfg["ingest"]["vlm"]["base_url"] = cfg["ingest"]["vlm"]["base_url"].removesuffix("/other")
+    cfg["ingest"]["vlm"]["timeout_sec"] = 120
+    cfg["ingest"]["vlm"]["max_retries"] = 3
+    cfg["ingest"]["vlm"]["model"] = "other-model"
+    with pytest.raises(HarnessError, match="different video/settings"):
+        ingest_all(cfg, captioner=captioner, jobs=1)
 
