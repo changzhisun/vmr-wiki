@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from adapters.qvhighlights import QVHighlightsAdapter
-from harness.common import (HarnessError, ingest_content_hash, read_json, read_jsonl,
+from harness.common import (HarnessError, ingest_content_hash, parse_json, read_json, read_jsonl,
                             write_json, write_jsonl)
 from harness.config import load_config
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
@@ -113,6 +113,25 @@ def test_dense_events_are_strict_and_use_only_window_timestamps():
         ]}), [0.0, 1.0, 2.0])
     with pytest.raises(HarnessError, match="only events"):
         parse_dense_events('{"events":[],"summary":"extra"}', [0.0])
+
+
+def test_dense_events_accept_markdown_json_fence_but_not_prose():
+    payload = {"events": [{"start": 0, "end": 1, "caption": "A door opens."}]}
+    inner = json.dumps(payload)
+    expected = [{"start": 0.0, "end": 1.0, "caption": "A door opens."}]
+    timeline = [0.0, 1.0]
+    for text in (
+        f"```json\n{inner}\n```",
+        f"```JSON\n{inner}\n```",
+        f"```\n{inner}\n```",
+        f"```json\n{inner}```",
+        f"\n```json\n{inner}\n```\n",
+    ):
+        assert parse_dense_events(text, timeline) == expected
+    with pytest.raises(HarnessError, match="Invalid JSON"):
+        parse_dense_events(f"Here is the JSON:\n```json\n{inner}\n```", timeline)
+    with pytest.raises(HarnessError):
+        parse_json(f"```json\n{inner}\n```")
 
 
 def test_ingest_once_query_independent_and_freeze(prepared):

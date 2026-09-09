@@ -7,6 +7,7 @@ if __package__ in (None, ""):
 
 import argparse
 import math
+import re
 import subprocess
 import tempfile
 import threading
@@ -90,14 +91,30 @@ def caption_windows(frames: list[dict], window_frames: int, stride_frames: int) 
     return [frames[start:start + window] for start in range(0, len(frames), stride)]
 
 
+# Whole-response Markdown fence only. Prose around a fence, or a fence in the
+# middle of other text, is still invalid: we unwrap the wrapper, not the JSON.
+_MARKDOWN_JSON_FENCE = re.compile(
+    r"\A```(?:json)?[ \t]*\r?\n(?P<body>.*?)[ \t]*\r?\n?```\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def unwrap_markdown_json_fence(text: str) -> str:
+    """Strip a surrounding ```json fence. Do not extract JSON from other prose."""
+    stripped = text.strip()
+    match = _MARKDOWN_JSON_FENCE.fullmatch(stripped)
+    return match.group("body").strip() if match else stripped
+
+
 def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
     """Validate and normalize one dense-caption response.
 
     Event boundaries must select timestamps from the window verbatim. This
     prevents the captioner from inventing temporal precision unavailable in
-    the sampled frames.
+    the sampled frames. A surrounding Markdown code fence is discarded; the
+    JSON object itself is not repaired.
     """
-    payload = parse_json(text)
+    payload = parse_json(unwrap_markdown_json_fence(text))
     if not isinstance(payload, dict) or set(payload) != {"events"}:
         raise HarnessError("Dense caption must be an object containing only events")
     events = payload["events"]
