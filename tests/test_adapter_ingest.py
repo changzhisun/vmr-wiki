@@ -115,6 +115,27 @@ def test_dense_events_are_strict_and_use_only_window_timestamps():
         parse_dense_events('{"events":[],"summary":"extra"}', [0.0])
 
 
+def test_dense_events_map_frame_indices_onto_shifted_windows():
+    timeline = [115.0, 116.0, 117.0, 118.0]
+    assert parse_dense_events(json.dumps({"events": [
+        {"start": 0, "end": 1, "caption": "A person enters."},
+        {"start": 2, "end": 3, "caption": "The person stops."},
+    ]}), timeline) == [
+        {"start": 115.0, "end": 116.0, "caption": "A person enters."},
+        {"start": 117.0, "end": 118.0, "caption": "The person stops."},
+    ]
+    assert parse_dense_events(json.dumps({"events": [
+        {"start": 115, "end": 118, "caption": "Absolute times."},
+    ]}), timeline) == [
+        {"start": 115.0, "end": 118.0, "caption": "Absolute times."},
+    ]
+    with pytest.raises(HarnessError, match=r"window=\[115.0, 116.0, 117.0, 118.0\]"):
+        parse_dense_events(
+            '{"events":[{"start":114,"end":115,"caption":"Before the window."}]}',
+            timeline,
+        )
+
+
 def test_dense_events_accept_markdown_json_fence_but_not_prose():
     payload = {"events": [{"start": 0, "end": 1, "caption": "A door opens."}]}
     inner = json.dumps(payload)

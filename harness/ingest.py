@@ -106,13 +106,50 @@ def unwrap_markdown_json_fence(text: str) -> str:
     return match.group("body").strip() if match else stripped
 
 
+_TIMESTAMP_EPS = 1e-9
+
+
+def _on_timeline(value: float, timestamps: list[float]) -> float | None:
+    for stamp in timestamps:
+        if abs(value - stamp) <= _TIMESTAMP_EPS:
+            return stamp
+    return None
+
+
+def _as_window_index(value: float, count: int) -> int | None:
+    nearest = round(value)
+    if abs(value - nearest) > _TIMESTAMP_EPS:
+        return None
+    index = int(nearest)
+    if 0 <= index < count:
+        return index
+    return None
+
+
+def resolve_window_timestamp(value: float, timestamps: list[float]) -> float | None:
+    """Map a model timestamp onto this window's sampled times.
+
+    Absolute times already on the timeline win. Otherwise a whole number in
+    ``[0, len(timestamps))`` is treated as a frame index: models often emit
+    0..n-1 for a window that actually starts at t=115s.
+    """
+    matched = _on_timeline(value, timestamps)
+    if matched is not None:
+        return matched
+    index = _as_window_index(value, len(timestamps))
+    if index is not None:
+        return timestamps[index]
+    return None
+
+
 def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
     """Validate and normalize one dense-caption response.
 
     Event boundaries must select timestamps from the window verbatim. This
     prevents the captioner from inventing temporal precision unavailable in
     the sampled frames. A surrounding Markdown code fence is discarded; the
-    JSON object itself is not repaired.
+    JSON object itself is not repaired. Whole-number frame indices are mapped
+    onto the window timeline.
     """
     payload = parse_json(unwrap_markdown_json_fence(text))
     if not isinstance(payload, dict) or set(payload) != {"events"}:
@@ -120,7 +157,7 @@ def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
     events = payload["events"]
     if not isinstance(events, list):
         raise HarnessError("Dense caption events must be a list")
-    allowed = set(timestamps)
+    window = ", ".join(str(stamp) for stamp in timestamps)
     normalized = []
     previous_start: float | None = None
     for index, event in enumerate(events, 1):
@@ -128,10 +165,17 @@ def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
             raise HarnessError(
                 f"Dense caption event {index} must contain only start, end, and caption"
             )
-        start = number(event["start"], f"dense event {index} start")
-        end = number(event["end"], f"dense event {index} end")
-        if start not in allowed or end not in allowed:
-            raise HarnessError(f"Dense caption event {index} uses a timestamp outside its window")
+        start = resolve_window_timestamp(
+            number(event["start"], f"dense event {index} start"), timestamps
+        )
+        end = resolve_window_timestamp(
+            number(event["end"], f"dense event {index} end"), timestamps
+        )
+        if start is None or end is None:
+            raise HarnessError(
+                f"Dense caption event {index} uses a timestamp outside its window "
+                f"(start={event['start']!r}, end={event['end']!r}; window=[{window}])"
+            )
         if start > end:
             raise HarnessError(f"Dense caption event {index} start must be <= end")
         if previous_start is not None and start < previous_start:

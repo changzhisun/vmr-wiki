@@ -177,7 +177,7 @@ python harness/ingest_all.py --dataset qvhighlights --split val --freeze
 python harness/freeze.py --dataset qvhighlights --split val
 ```
 
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内文件名和采样时间替换进 `{{FRAME_TIMESTAMPS}}`，严格要求 VLM 返回只使用这些时间点的有序事件 JSON；Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内文件名和采样时间替换进 `{{FRAME_TIMESTAMPS}}`，要求 VLM 返回只使用这些时间点的有序事件 JSON；若模型把 `start`/`end` 写成 `0..n-1` 的帧序号，会映射回该窗口的采样时间，其它时刻仍直接拒绝。Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
 
 每个视频输出：
 
@@ -194,7 +194,7 @@ wiki/qvhighlights/videos/<video_id>/
 
 Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式；Simple 多图模式的每行包含窗口信息、`frames` 数组和一个窗口 Caption。Dense 模式的每行包含窗口信息、按时间排序的 `frames` 数组和经过校验的 `events` 数组，每个事件都包含来自当前窗口时间线的 `start`、`end` 及 Caption。`wiki.md` 按窗口列出 Dense 事件时间范围及对应图片。重叠窗口的原始事件会完整保留，不做语义合并。
 
-完整 Ingest 再次执行时只核验并复用，不重新 caption。失败的临时输出被清除；API 仅对临时网络错误、限流和服务端错误做有限重试，达到 Token 上限的截断响应会直接失败。Dense 响应若整段包在 Markdown JSON 代码围栏里，只剥掉围栏再解析；字段不符、事件无序、时间越界、使用非采样时间点、或围栏外还有其它文字时同样直接失败，不会静默修复语义。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
+完整 Ingest 再次执行时只核验并复用，不重新 caption。失败的临时输出被清除；API 仅对临时网络错误、限流和服务端错误做有限重试，达到 Token 上限的截断响应会直接失败。Dense 响应若整段包在 Markdown JSON 代码围栏里，只剥掉围栏再解析；`start`/`end` 若是当前窗口的帧序号则映射为采样时间。字段不符、事件无序、时间越界、使用非采样时间点、或围栏外还有其它文字时同样直接失败，不会静默修复语义。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
 
 批量 Ingest 保留 `--jobs`（默认 4）和 `--verbose`。`--jobs 1` 顺序执行；多个 worker 并发处理当前 split 的不同视频，不会对共享 video_id 重复提交任务。Ingest 与批量 Query 的进度条都会显示已完成数量、平均处理速度和预计剩余时间，结束时显示总耗时。收到 Ctrl-C 时，尚未开始的任务立即取消，运行中的 worker 在当前 FFmpeg/VLM 调用结束后的下一个检查点退出并清理 staging 目录；主进程等待 worker 收敛，不会让后台线程继续发布 Wiki。
 
