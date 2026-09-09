@@ -4,10 +4,12 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agents.runner import AgentResult, DockerRunner
 from harness.aggregate import aggregate
 from harness.common import HarnessError, read_json, write_json
+from harness.config import load_config
 from harness.evaluate import evaluate
 from harness.freeze import freeze_dataset
 from harness.ingest_all import ingest_all
@@ -296,3 +298,74 @@ def test_docker_mount_boundary_and_credentials_not_in_command(cfg, monkeypatch, 
     assert "--no-session-persistence" in command
     assert "--append-system-prompt-file" in command
     assert "--strict-mcp-config" in command
+
+
+def test_claude_tool_surface_allows_writing_and_excludes_network_tools(cfg, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-secret")
+    monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
+    cfg["query"]["agent"] = "claude_code"
+    command = DockerRunner(cfg).agent_command()
+    declared = command[command.index("--tools") + 1].split(",")
+    assert "Write" in declared, "without Write the agent cannot produce prediction.json"
+    # --bare pins the tools to Bash, Edit and Read whatever --tools says.
+    assert "--bare" not in command
+    denied = command[command.index("--disallowedTools") + 1:command.index("--append-system-prompt-file")]
+    assert set(denied) == {"Monitor", "PushNotification"}
+    for tool in ("WebSearch", "WebFetch", "Agent", "TaskCreate", "CronCreate"):
+        assert tool not in declared
+
+
+def test_default_base_url_is_not_passed_into_the_container(cfg, monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_API_KEY", "test-secret")
+    monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
+    runner = DockerRunner(cfg)
+    command = runner.docker_command(tmp_path, "test-container", "isolated-network")
+    assert not [arg for arg in command if "BASE_URL" in arg]
+    assert runner.provenance["api_base_url"] is None
+
+
+def test_gateway_base_url_reaches_the_agent_and_provenance(cfg, monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-secret")
+    monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
+    cfg["query"]["agent"] = "claude_code"
+    cfg["query"]["base_url"]["claude_code"] = "https://gateway.example.net/v1"
+    cfg["query"]["egress_allowed_hosts"]["claude_code"] = ["gateway.example.net"]
+    runner = DockerRunner(cfg)
+    command = runner.docker_command(tmp_path, "test-container", "isolated-network")
+    assert "ANTHROPIC_BASE_URL=https://gateway.example.net/v1" in command
+    assert "OPENAI_BASE_URL" not in " ".join(command)
+    assert runner.provenance["api_base_url"] == "https://gateway.example.net/v1"
+
+
+def written_config(tmp_path, **query) -> Path:
+    raw = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text())
+    raw["query"].update(query)
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def test_base_url_defaults_to_the_vendor_endpoint(tmp_path):
+    raw = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text())
+    del raw["query"]["base_url"]
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    assert load_config(path)["query"]["base_url"] == {"codex": None, "claude_code": None}
+
+
+@pytest.mark.parametrize("url, reason", [
+    # The proxy would answer each of these with an opaque 403 or never see them.
+    ("https://gateway.example.net/v1", "not in query.egress_allowed_hosts"),
+    ("http://api.example.net/v1", "must be an https URL"),
+    ("https://api.example.net:8443/v1", "must use port 443"),
+    ("https://user:pw@api.example.net/v1", "must not carry credentials"),
+])
+def test_unreachable_base_url_is_rejected_at_load(tmp_path, url, reason):
+    path = written_config(tmp_path, base_url={"codex": None, "claude_code": url})
+    with pytest.raises(HarnessError, match=reason):
+        load_config(path)
+
+
+def test_base_url_matching_the_allowlist_is_accepted(tmp_path):
+    path = written_config(tmp_path, base_url={"codex": None, "claude_code": "https://api.example.net/v1"})
+    assert load_config(path)["query"]["base_url"]["claude_code"] == "https://api.example.net/v1"

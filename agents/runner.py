@@ -35,8 +35,12 @@ class DockerRunner:
         self.env = {**os.environ, destination: key}
         self.destination_key = destination
         self.allowed_hosts = tuple(cfg["query"]["egress_allowed_hosts"][self.agent])
+        # An OpenAI/Anthropic compatible gateway instead of the vendor default.
+        self.base_url_key = "OPENAI_BASE_URL" if self.agent == "codex" else "ANTHROPIC_BASE_URL"
+        self.base_url = cfg["query"]["base_url"][self.agent]
         self.provenance = {"runtime": "docker", "image_id": self.image,
                            "agent_command": self.agent_command(),
+                           "api_base_url": self.base_url,
                            "egress": {"mode": "allowlist-proxy", "hosts": list(self.allowed_hosts)}}
 
     @staticmethod
@@ -61,6 +65,8 @@ class DockerRunner:
         if "," in str(workspace):
             raise HarnessError("Docker bind paths must not contain commas")
         proxy = "http://egress-proxy:8080"
+        # The endpoint is provenance, not a credential, so it is passed inline.
+        endpoint = ["--env", f"{self.base_url_key}={self.base_url}"] if self.base_url else []
         return ["docker", "run", "--rm", "--interactive", "--init", "--name", name,
                 "--network", network,
                 # Keep Docker's local service discovery for the proxy alias but
@@ -72,7 +78,7 @@ class DockerRunner:
                 "--tmpfs", "/home/node:rw,nosuid,size=256m,uid=1000,gid=1000,mode=700",
                 "--mount", f"type=bind,src={workspace},dst=/workspace,readonly",
                 "--mount", f"type=bind,src={workspace / 'output'},dst=/workspace/output",
-                "--workdir", "/workspace", "--env", self.destination_key,
+                "--workdir", "/workspace", "--env", self.destination_key, *endpoint,
                 "--env", f"HTTPS_PROXY={proxy}", "--env", f"HTTP_PROXY={proxy}",
                 "--env", f"ALL_PROXY={proxy}", "--env", "NO_PROXY=",
                 "--env", "DISABLE_AUTOUPDATER=1", "--env", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",

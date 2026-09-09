@@ -4,6 +4,7 @@ from copy import deepcopy
 import ipaddress
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -22,6 +23,26 @@ def hostname(value, field: str) -> str:
     except ValueError:
         return value
     raise HarnessError(f"{field} must not be an IP address")
+
+
+def endpoint_host(value, field: str) -> str:
+    """Return the host of an agent API endpoint the egress proxy can reach.
+
+    The proxy only tunnels CONNECT to port 443, so any other scheme or port
+    is rejected here rather than surfacing as a proxy 403 inside the agent.
+    """
+    url = urlsplit(nonempty(value, field))
+    if url.scheme != "https":
+        raise HarnessError(f"{field} must be an https URL")
+    try:
+        port = url.port
+    except ValueError as exc:
+        raise HarnessError(f"{field} has an invalid port") from exc
+    if port not in (None, 443):
+        raise HarnessError(f"{field} must use port 443; the egress proxy tunnels no other port")
+    if url.username or url.password or url.query or url.fragment:
+        raise HarnessError(f"{field} must not carry credentials, a query string, or a fragment")
+    return hostname(url.hostname, field)
 
 
 def load_config(path: str | Path = "config.yaml") -> dict:
@@ -68,6 +89,9 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         if number(query["timeout_sec"], "query.timeout_sec") <= 0:
             raise HarnessError("query.timeout_sec must be positive")
         nonempty(query["container_image"], "container_image")
+        query.setdefault("base_url", {})
+        if not isinstance(query["base_url"], dict):
+            raise HarnessError("query.base_url must be a mapping of agent to URL")
         for agent in ("codex", "claude_code"):
             identifier(query["api_key_env"][agent], "api_key_env")
             hosts = query["egress_allowed_hosts"][agent]
@@ -77,6 +101,16 @@ def load_config(path: str | Path = "config.yaml") -> dict:
             if len(set(normalized)) != len(normalized):
                 raise HarnessError(f"query.egress_allowed_hosts.{agent} contains duplicates")
             query["egress_allowed_hosts"][agent] = normalized
+            query["base_url"].setdefault(agent, None)
+            if query["base_url"][agent] is None:
+                continue
+            # A gateway the proxy would refuse is a misconfiguration, not an
+            # agent failure: the agent only sees an opaque 403 from the proxy.
+            host = endpoint_host(query["base_url"][agent], f"query.base_url.{agent}")
+            if host not in normalized:
+                raise HarnessError(
+                    f"query.base_url.{agent} host {host!r} is not in "
+                    f"query.egress_allowed_hosts.{agent}; the agent could not reach it")
         ev = cfg["evaluation"]
         identifier(ev["evaluator"], "evaluator")
         if not ev["top_k"] or not ev["iou_thresholds"]:

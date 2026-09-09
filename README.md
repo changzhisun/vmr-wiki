@@ -43,6 +43,7 @@ docker build -f docker/Dockerfile \
 - `ingest.vlm.base_url`：按当前配置选择兼容 Chat Completions 的 VLM `/v1` endpoint。
 - `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
 - `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
+- `query.base_url`：可选地为每个 Agent 指定兼容 OpenAI / Anthropic 的网关 endpoint，`null` 表示使用官方默认地址。必须是 443 端口上的 https URL，且主机名同时出现在 `query.egress_allowed_hosts` 中，否则加载配置时即报错——代理只隧道 443 的 CONNECT，Agent 那一侧只会看到一个无 body 的 403。
 - `caption_window_frames`：每次 VLM 请求包含的连续采样帧数量；设为 `1` 时是单图 Caption。
 - `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；小于窗口时产生重叠窗口。
 - `sample_interval_sec`、窗口、stride、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
@@ -278,7 +279,7 @@ Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Q
 
 宿主仓库、视频、GT、其他 Query、其他预测都不挂载进容器。容器以非 root 用户运行，根文件系统和整个 workspace 只读，唯一的任务输出挂载点 `output/` 可写。容器 Home 和临时目录每次新建且退出销毁，CLI 禁用 session 持久化，不使用 resume。Claude 显式加载同一份 `AGENTS.md`。
 
-Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到 `query.egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放文件及 shell 内置工具，不启用额外 MCP。修改 allowlist 会改变实验配置哈希，应使用新实验名。
+Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到 `query.egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放 `Bash,Read,Write,Edit,Glob,Grep` 六个内置工具，不启用额外 MCP；`WebSearch`、`WebFetch`、`Agent`、`Task*`、`Cron*` 等工具不会声明给模型。配置了 `query.base_url` 时，endpoint 以 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 传入容器，并作为 `runtime.api_base_url` 记入每次运行的 provenance。修改 allowlist 或 endpoint 会改变实验配置哈希，应使用新实验名。
 
 Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。JSON 缺失、解析失败、字段多余/缺失、错误 ID、布尔值冒充数字、NaN、时间越界、分数越界、排序错误、预测数量超限、额外输出文件等均记录为 `invalid_output` 失败，**不会自动修复或重新调用 Agent**。`moments: []` 是成功的 abstention。
 

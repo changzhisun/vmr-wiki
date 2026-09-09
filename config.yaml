@@ -44,6 +44,12 @@ query:
   api_key_env:
     codex: CODEX_API_KEY
     claude_code: ANTHROPIC_API_KEY
+  # Optional OpenAI/Anthropic compatible gateway per agent; null uses the
+  # vendor default. Must be https on port 443 and listed in
+  # egress_allowed_hosts, because the proxy tunnels nothing else.
+  base_url:
+    codex: null
+    claude_code: null
   # The agent has no direct internet route. A separate proxy sidecar permits
   # HTTPS CONNECT only to these exact model API hosts.
   # Replace these reserved example hosts with the endpoints used by each agent.
