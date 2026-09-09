@@ -6,7 +6,7 @@ import pytest
 from adapters.qvhighlights import QVHighlightsAdapter
 from harness.common import HarnessError, read_json, read_jsonl, write_json, write_jsonl
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
-from harness.ingest import probe_duration, sample_times
+from harness.ingest import ingest_video, probe_duration, probe_durations, sample_times
 from harness.ingest_all import _run_parallel, ingest_all
 from harness.run_query import Experiment
 
@@ -100,7 +100,30 @@ def test_probe_duration_prefers_container_over_stream(monkeypatch, tmp_path):
         '{"streams":[{"codec_type":"video","duration":"10.366667"}],'
         '"format":{"duration":"12.020000"}}'
     ))
+    assert probe_durations(video) == pytest.approx((12.02, 10.366667))
     assert probe_duration(video) == pytest.approx(12.02)
+
+
+def test_ingest_samples_only_within_video_stream(cfg, monkeypatch, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"source")
+    output = tmp_path / "wiki" / "clip"
+    cfg["ingest"]["sample_interval_sec"] = 5.0
+    monkeypatch.setattr("harness.ingest.probe_durations", lambda _path: (12.02, 10.0))
+    monkeypatch.setattr(
+        "harness.ingest.extract_frame",
+        lambda _video, _timestamp, path, _cfg: path.write_bytes(b"jpeg"),
+    )
+    monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: "ffmpeg version test")
+
+    class Captioner:
+        def caption(self, _path):
+            return "A visible scene."
+
+    metadata = ingest_video(video, "clip", output, cfg, captioner=Captioner())
+    assert metadata["duration"] == pytest.approx(12.02)
+    assert metadata["video_stream_duration"] == pytest.approx(10.0)
+    assert [row["timestamp"] for row in read_jsonl(output / "frames.jsonl")] == [0.0, 5.0]
 
 
 def test_pipeline_does_not_compare_ingest_and_annotation_durations(prepared):

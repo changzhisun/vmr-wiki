@@ -30,12 +30,20 @@ def media_command(command: list[str]) -> str:
     return result.stdout
 
 
-def probe_duration(video: Path) -> float:
-    """Return container duration, falling back to the video stream.
+def _optional_duration(raw, field: str) -> float | None:
+    try:
+        duration = number(float(raw), field, 0)
+    except (TypeError, ValueError, HarnessError):
+        return None
+    return duration if duration > 0 else None
 
-    Annotations are written against what a player shows, which tracks the
-    container. Preferring the stream would treat a correct file as truncated
-    whenever an audio track or muxer delay makes the two differ.
+
+def probe_durations(video: Path) -> tuple[float, float]:
+    """Return ``(container_duration, video_stream_duration)``.
+
+    The container duration remains the public duration in the generated Wiki,
+    while the selected video stream duration bounds frame sampling. Either
+    value falls back to the other when FFprobe cannot provide it.
     """
     metadata = parse_json(media_command([
         "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
@@ -43,16 +51,25 @@ def probe_duration(video: Path) -> float:
     ]))
     if not metadata.get("streams"):
         raise HarnessError("Input contains no video stream")
-    raw = metadata.get("format", {}).get("duration")
-    if raw is None:
-        raw = metadata["streams"][0].get("duration")
-    try:
-        duration = number(float(raw), "video duration", 0)
-    except (TypeError, ValueError) as exc:
-        raise HarnessError("Unable to determine video duration") from exc
-    if duration <= 0:
-        raise HarnessError("Video duration must be positive")
-    return duration
+    container = _optional_duration(
+        metadata.get("format", {}).get("duration"), "container duration"
+    )
+    stream = _optional_duration(
+        metadata["streams"][0].get("duration"), "video stream duration"
+    )
+    if container is None and stream is None:
+        raise HarnessError("Unable to determine video duration")
+    if container is None:
+        container = stream
+    if stream is None:
+        stream = container
+    assert container is not None and stream is not None
+    return container, stream
+
+
+def probe_duration(video: Path) -> float:
+    """Return the container duration for display and metadata compatibility."""
+    return probe_durations(video)[0]
 
 
 def sample_times(duration: float, interval: float) -> list[float]:
@@ -121,13 +138,16 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         _check_cancelled(cancel_event)
         if output.exists():
             raise HarnessError("Ingest completed concurrently; rerun to verify existing output")
-        duration = probe_duration(video)
+        duration, video_stream_duration = probe_durations(video)
         _check_cancelled(cancel_event)
         client = captioner if captioner is not None else VLMClient(cfg["ingest"]["vlm"])
         staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
         (staging / "frames").mkdir()
         frames = []
-        for index, timestamp in enumerate(sample_times(duration, cfg["ingest"]["sample_interval_sec"]), 1):
+        sampling_times = sample_times(
+            video_stream_duration, cfg["ingest"]["sample_interval_sec"]
+        )
+        for index, timestamp in enumerate(sampling_times, 1):
             _check_cancelled(cancel_event)
             relative = f"frames/{index:06d}.jpg"
             extract_frame(video, timestamp, staging / relative, cfg["ingest"])
@@ -144,6 +164,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
             raise HarnessError("Source video changed during ingest")
         _check_cancelled(cancel_event)
         metadata = {"version": 1, "video_id": video_id, "duration": duration,
+                    "video_stream_duration": video_stream_duration,
                     "source_sha256": source_hash, "ingest_config": cfg["ingest"],
                     # Hash of content-determining settings only; transport,
                     # auth, timeouts, and retries remain provenance metadata.
