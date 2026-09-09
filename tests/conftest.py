@@ -48,6 +48,10 @@ def cfg(tmp_path):
     for kind in ("datasets", "wiki", "runs", "results"):
         config["paths"][kind] = str(tmp_path / kind)
     config["ingest"]["sample_interval_sec"] = 1.0
+    # Most pipeline tests exercise the legacy single-frame schema. Multi-frame
+    # window behavior is covered explicitly in test_adapter_ingest.py.
+    config["ingest"]["caption_window_frames"] = 1
+    config["ingest"]["caption_stride_frames"] = 1
     config["ingest"]["image_max_size"] = 64
     config["ingest"]["vlm"]["model"] = "fixture-vlm"
     config["query"]["model"] = "fixture-agent"

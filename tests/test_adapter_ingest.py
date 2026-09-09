@@ -6,6 +6,7 @@ import pytest
 from adapters.qvhighlights import QVHighlightsAdapter
 from harness.common import (HarnessError, ingest_content_hash, read_json, read_jsonl,
                             write_json, write_jsonl)
+from harness.config import load_config
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
 from harness.ingest import (caption_windows, ingest_video, probe_duration, probe_durations,
                             sample_times)
@@ -45,6 +46,16 @@ def test_sampling_edges():
     for interval in (0, -1, float("nan")):
         with pytest.raises(HarnessError):
             sample_times(10.0, interval)
+
+
+def test_default_config_uses_overlapping_multi_frame_captions():
+    config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
+    ingest = config["ingest"]
+    assert ingest["sample_interval_sec"] == 1.0
+    assert ingest["caption_window_frames"] == 4
+    assert ingest["caption_stride_frames"] == 1
+    assert ingest["vlm"]["max_tokens"] == 2048
+    assert "frame or frames" in ingest["vlm"]["prompt"]
 
 
 def test_caption_windows_support_overlap_and_partial_tail():
