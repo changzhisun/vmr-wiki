@@ -134,6 +134,20 @@ Query 阶段不允许修改 Wiki。
 - 完成后进程退出；
 - workspace 删除。
 
+### 3.3.1 Workspace 不得包含可识别的数据集标识符
+
+隔离必须同时覆盖「读得到的字节」和「认得出的标签」。公开 benchmark 在被测模型的权重里，官方 `qid` / `vid` / split 名是精确查表键，所以只读挂载和 internal network 并不足够。
+
+```text
+真实 qid / vid / split
+        ↓  HMAC(per-experiment secret)
+不透明令牌  →  task.json / workspace 目录名 / wiki.md 标题
+        ↓  Harness 校验后翻译回真实 ID
+predictions / aggregate / evaluate
+```
+
+残余通道必须如实声明：`query` 文本本身是任务输入，无法遮蔽，公开数据集的 query 文本同样可检索。别名只移除精确查表键，不构成去污染保证。
+
 ### 3.4 Wiki 与 Query 无关
 
 Wiki 只能由以下信息生成：
@@ -635,6 +649,22 @@ moments[i].score >= moments[i+1].score
 
 数值必须有限且不是布尔值；允许 `moments: []` 表示成功 abstention。输出缺失、JSON 无法解析、字段缺失、额外输出、错误 split/ID、数量越限、时间非法或排序错误均记为 failed run，不自动修复或重跑 Agent。
 
+### 13.1 Failed Run 必须区分归属
+
+failed run 分两类，绝不能折叠成同一个数字：
+
+```text
+Agent 侧（有效的零分，终局，不重跑）
+  timeout / agent_error / invalid_output / tampered
+
+Harness 侧（没有测量值，自动重试）
+  harness_error / interrupted
+```
+
+一次 Docker 故障若被记成零分，会让"Agent 不会做 VMR"和"环境坏了"无法区分。因此：批量运行遇到 Harness 侧失败立即中止；评测遇到 Harness 侧失败直接拒绝，除非显式 opt-in。
+
+`metrics.json` 顶层数字以整个 split 为分母（对外口径），并追加 `successful_only` 用同一套指标重算仅覆盖已作答 Query 的分数。比较不同 Agent 时必须同时看两个数，否则 JSON 合规性差异会被误读成检索能力差异。
+
 ---
 
 ## 14. Agent Runner
@@ -833,8 +863,10 @@ mAP
 官方主指标
 R@1 / R@K（如果适用）
 IoU thresholds
-Failed Runs
+Failed Runs（并按 failure_kind 分类，见 13.1）
+Unattempted queries
 Average number of predictions per query
+successful_only：仅已作答 Query 的同套指标
 ```
 
 ---
@@ -1165,10 +1197,12 @@ python harness/evaluate.py --dataset DATASET --split SPLIT --pred results/EXPERI
 - 同一实验禁止混用 dataset、split、Agent 或配置。聚合核验 Query/video 成员关系和各运行的 dataset/split provenance。
 - `predictions.jsonl.metadata.json` 保存聚合结果的 dataset、split、SHA256 和 annotation 哈希；评测默认强制要求 sidecar，不能通过删除 provenance 降级绕过校验。外部原始 submission 只能通过显式 unverified opt-in 进入。
 - Evaluation 先验证 metadata 和 has_ground_truth，再读取选定 split 的 GT；失败/缺失 Query 仍留在该 split 分母内。无 GT split 只生成预测。
+- Failed run 按 `failure_kind` 区分归属（见 13.1）：Agent 侧失败终局且计零分，Harness 侧失败中止批量运行、被评测拒绝、并在修复后自动重试；`attempts` 与 `superseded_failures` 保留审计痕迹。`metrics.json` 同时给出全 split 与 `successful_only` 两套分数。
 - 默认 evaluator 由 dataset.json 指向 Adapter；官方代码优先，缺省使用 dataset-specific 实现，最后才用 generic。原有 QVHighlights 多 relevant instances mAP 语义不变。
 - `default_eval_split` 仅作为评测的默认值；Ingest/Freeze/Query 要求 --split 或 config.dataset.split。Unknown split 不做别名映射。
 - 旧 manifest 采用迁移方案 A：明确要求重新运行 Adapter。不自动补 split。旧 Wiki 可在保持内容不变的前提下迁入新的 videos/ 布局并校验，不自动移动用户产物。
 - VLM provider、endpoint、认证、timeout 和 retry 等传输参数保留在 provenance 中，但不进入 ingest hash。并发 Ingest 使用协作式取消事件，Ctrl-C 后等待运行 worker 清理退出。
 - Query Agent 仅连接临时 internal Docker network，通过无密钥 allowlist proxy 访问配置中的模型 API hostname；代理不挂载 workspace，任务结束时与网络一并删除。
+- Workspace 中的 `query_id` / `video_id` / `split` 是 per-experiment HMAC 别名（见 3.3.1），Wiki 标题不含 video id，临时目录名亦用别名；预测按别名校验后翻译回真实 ID 落盘。旧 Wiki 用 `harness/migrate_wiki_title.py` 只改标题迁移，不重新 caption。
 
 验收测试覆盖任意 split 名称、has_ground_truth 布尔验证、unknown split、共享视频跨 split 去重、增量 Freeze、跨 split 重复 Query ID、Query/GT 隔离、无 GT 拒绝、多 GT/预测、聚合混入其他 split/dataset 拒绝、CLI help 与默认 split。原有独立进程、只读挂载、超时清理和官方评测一致性测试继续保留。

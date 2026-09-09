@@ -47,7 +47,48 @@ def remove_tree(root: Path) -> None:
     shutil.rmtree(root)
 
 
+def _format_ids(video_ids: list[str], limit: int = 8) -> str:
+    shown = ", ".join(video_ids[:limit])
+    if len(video_ids) > limit:
+        shown += f" ... (+{len(video_ids) - limit})"
+    return shown
+
+
+def wiki_readiness(root: Path, video_ids) -> tuple[list[str], list[str]]:
+    """Return ``(not_ingested, ingested_but_not_frozen)`` video ids under ``root``."""
+    missing, unfrozen = [], []
+    for vid in video_ids:
+        wiki = root / vid
+        if not (wiki / "ingest.json").is_file():
+            missing.append(vid)
+        elif not (wiki / "frozen.json").is_file():
+            unfrozen.append(vid)
+    return missing, unfrozen
+
+
+def split_not_ready_error(dataset: str, split: str, missing: list[str],
+                          unfrozen: list[str]) -> HarnessError:
+    parts = []
+    if missing:
+        parts.append(f"{len(missing)} not ingested ({_format_ids(missing)})")
+    if unfrozen:
+        parts.append(f"{len(unfrozen)} ingested but not frozen")
+    return HarnessError(
+        f"Split {split!r} is not ready for queries: {'; '.join(parts)}. "
+        f"Finish ingest, then run: python harness/freeze.py --dataset {dataset} --split {split}"
+    )
+
+
 def verify_wiki(root: Path) -> dict:
+    if not (root / "frozen.json").is_file():
+        if (root / "ingest.json").is_file():
+            raise HarnessError(
+                f"Wiki is ingested but not frozen: {root}. "
+                "Run python harness/freeze.py with the same --dataset and --split."
+            )
+        raise HarnessError(
+            f"Frozen wiki not found: {root}. Ingest this video, then freeze the split."
+        )
     seal = read_json(root / "frozen.json")
     actual = tree_hashes(root, ("frozen.json",))
     if seal.get("files") != actual or seal.get("wiki_hash") != object_hash(actual):
@@ -80,6 +121,11 @@ def freeze_dataset(cfg: dict, *, split: str | None = None) -> dict:
     videos = load_videos(directory, dataset, split)
     if not videos:
         raise HarnessError("No videos to freeze")
+    missing, _ = wiki_readiness(root, videos)
+    if missing:
+        raise HarnessError(
+            f"{len(missing)} video(s) have no ingest and cannot be frozen: {_format_ids(missing)}"
+        )
     # Preflight every video before applying any read-only permissions.
     for vid, video in videos.items():
         metadata = read_json(root / vid / "ingest.json")

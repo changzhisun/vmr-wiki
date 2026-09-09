@@ -7,9 +7,13 @@ import pytest
 
 from agents.runner import AgentResult, DockerRunner
 from harness.aggregate import aggregate
-from harness.common import HarnessError, read_json, read_jsonl, write_json
+from harness.common import HarnessError, atomic_text, file_hash, read_json, read_jsonl, write_json
 from harness.evaluate import evaluate
+from harness.freeze import freeze_dataset
+from harness.ingest_all import ingest_all
+from harness.migrate_wiki_title import migrate_wiki
 from harness.run_query import Experiment
+from harness.workspace import require_anonymous_wiki
 
 
 class ProcessFixtureRunner:
@@ -93,6 +97,16 @@ def test_end_to_end_fresh_processes_cleanup_and_no_gt_reads(frozen):
     assert (root / "config.yaml").exists()
 
 
+def test_experiment_requires_frozen_split(prepared):
+    cfg, captioner = prepared
+    with pytest.raises(HarnessError, match="not ingested"):
+        Experiment(cfg, "test", runner=ProcessFixtureRunner())
+    ingest_all(cfg, captioner=captioner)
+    with pytest.raises(HarnessError, match="ingested but not frozen") as exc:
+        Experiment(cfg, "test", runner=ProcessFixtureRunner())
+    assert "python harness/freeze.py --dataset qvhighlights --split train" in str(exc.value)
+
+
 @pytest.mark.parametrize("behavior", ["missing", "invalid", "extra", "nonzero", "timeout", "symlink", "mutate"])
 def test_failures_never_retried_or_published(frozen, behavior):
     cfg, _ = frozen
@@ -107,13 +121,151 @@ def test_failures_never_retried_or_published(frozen, behavior):
         assert not runner.workspaces[0].exists()
 
 
+def test_workspace_hides_public_identifiers_and_saves_real_ones(frozen):
+    """The agent is given aliases; the saved prediction carries real identifiers."""
+    cfg, _ = frozen
+    seen = []
+    class Spy(ProcessFixtureRunner):
+        def run(self, workspace, prompt, stdout, stderr):
+            seen.append(read_json(workspace / "task.json"))
+            return super().run(workspace, prompt, stdout, stderr)
+    with Experiment(cfg, "test", runner=Spy()) as experiment:
+        query = experiment.queries[0]
+        result = experiment.run(query)
+    task = seen[0]
+    assert task["query_id"] != query["query_id"] and task["video_id"] != query["video_id"]
+    assert task["split"] != cfg["dataset"]["split"]
+    assert task["query"] == query["query"]  # the task input itself cannot be obscured
+    assert set(task) == {"query_id", "video_id", "split", "query", "max_predictions"}
+    saved = read_json(Path(cfg["paths"]["results"]) / "test" / "predictions" / f"{query['query_id']}.json")
+    assert (saved["query_id"], saved["video_id"], saved["split"]) == (
+        query["query_id"], query["video_id"], cfg["dataset"]["split"])
+    assert result["task_query_id"] == task["query_id"]
+
+
+def test_aliases_are_stable_within_and_distinct_across_experiments(frozen):
+    cfg, _ = frozen
+    tasks = {}
+    class Spy(ProcessFixtureRunner):
+        def run(self, workspace, prompt, stdout, stderr):
+            tasks.setdefault(self.behavior, []).append(read_json(workspace / "task.json")["query_id"])
+            return super().run(workspace, prompt, stdout, stderr)
+    for name in ("one", "one", "two"):
+        runner = Spy(name)
+        with Experiment(cfg, name, runner=runner) as experiment:
+            experiment.run(experiment.queries[0])
+    # Resuming "one" reuses the minted secret, so a rerun cannot change aliases;
+    # a different experiment must not produce a correlatable alias.
+    assert len(tasks["one"]) == 1 and tasks["one"][0] != tasks["two"][0]
+    with Experiment(cfg, "one", runner=Spy("one")) as experiment:
+        assert experiment.aliases.query[experiment.queries[0]["query_id"]] == tasks["one"][0]
+
+
+def test_prediction_echoing_the_real_identifier_is_rejected(frozen):
+    cfg, _ = frozen
+    class RealIdRunner(ProcessFixtureRunner):
+        def run(self, workspace, prompt, stdout, stderr):
+            result = super().run(workspace, prompt, stdout, stderr)
+            write_json(workspace / "output" / "prediction.json",
+                       {"query_id": "1", "video_id": "video", "split": "train",
+                        "moments": [{"start_sec": 0, "end_sec": 1, "score": 0.9}]})
+            return result
+    with Experiment(cfg, "test", runner=RealIdRunner()) as experiment:
+        result = experiment.run(experiment.queries[0])
+        assert result["failure_kind"] == "invalid_output"
+
+
+def test_wiki_naming_its_video_is_refused(frozen, tmp_path):
+    """A frozen wiki cannot be edited, so legacy titles are caught on the way in."""
+    cfg, _ = frozen
+    current = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos" / "video" / "wiki.md"
+    require_anonymous_wiki(current)
+    legacy = tmp_path / "legacy.md"
+    legacy.write_text("# Video: video\n" + current.read_text().split("\n", 1)[1], encoding="utf-8")
+    with pytest.raises(HarnessError, match="names its own video"):
+        require_anonymous_wiki(legacy)
+
+
+def test_legacy_wiki_title_migrates_without_recaptioning(prepared):
+    cfg, captioner = prepared
+    ingest_all(cfg, captioner=captioner)
+    calls_after_ingest = captioner.calls
+    root = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos" / "video"
+    frames = read_jsonl(root / "frames.jsonl")
+    body = (root / "wiki.md").read_text().split("\n", 1)[1]
+    atomic_text(root / "wiki.md", f"# Video: video\n{body}")
+    metadata = read_json(root / "ingest.json")
+    metadata["content_hashes"]["wiki.md"] = file_hash(root / "wiki.md")
+    write_json(root / "ingest.json", metadata)
+    with pytest.raises(HarnessError, match="names its own video"):
+        require_anonymous_wiki(root / "wiki.md")
+    assert migrate_wiki(root) is True
+    require_anonymous_wiki(root / "wiki.md")
+    assert migrate_wiki(root) is False  # idempotent
+    assert read_jsonl(root / "frames.jsonl") == frames
+    # Re-verification passes and no caption is requested again.
+    ingest_all(cfg, captioner=captioner)
+    assert captioner.calls == calls_after_ingest
+    assert read_json(root / "ingest.json")["migrations"] == ["anonymous_wiki_title"]
+    freeze_dataset(cfg)
+    with pytest.raises(HarnessError, match="re-freeze"):
+        migrate_wiki(root)
+
+
+def test_experiment_without_alias_secret_is_refused(frozen):
+    cfg, _ = frozen
+    with Experiment(cfg, "test", runner=ProcessFixtureRunner()):
+        pass
+    manifest = Path(cfg["paths"]["results"]) / "test" / "experiment.json"
+    saved = read_json(manifest)
+    del saved["alias_secret"]
+    write_json(manifest, saved)
+    with pytest.raises(HarnessError, match="predates workspace identifier aliasing"):
+        with Experiment(cfg, "test", runner=ProcessFixtureRunner()):
+            pass
+
+
 def test_abstention_is_success(frozen):
     cfg, _ = frozen
     with Experiment(cfg, "test", runner=ProcessFixtureRunner("empty")) as experiment:
         assert experiment.run(experiment.queries[0])["status"] == "success"
 
 
-def test_interrupted_attempt_is_finalized_without_second_process(frozen):
+@pytest.mark.parametrize("behavior,kind", [
+    ("missing", "invalid_output"), ("invalid", "invalid_output"), ("extra", "invalid_output"),
+    ("symlink", "invalid_output"), ("nonzero", "agent_error"), ("timeout", "timeout"),
+    ("mutate", "tampered")])
+def test_agent_failures_are_classified_by_cause(frozen, behavior, kind):
+    cfg, _ = frozen
+    with Experiment(cfg, "test", runner=ProcessFixtureRunner(behavior)) as experiment:
+        result = experiment.run(experiment.queries[0])
+        assert (result["status"], result["failure_kind"]) == ("failed", kind)
+        assert result["attempts"] == 1
+
+
+def test_harness_failure_is_recorded_raised_and_retried(frozen):
+    """An infrastructure fault is not the agent's score, so it never stands as one."""
+    cfg, _ = frozen
+    class BrokenRunner(ProcessFixtureRunner):
+        def run(self, *args):
+            raise OSError("docker daemon is not running")
+    with Experiment(cfg, "test", runner=BrokenRunner()) as experiment:
+        query = experiment.queries[0]
+        with pytest.raises(OSError):
+            experiment.run(query)
+        recorded = read_json(experiment.root / "run_metadata" / "1.json")
+        assert recorded["failure_kind"] == "harness_error"
+        assert "docker daemon" in recorded["error"]
+    runner = ProcessFixtureRunner()
+    with Experiment(cfg, "test", runner=runner) as experiment:
+        result = experiment.run(experiment.queries[0])
+        assert result["status"] == "success"
+        assert result["attempts"] == 2
+        assert [f["kind"] for f in result["superseded_failures"]] == ["harness_error"]
+        assert len(runner.workspaces) == 1
+
+
+def test_interrupted_attempt_is_retried_not_charged_to_the_agent(frozen):
     cfg, _ = frozen
     runner = ProcessFixtureRunner()
     with Experiment(cfg, "test", runner=runner) as experiment:
@@ -124,9 +276,9 @@ def test_interrupted_attempt_is_finalized_without_second_process(frozen):
             "started_at": "2026-09-08T00:00:00+00:00", "finished_at": None,
         })
         result = experiment.run(query)
-        assert result["status"] == "failed"
-        assert result["finished_at"] is not None
-        assert runner.workspaces == []
+        assert result["status"] == "success"
+        assert [f["kind"] for f in result["superseded_failures"]] == ["interrupted"]
+        assert len(runner.workspaces) == 1
 
 
 def test_mixed_agent_and_modified_inputs_refused(frozen):

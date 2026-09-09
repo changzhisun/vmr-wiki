@@ -233,7 +233,40 @@ wiki/frames/
 output/
 ```
 
-`task.json` 保留 `query_id`、`video_id`、`split`、`query` 和固定的 `max_predictions`。Agent 必须在预测中原样复制 split；示例：
+### 不透明标识符
+
+公开 VMR benchmark 就在被测模型的训练数据里，而官方的 `qid`、`vid`（QVHighlights 是 YouTube ID，UCA-VMR 是 UCF-Crimes 文件名）和 split 名是**精确的查表键**。只读挂载和 internal network 能阻止 Agent *读取* GT，但阻止不了它认出标签后凭记忆作答，或者拿这个键去问模型 API。
+
+因此 workspace 里不出现真实标识符。每个实验铸造一次随机 `alias_secret`（存在 `experiment.json`，Agent 读不到），`task.json` 里的三个标识符是 `HMAC(secret, kind:value)` 截断后的令牌：
+
+```json
+{
+  "query_id": "q4f2a91c0d7b83e15",
+  "video_id": "v8c17de40ab926f3d",
+  "split": "s15a0d1954e686b4c",
+  "query": "When does the man open the refrigerator?",
+  "max_predictions": 5
+}
+```
+
+Agent 照旧原样复制这三个值，Harness 按令牌校验后**翻译回真实 ID 再落盘**，所以 `predictions/*.json`、`aggregate` 和 `evaluate` 完全不接触别名。`run_metadata` 同时记录 `task_query_id` / `task_video_id` 以便追溯。别名按实验隔离：同一条 Query 在两个实验里得到不同令牌，无法跨实验关联；恢复同一实验会复用已铸造的 secret，令牌不会中途改变。承载 workspace 的临时目录也用别名命名，因为容器能通过 `/proc` 读到 bind mount 的宿主路径。
+
+Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Query 阶段会拒绝仍然写着 `# Video: <video_id>` 的旧 Wiki。
+
+> **这条措施缩小了通道，但没有关闭它。** `query` 文本本身就是任务输入，无法遮蔽，而公开 benchmark 的 query 文本同样可检索。采样帧里若出现视频自带的标题字幕也会泄露。把别名理解为「移除了精确查表键」，不要当成去污染的保证；报告结果时应当说明这一点。
+
+### 旧 Wiki 迁移
+
+`render_wiki` 过去会写 `# Video: <video_id>`。captions 和采样帧完全不受影响，所以不必重新调用 VLM，只改标题即可：
+
+```bash
+python harness/migrate_wiki_title.py --dataset uca            # 先干跑，报告将要改动的数量
+python harness/migrate_wiki_title.py --dataset uca --apply
+```
+
+迁移前会核验除 `wiki.md` 外的每一项 `content_hashes` 仍然吻合（这就是 captions 未被改动的证据），然后重写标题、更新记录的哈希，并在 `ingest.json` 的 `migrations` 中留痕。已 Freeze 的 Wiki 会被拒绝：先删掉 `frozen.json`，迁移后重新 Freeze，让 seal 证明真实存在的内容。
+
+`task.json` 保留 `query_id`、`video_id`、`split`、`query` 和固定的 `max_predictions`（均为别名形式）。Agent 必须在预测中原样复制 split；示例中为可读性使用真实 ID：
 
 ```json
 {
@@ -254,9 +287,20 @@ output/
 
 Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到 `query.egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放文件及 shell 内置工具，不启用额外 MCP。修改 allowlist 会改变实验配置哈希，应使用新实验名。
 
-Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。JSON 缺失、解析失败、字段多余/缺失、错误 ID、布尔值冒充数字、NaN、时间越界、分数越界、排序错误、预测数量超限、额外输出文件等均记录为失败，**不会自动修复或重新调用 Agent**。`moments: []` 是成功的 abstention。
+Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。JSON 缺失、解析失败、字段多余/缺失、错误 ID、布尔值冒充数字、NaN、时间越界、分数越界、排序错误、预测数量超限、额外输出文件等均记录为 `invalid_output` 失败，**不会自动修复或重新调用 Agent**。`moments: []` 是成功的 abstention。
 
-已有运行记录（成功或失败）不会再执行。再次运行同一批命令只处理尚未开始的 Query；中断后留下的 `running` 记录在再次读取时转为失败。配置、模型、Agent、代码、模板、manifest 或镜像 ID 变化时，必须使用新实验名。
+每次运行都记录 `failure_kind`，把"Agent 没做好"和"Harness / 基础设施坏了"分开：
+
+| failure_kind | 含义 | 归属 | 是否重跑 |
+| --- | --- | --- | --- |
+| `timeout` | Agent 超时 | Agent | 否，终局 |
+| `agent_error` | Agent 进程非零退出 | Agent | 否，终局 |
+| `invalid_output` | 输出缺失、无法解析、schema 不合法、多余产物 | Agent | 否，终局 |
+| `tampered` | Agent 改动了冻结输入 | Agent | 否，终局 |
+| `harness_error` | Docker 不可用、磁盘错误、Harness 不变量被破坏 | Harness | 是 |
+| `interrupted` | Ctrl-C 或进程未收尾 | Harness | 是 |
+
+Agent 自己的失败是终局，绝不会为同一条 Query 再启动第二个进程，因此不存在 best-of-N。Harness 侧失败不是 Agent 的成绩：`run_all_queries.py` **立即中止整批**而不是把剩余 Query 记成零分，修好原因后重跑会自动重试这些 Query，并在 `attempts` 和 `superseded_failures` 中留下审计痕迹，重跑过的 Query 不会被误认为首次尝试。成功记录和 Agent 失败记录都不会被重跑。没有 `failure_kind` 字段的历史记录按终局处理。配置、模型、Agent、代码、模板、manifest 或镜像 ID 变化时，必须使用新实验名。
 
 ```text
 results/<experiment>/
@@ -275,7 +319,7 @@ results/<experiment>/
 
 ## 4. 聚合与评测
 
-即使批量运行因部分 Query 失败而返回非零 exit code，也应继续聚合与评测。
+批量运行因部分 Query 的 **Agent 侧**失败而返回非零 exit code 时，应继续聚合与评测——这些失败是有效的零分。但若批量运行是因 Harness 侧失败而**中止**（输出中带 `harness failure after N of M queries`），应先修好原因重跑，否则评测会拒绝这批结果。
 
 ```bash
 python harness/aggregate.py \
@@ -300,6 +344,8 @@ python harness/evaluate.py \
 
 **所有指标的单位为百分数，范围 0–100。** 分母是所选 split 的全部带标签 Query，缺失/失败结果按零命中处理；不因某个 Query 失败就从评测集删除它。只跑一个 Query 时评测该 split，其余同 split 内未运行的 Query 也会计入失败；需要子集实验时应先准备对应子集的 manifests。
 
+若 run metadata 中存在 `harness_error` 或 `interrupted`，评测**直接拒绝**并列出对应 Query：这些 Query 根本没有测量值，把它们当成零分会让一次 Docker 故障看起来像 Agent 不会做 VMR。修好原因后重跑即可（这两类会自动重试）；确实要按零分计入时显式传 `--allow-harness-failures`。
+
 通用 evaluator 输出配置的 `R@K,IoU=T`，语义为前 K 个预测命中任意一个 GT 即成功。UCA-VMR 使用此 evaluator（每个 Query 只有一个 GT moment，属于 `any_acceptable_moment` 语义）。QVHighlights adapter 额外输出：
 
 - `MR-full-mAP`：主指标，IoU 0.50 到 0.95、间隔 0.05 的平均 AP。
@@ -308,7 +354,22 @@ python harness/evaluate.py \
 
 QVHighlights AP 使用前 10 个预测，按置信度逐一与尚未匹配的 GT 做匹配；重复命中同一个 GT 不能重复加分。实现遵循官方 moment retrieval 语义，不计算与本任务无关的 highlight/saliency 指标。没有 Query 的长度组返回 JSON `null`。
 
-输出同时包括 `failed_runs`、失败 ID、缺失数量、abstention 数量、每条 Query 平均预测数、top K 和 IoU thresholds。聚合保留所有预测和 evidence，不会静默降成 top-1，也不会重排或修复不合法结果。
+输出同时包括 `failed_runs`、失败 ID、缺失数量、abstention 数量、每条 Query 平均预测数、top K 和 IoU thresholds。提供 run metadata 时额外输出 `run_failures`：按 `failure_kind` 分类计数，外加 `unattempted`（从未启动）和 `unclassified`（历史记录）。聚合保留所有预测和 evidence，不会静默降成 top-1，也不会重排或修复不合法结果。
+
+当存在未作答的 Query 时，metrics.json 追加一个 `successful_only` 块，用**同一套指标**重算仅覆盖已作答 Query 的分数。顶层数字始终以整个 split 为分母，是对外汇报的口径；`successful_only` 用来判断差距来自检索质量还是来自格式遵从率与覆盖率。对比 Codex 与 Claude Code 时必须同时看这两个数——否则 JSON 合规性的差异会被读成 VMR 能力的差异。
+
+```json
+{
+  "num_queries": 6,
+  "failed_runs": 2,
+  "run_failures": {"timeout": 1, "invalid_output": 1, "harness_error": 0,
+                   "interrupted": 0, "agent_error": 0, "tampered": 0,
+                   "unclassified": 0, "unattempted": 0},
+  "primary_metric": "MR-full-mAP",
+  "primary_score": 33.33,
+  "successful_only": {"num_queries": 4, "primary_score": 50.0}
+}
+```
 
 ### 使用官方代码
 

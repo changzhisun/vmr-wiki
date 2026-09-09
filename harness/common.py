@@ -15,6 +15,25 @@ class HarnessError(ValueError):
     """An input or experiment invariant was violated."""
 
 
+# A run can fail for two very different reasons. Only the kinds below are
+# attributable to the agent under test and are therefore a legitimate zero.
+# Anything else means the measurement is invalid, not that the agent scored
+# zero, so it must never be averaged into a reported metric unattended.
+AGENT_FAILURE_KINDS = frozenset({"timeout", "agent_error", "invalid_output", "tampered"})
+HARNESS_FAILURE_KINDS = frozenset({"harness_error", "interrupted"})
+FAILURE_KINDS = AGENT_FAILURE_KINDS | HARNESS_FAILURE_KINDS
+
+
+class RunFailure(HarnessError):
+    """A run failure caused by the agent under test rather than the harness."""
+
+    def __init__(self, message: str, kind: str):
+        if kind not in AGENT_FAILURE_KINDS:
+            raise HarnessError(f"Not an agent failure kind: {kind!r}")
+        super().__init__(message)
+        self.kind = kind
+
+
 def identifier(value: Any, field: str = "id") -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", value):
         raise HarnessError(f"{field} must be a safe, nonempty identifier: {value!r}")

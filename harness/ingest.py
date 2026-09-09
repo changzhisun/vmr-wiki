@@ -65,8 +65,10 @@ def extract_frame(video: Path, timestamp: float, output: Path, cfg: dict) -> Non
         raise HarnessError(f"No frame decoded at {timestamp}s")
 
 
-def render_wiki(video_id: str, duration: float, interval: float, frames: list[dict]) -> str:
-    lines = [f"# Video: {video_id}", "", "## Metadata", "",
+def render_wiki(duration: float, interval: float, frames: list[dict]) -> str:
+    """Query-independent and identity-neutral: the video id is a lookup key
+    into public benchmark data, and the agent never needs it to locate moments."""
+    lines = ["# Video", "", "## Metadata", "",
              f"- Duration: {duration} seconds", f"- Sampling interval: {interval} seconds",
              f"- Number of frames: {len(frames)}", "", "## Timeline", ""]
     for frame in frames:
@@ -129,7 +131,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
                            "frame": relative, "caption": nonempty(caption, "caption")})
         write_jsonl(staging / "frames.jsonl", frames)
         atomic_text(staging / "wiki.md", render_wiki(
-            video_id, duration, cfg["ingest"]["sample_interval_sec"], frames))
+            duration, cfg["ingest"]["sample_interval_sec"], frames))
         if file_hash(video) != source_hash:
             raise HarnessError("Source video changed during ingest")
         _check_cancelled(cancel_event)

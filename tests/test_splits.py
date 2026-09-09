@@ -134,11 +134,18 @@ def test_query_isolation_and_unlabeled_prediction_generation(split_dataset):
     class Spy(ProcessFixtureRunner):
         def run(self, workspace, prompt, stdout, stderr):
             task = read_json(workspace / "task.json")
-            assert task["split"] == "val"
             assert task["query"].startswith("VAL_SECRET")
-            text = "\n".join(path.read_text() for path in workspace.rglob("*")
-                             if path.is_file() and path.suffix in (".md", ".json", ".jsonl"))
+            # The real split and identifiers are lookup keys into public data,
+            # so the workspace carries opaque per-experiment aliases instead.
+            assert task["split"] != "val" and task["split"].startswith("s")
+            assert task["query_id"].startswith("q") and task["video_id"].startswith("v")
+            readable = [path for path in workspace.rglob("*")
+                        if path.is_file() and path.suffix in (".md", ".json", ".jsonl")]
+            text = "\n".join(path.read_text() for path in readable)
+            names = "\n".join(str(path.relative_to(workspace)) for path in readable)
             assert all(secret not in text for secret in ("TRAIN_SECRET", "TEST_SECRET", "GT_SECRET"))
+            assert "val-only" not in text and "val-only" not in names
+            assert "val-only" not in str(workspace.name)
             return super().run(workspace, prompt, stdout, stderr)
     with Experiment(cfg, "val-run", split="val", runner=Spy()) as experiment:
         for query in experiment.queries:

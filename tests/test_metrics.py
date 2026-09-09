@@ -41,6 +41,69 @@ def test_any_gt_hit_missing_denominator_and_abstention(tmp_path):
     assert metrics["benchmark"]["long"]["MR-mAP"]["average"] is None
 
 
+def run_metadata(tmp_path, entries):
+    directory = tmp_path / "run_metadata"
+    directory.mkdir()
+    for qid, status, kind in entries:
+        write_json(directory / f"{qid}.json", {
+            "query_id": qid, "video_id": "v", "dataset": "example", "split": "train",
+            "status": status, "failure_kind": kind})
+    return directory
+
+
+def evaluation_fixture(tmp_path, answered):
+    gt = [{"query_id": qid, "video_id": "v", "split": "train", "moments": [moment(0, 1), moment(2, 3)]}
+          for qid in ["a", "b", "c", "d"]]
+    write_evaluation_dataset(tmp_path, gt)
+    write_jsonl(tmp_path / "gt.jsonl", gt)
+    write_jsonl(tmp_path / "pred.jsonl", [
+        {"query_id": qid, "video_id": "v", "split": "train", "moments": [moment(0, 1)]}
+        for qid in answered])
+    return tmp_path / "pred.jsonl", tmp_path / "gt.jsonl"
+
+
+def test_harness_failures_refuse_to_score_silently(tmp_path):
+    pred, gt = evaluation_fixture(tmp_path, ["a", "b"])
+    metadata = run_metadata(tmp_path, [
+        ("a", "success", None), ("b", "success", None),
+        ("c", "failed", "invalid_output"), ("d", "failed", "harness_error")])
+    with pytest.raises(HarnessError, match="failed inside the harness"):
+        evaluate(pred, gt, evaluator="qvhighlights", metadata_dir=metadata,
+                 allow_unverified_predictions=True)
+    metrics = evaluate(pred, gt, evaluator="qvhighlights", metadata_dir=metadata,
+                       allow_unverified_predictions=True, allow_harness_failures=True)
+    assert metrics["run_failures"]["invalid_output"] == 1
+    assert metrics["run_failures"]["harness_error"] == 1
+    assert metrics["run_failures"]["unattempted"] == 0
+
+
+def test_successful_only_separates_coverage_from_retrieval_quality(tmp_path):
+    """Two queries answered perfectly must not read as a 50% retrieval score."""
+    pred, gt = evaluation_fixture(tmp_path, ["a", "b"])
+    metadata = run_metadata(tmp_path, [
+        ("a", "success", None), ("b", "success", None),
+        ("c", "failed", "invalid_output"), ("d", "failed", "timeout")])
+    metrics = evaluate(pred, gt, evaluator="qvhighlights", metadata_dir=metadata,
+                       allow_unverified_predictions=True)
+    assert metrics["num_queries"] == 4 and metrics["failed_runs"] == 2
+    assert metrics["retrieval"]["R@1,IoU=0.5"] == pytest.approx(50.0)
+    assert metrics["successful_only"]["num_queries"] == 2
+    assert metrics["successful_only"]["retrieval"]["R@1,IoU=0.5"] == pytest.approx(100.0)
+    assert metrics["successful_only"]["primary_score"] > metrics["primary_score"]
+    assert metrics["run_failures"] == {
+        "agent_error": 0, "harness_error": 0, "interrupted": 0, "invalid_output": 1,
+        "tampered": 0, "timeout": 1, "unclassified": 0, "unattempted": 0}
+
+
+def test_unattempted_queries_are_counted_separately(tmp_path):
+    pred, gt = evaluation_fixture(tmp_path, ["a"])
+    metadata = run_metadata(tmp_path, [("a", "success", None), ("b", "failed", "agent_error")])
+    metrics = evaluate(pred, gt, evaluator="qvhighlights", metadata_dir=metadata,
+                       allow_unverified_predictions=True)
+    assert metrics["run_failures"]["unattempted"] == 2
+    assert metrics["failed_runs"] == 3
+
+
 def test_qvh_length_groups_and_top_ten_cap():
     gt = {"q": {"query_id": "q", "video_id": "v", "split": "train", "moments": [moment(0, 10), moment(10, 40), moment(40, 100)]}}
     pred = {"q": {"moments": [moment(110, 120)] * 10 + [moment(0, 10)]}}

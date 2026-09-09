@@ -51,8 +51,7 @@ class ProgressBar:
         self._width = 30
         self._finished = False
         self._is_tty = sys.stdout.isatty()
-        # Width wide enough to fully overwrite the longest possible bar line.
-        self._line_width = len(desc) + self._width + len(f"{total}/{total}") + 10
+        self._rendered_width = 0
 
     def update(self, n: int = 1) -> None:
         with self._lock:
@@ -78,11 +77,15 @@ class ProgressBar:
         bar = "=" * filled + "-" * (self._width - filled)
         percent = int(100 * fraction)
         line = f"{self.desc}: [{bar}] {self.current}/{self.total} ({percent}%)"
-        sys.stdout.write("\r" + line.ljust(self._line_width) + "\r")
+        # Clear at least as many columns as any previously rendered line. The
+        # percentage grows from one to three digits during a run, so a fixed
+        # estimate can otherwise leave trailing characters on the terminal.
+        self._rendered_width = max(self._rendered_width, len(line))
+        sys.stdout.write("\r" + line.ljust(self._rendered_width) + "\r")
         sys.stdout.flush()
 
     def _clear_unlocked(self) -> None:
-        sys.stdout.write("\r" + " " * self._line_width + "\r")
+        sys.stdout.write("\r" + " " * self._rendered_width + "\r")
         sys.stdout.flush()
 
     def finish(self) -> None:

@@ -9,8 +9,9 @@ import argparse
 from pathlib import Path
 
 from adapters import get_evaluator
-from harness.common import (HarnessError, cli, file_hash, identifier, number, object_hash, positive_int,
-                            read_json, read_jsonl, unique_index, write_json)
+from harness.common import (FAILURE_KINDS, HARNESS_FAILURE_KINDS, HarnessError, cli, file_hash,
+                            identifier, number, object_hash, positive_int, read_json, read_jsonl,
+                            unique_index, write_json)
 from harness.config import dataset_path, load_config
 from harness.dataset import (load_dataset, load_query_inputs, require_ground_truth,
                              select_split, validate_ground_truth)
@@ -22,7 +23,8 @@ def evaluate(pred_path: Path, gt_path: Path | None = None, *, dataset_dir: Path 
              split: str | None = None, evaluator: str | None = None,
              top_k=(1, 5), iou_thresholds=(0.3, 0.5, 0.7), max_predictions: int = 5,
              metadata_dir: Path | None = None, official_root: Path | None = None,
-             allow_unverified_predictions: bool = False) -> dict:
+             allow_unverified_predictions: bool = False,
+             allow_harness_failures: bool = False) -> dict:
     if dataset_dir is None:
         if gt_path is None:
             raise HarnessError("Evaluation requires a dataset context")
@@ -56,7 +58,7 @@ def evaluate(pred_path: Path, gt_path: Path | None = None, *, dataset_dir: Path 
     # opt-in; deleting a sidecar can never silently downgrade verification.
     verify_bundle(pred_path, dataset, split, queries, required=not allow_unverified_predictions)
     failed = set(truth) - set(predictions)
-    statuses = {}
+    statuses, kinds = {}, {}
     if metadata_dir is not None:
         if not metadata_dir.is_dir():
             raise HarnessError(f"Run metadata directory not found: {metadata_dir}")
@@ -74,13 +76,21 @@ def evaluate(pred_path: Path, gt_path: Path | None = None, *, dataset_dir: Path 
             if status != "success":
                 if qid in predictions:
                     raise HarnessError(f"Failed run must not have a prediction: {qid}")
+                kind = "interrupted" if status == "running" else meta.get("failure_kind")
+                if kind is not None and kind not in FAILURE_KINDS:
+                    raise HarnessError(f"Unknown failure kind for {qid}: {kind!r}")
+                kinds[qid] = kind
                 failed.add(qid)
             elif qid not in predictions:
                 raise HarnessError(f"Successful run missing prediction: {qid}")
             statuses[qid] = status
         if set(predictions) - set(statuses):
             raise HarnessError("Predictions lack run metadata")
+    run_failures = failure_breakdown(kinds, truth, statuses) if metadata_dir is not None else None
+    if run_failures is not None and not allow_harness_failures:
+        refuse_harness_failures(kinds)
     evaluator = evaluator or dataset.get("evaluator", "generic")
+    scored = {qid: gt for qid, gt in truth.items() if qid in predictions}
     result = {
         "dataset": dataset["name"], "split": split,
         "evaluator": evaluator, "metric_units": "percent", "num_queries": len(truth),
@@ -93,8 +103,45 @@ def evaluate(pred_path: Path, gt_path: Path | None = None, *, dataset_dir: Path 
         "inputs": {"prediction_sha256": file_hash(pred_path), "ground_truth_sha256": file_hash(gt_path),
                    "dataset_hash": object_hash(dataset), "queries_hash": object_hash(queries)},
     }
+    if run_failures is not None:
+        result["run_failures"] = run_failures
     result.update(get_evaluator(evaluator)(predictions, truth, official_root=official_root))
+    # The headline numbers above keep the whole split as the denominator. These
+    # repeat them over only the queries the agent actually answered, so a gap in
+    # schema compliance or coverage stays visible instead of being averaged into
+    # the score and read as an inability to retrieve moments.
+    if scored and scored.keys() != truth.keys():
+        subset = {
+            "num_queries": len(scored),
+            "average_predictions_per_query":
+                sum(len(predictions[qid]["moments"]) for qid in scored) / len(scored),
+            "retrieval": retrieval_metrics(predictions, scored, list(top_k), list(iou_thresholds)),
+        }
+        subset.update(get_evaluator(evaluator)(predictions, scored, official_root=official_root))
+        result["successful_only"] = subset
     return result
+
+
+def failure_breakdown(kinds: dict, truth: dict, statuses: dict) -> dict:
+    counts = {kind: 0 for kind in sorted(FAILURE_KINDS)}
+    counts["unclassified"] = 0
+    for kind in kinds.values():
+        counts["unclassified" if kind is None else kind] += 1
+    counts["unattempted"] = len(truth.keys() - statuses.keys())
+    return counts
+
+
+def refuse_harness_failures(kinds: dict) -> None:
+    """A harness fault is not an agent score, so it never scores silently."""
+    broken = sorted(qid for qid, kind in kinds.items() if kind in HARNESS_FAILURE_KINDS)
+    if not broken:
+        return
+    shown = ", ".join(broken[:8]) + (f" ... (+{len(broken) - 8})" if len(broken) > 8 else "")
+    raise HarnessError(
+        f"{len(broken)} run(s) failed inside the harness rather than in the agent: {shown}.\n"
+        "Those queries carry no measurement. Fix the cause and rerun them (harness and "
+        "interrupted failures are retried automatically), or pass "
+        "--allow-harness-failures to deliberately score them as zeros.")
 
 
 def main():
@@ -110,6 +157,8 @@ def main():
     parser.add_argument("--metadata-dir", type=Path)
     parser.add_argument("--allow-unverified-predictions", action="store_true",
                         help="Accept raw prediction JSONL without an aggregate provenance sidecar")
+    parser.add_argument("--allow-harness-failures", action="store_true",
+                        help="Score harness/interrupted failures as zeros instead of refusing")
     args = parser.parse_args()
     saved = args.pred.parent / "config.yaml"
     cfg = load_config(args.config or (saved if saved.exists() else "config.yaml"))
@@ -125,10 +174,14 @@ def main():
                       iou_thresholds=evaluation["iou_thresholds"],
                       max_predictions=cfg["query"]["max_predictions"],
                       metadata_dir=args.metadata_dir, official_root=args.official_root,
-                      allow_unverified_predictions=args.allow_unverified_predictions)
+                      allow_unverified_predictions=args.allow_unverified_predictions,
+                      allow_harness_failures=args.allow_harness_failures)
     output = args.output or args.pred.parent / "metrics.json"
     write_json(output, result)
     print(f"{output}: {result['dataset']}/{result['split']}, {result['num_queries']} queries, {result['failed_runs']} failed runs")
+    if "successful_only" in result:
+        print(f"  scored over {result['successful_only']['num_queries']} answered queries as well; "
+              "compare both before attributing a gap to retrieval quality")
 
 
 if __name__ == "__main__":
