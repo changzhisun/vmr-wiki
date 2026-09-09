@@ -66,6 +66,13 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         ingest.setdefault("caption_mode", "simple")
         if ingest["caption_mode"] not in ("simple", "dense"):
             raise HarnessError("caption_mode must be simple or dense")
+        ingest.setdefault("dense_timestamp_mode", "absolute_seconds")
+        if ingest["dense_timestamp_mode"] not in ("absolute_seconds", "frame_index"):
+            raise HarnessError("dense_timestamp_mode must be absolute_seconds or frame_index")
+        # Code-owned version: cannot silently run new rules under an old identity.
+        if ingest.get("caption_processing_version", 2) != 2:
+            raise HarnessError("caption_processing_version is unsupported; use a new wiki root")
+        ingest["caption_processing_version"] = 2
         ingest.setdefault("caption_window_frames", 1)
         ingest.setdefault("caption_stride_frames", 1)
         positive_int(ingest["caption_window_frames"], "caption_window_frames")

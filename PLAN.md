@@ -2,6 +2,8 @@
 
 当前版本包含通用 Dataset Split 支持；Split 是 Adapter 定义的 opaque string，Harness 仅验证、筛选和记录。旧的无 split manifest 必须重新运行 Adapter。
 
+增量实现：Dense 时间坐标改为显式秒数或闭区间帧索引，处理规则版本进入内容哈希；Ingest 支持带完整性校验的帧/窗口 checkpoint、私有 caption 审计、耗时和 token 遥测，以及有容量上限的图像编码缓存。新增固定子集的四组 caption 对照实验入口与 Python 3.10/3.12 CI。对照实验真实模型结果需另行运行；事件语义合并和批量 FFmpeg 解码尚未实现，原始重叠事件及逐点 seek 语义保持不变。
+
 ## 1. 项目目标
 
 将一个现成的 Video Moment Retrieval（VMR）数据集改造成一个适合 Codex / Claude Code 等 LLM Agent 独立求解的标准化 Harness。

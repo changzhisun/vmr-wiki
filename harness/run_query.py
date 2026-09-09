@@ -252,9 +252,22 @@ def main():
         if query is None:
             raise HarnessError(f"Unknown query: {args.query_id}")
         result = experiment.run(query)
-        print(f"{args.query_id}: {result['status']}")
+        print(run_status(result, experiment.root))
         if result["status"] != "success":
             raise SystemExit(1)
+
+
+def run_status(result: dict, root: Path) -> str:
+    """Useful CLI diagnostics without opening large metadata files."""
+    qid = result["query_id"]
+    message = f"{qid}: {result['status']}"
+    if result["status"] != "success":
+        reason = " ".join(str(result.get("error") or "No error detail recorded").split())[:300]
+        message += f" [{result.get('failure_kind') or 'unclassified'}] {reason}"
+        message += f"\n  metadata: {root / 'run_metadata' / (qid + '.json')}"
+        message += f"\n  logs: {root / 'logs' / (qid + '.stderr.log')}"
+        message += f"\n        {root / 'logs' / (qid + '.stdout.log')}"
+    return message
 
 
 if __name__ == "__main__":

@@ -174,3 +174,48 @@ def test_content_filter_fails_immediately(cfg, tmp_path, monkeypatch):
     with pytest.raises(HarnessError, match="finish_reason='content_filter'"):
         VLMClient(cfg["ingest"]["vlm"]).caption(image)
     assert len(calls) == 1
+
+
+def test_encoded_images_are_reused_and_invalidated(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"first")
+    client = VLMClient(cfg["ingest"]["vlm"])
+    first = client._image_url(image)
+    original = type(image).read_bytes
+    reads = []
+
+    def read(path):
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(type(image), "read_bytes", read)
+    assert client._image_url(image) == first
+    assert reads == []
+    image.write_bytes(b"changed image")
+    assert client._image_url(image) != first
+    assert reads == [image]
+
+
+def test_request_usage_and_errors_are_recorded_without_credentials(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"image")
+    calls = []
+
+    def request(req, timeout):
+        calls.append(req)
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(req.full_url, 429, "fake-key", {}, None)
+        return io.BytesIO(json.dumps({"usage": {"prompt_tokens": 8, "completion_tokens": 2,
+                                               "total_tokens": 10}, "choices": [{
+            "finish_reason": "stop", "message": {"content": "A person."}}]}).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    client = VLMClient(cfg["ingest"]["vlm"])
+    assert client.caption(image) == "A person."
+    assert client.last_requests[0]["http_status"] == 429
+    assert client.last_requests[1]["usage"]["total_tokens"] == 10
+    assert client.last_requests[1]["elapsed_sec"] >= 0
+    assert "fake-key" not in json.dumps(client.last_requests)

@@ -6,9 +6,11 @@ import json
 import os
 import re
 import time
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
+from collections import OrderedDict
 from pathlib import Path
 
 from harness.common import HarnessError, nonempty
@@ -61,18 +63,46 @@ def _request_extras(model: str) -> tuple[str, dict]:
 
 
 class VLMClient:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, timestamp_mode: str = "absolute_seconds"):
         self.config = config
+        self.timestamp_mode = timestamp_mode
+        self._local = threading.local()
+        self._images = OrderedDict()
+        self._image_bytes = 0
+        self._cache_lock = threading.Lock()
         self.key = os.environ.get(config["api_key_env"])
         if not self.key:
             raise HarnessError(f"Set {config['api_key_env']} before ingest")
         if config["model"].startswith("REPLACE_"):
             raise HarnessError("Configure an explicit VLM model before ingest")
 
+    @property
+    def last_requests(self) -> list[dict]:
+        return getattr(self._local, "requests", [])
+
+    def _image_url(self, image: Path) -> str:
+        stat = image.stat()
+        key = (str(image.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        with self._cache_lock:
+            value = self._images.pop(key, None)
+            if value is not None:
+                self._images[key] = value
+                return value
+            value = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
+            limit = 32 * 1024 * 1024
+            while self._images and self._image_bytes + len(value) > limit:
+                _, old = self._images.popitem(last=False)
+                self._image_bytes -= len(old)
+            if len(value) <= limit:
+                self._images[key] = value
+                self._image_bytes += len(value)
+            return value
+
     def caption(self, images: Path | Sequence[Path], *,
                 timestamps: Sequence[float] | None = None,
                 correction: str | None = None) -> str:
         cfg = self.config
+        self._local.requests = []
         paths = [images] if isinstance(images, Path) else list(images)
         if not paths:
             raise HarnessError("VLM caption requires at least one image")
@@ -91,6 +121,11 @@ class VLMClient:
             prompt = prompt.replace(placeholder, ", ".join(
                 f"{timestamp}" for timestamp in timeline
             ))
+            if self.timestamp_mode == "frame_index":
+                prompt += (
+                    "\nBoundary coordinate contract: the listed values are zero-based "
+                    "frame indices, NOT seconds. Both start and end are inclusive indices."
+                )
         elif placeholder in prompt:
             raise HarnessError("VLM timestamp prompt requires frame timestamps")
         elif len(paths) > 1:
@@ -109,9 +144,7 @@ class VLMClient:
         prompt += suffix
         content = [{"type": "text", "text": prompt}]
         for image in paths:
-            image_url = (
-                "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
-            )
+            image_url = self._image_url(image)
             content.append({
                 "type": "image_url",
                 "image_url": {"url": image_url, "detail": "high"},
@@ -128,12 +161,22 @@ class VLMClient:
                 data=json.dumps(payload, allow_nan=False).encode(),
                 headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"},
             )
+            started = time.monotonic()
+            trace = {"attempt": attempt + 1, "image_count": len(paths)}
             try:
                 with urllib.request.urlopen(request, timeout=cfg["timeout_sec"]) as response:
                     result = json.load(response)
                 choice = result["choices"][0]
                 finish_reason = choice.get("finish_reason")
                 text = _choice_text(choice)
+                trace.update(finish_reason=finish_reason, raw_response=text,
+                             status="success")
+                usage = result.get("usage")
+                trace["usage"] = {
+                    key: value for key, value in (usage.items() if isinstance(usage, dict) else [])
+                    if key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                    and type(value) is int and value >= 0
+                }
                 if finish_reason in _REFUSAL_REASONS or finish_reason == "length":
                     raise HarnessError(
                         f"VLM caption was truncated or refused (finish_reason={finish_reason!r})"
@@ -144,14 +187,23 @@ class VLMClient:
                     )
                 return nonempty(text, "VLM caption")
             except urllib.error.HTTPError as exc:
+                trace.update(status="http_error", http_status=exc.code)
                 # Do not log response bodies, request headers, or credentials.
                 if exc.code not in (408, 429, 500, 502, 503, 504) or attempt == cfg["max_retries"]:
                     raise HarnessError(f"VLM request failed with HTTP {exc.code}") from None
             except (urllib.error.URLError, TimeoutError):
+                trace["status"] = "connection_error"
                 if attempt == cfg["max_retries"]:
                     raise HarnessError("VLM request failed: connection error or timeout") from None
             except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                trace["status"] = "invalid_response"
                 raise HarnessError("VLM returned an invalid caption response") from exc
+            except HarnessError:
+                trace["status"] = "rejected_response"
+                raise
+            finally:
+                trace["elapsed_sec"] = time.monotonic() - started
+                self._local.requests.append(trace)
             if attempt == cfg["max_retries"]:
                 break
             time.sleep(min(2 ** attempt, 10))

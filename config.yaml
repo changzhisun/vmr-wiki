@@ -14,6 +14,8 @@ ingest:
   sample_interval_sec: 1.0
   # Dense mode returns validated temporal events; simple preserves plain captions.
   caption_mode: dense
+  # One coordinate system per response. frame_index uses inclusive 0-based indices.
+  dense_timestamp_mode: absolute_seconds
   # Number of sampled frames per VLM request, and sampled frames advanced per request.
   # The default 4/1 gives each sampled second a four-frame overlapping context window.
   caption_window_frames: 4

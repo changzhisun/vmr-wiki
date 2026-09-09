@@ -7,7 +7,7 @@ if __package__ in (None, ""):
 
 from harness.common import HarnessError, cli
 from harness.progress import ProgressBar
-from harness.run_query import Experiment, arguments, configured
+from harness.run_query import Experiment, arguments, configured, run_status
 
 
 def main():
@@ -32,7 +32,7 @@ def main():
                 completed += 1
                 failed += result["status"] != "success"
                 bar.update()
-                bar.log(f"{query['query_id']}: {result['status']}")
+                bar.log(run_status(result, experiment.root))
         finally:
             bar.finish()
     print(f"Finished: {failed} failed/unresolved runs")

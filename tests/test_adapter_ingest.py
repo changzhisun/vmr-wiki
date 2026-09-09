@@ -161,7 +161,7 @@ def test_dense_events_map_frame_indices_onto_shifted_windows():
     assert parse_dense_events(json.dumps({"events": [
         {"start": 0, "end": 1, "caption": "A person enters."},
         {"start": 2, "end": 3, "caption": "The person stops."},
-    ]}), timeline) == [
+    ]}), timeline, "frame_index") == [
         {"start": 115.0, "end": 116.0, "caption": "A person enters."},
         {"start": 117.0, "end": 118.0, "caption": "The person stops."},
     ]
@@ -170,26 +170,18 @@ def test_dense_events_map_frame_indices_onto_shifted_windows():
     ]}), timeline) == [
         {"start": 115.0, "end": 118.0, "caption": "Absolute times."},
     ]
-    assert parse_dense_events(json.dumps({"events": [
-        {"start": 0, "end": 4, "caption": "Exclusive end as frame count."},
-    ]}), timeline) == [
-        {"start": 115.0, "end": 118.0, "caption": "Exclusive end as frame count."},
-    ]
-    assert parse_dense_events(json.dumps({"events": [
-        {"start": 0.0, "end": 4.0, "caption": "Covers the four-frame window."},
-    ]}), [0.0, 1.0, 2.0, 3.0]) == [
-        {"start": 0.0, "end": 3.0, "caption": "Covers the four-frame window."},
-    ]
-    assert parse_dense_events(json.dumps({"events": [
-        {"start": 4, "end": 4, "caption": "One-based last frame."},
-    ]}), [0.0, 1.0, 2.0, 3.0]) == [
-        {"start": 3.0, "end": 3.0, "caption": "One-based last frame."},
-    ]
-    assert parse_dense_events(json.dumps({"events": [
-        {"start": 115, "end": 119, "caption": "Exclusive time past last sample."},
-    ]}), timeline) == [
-        {"start": 115.0, "end": 118.0, "caption": "Exclusive time past last sample."},
-    ]
+    for start, end, mode in [(0, 4, "frame_index"), (115, 119, "absolute_seconds"),
+                             (0, 2, "absolute_seconds")]:
+        with pytest.raises(HarnessError, match="outside its window"):
+            parse_dense_events(json.dumps({"events": [
+                {"start": start, "end": end, "caption": "Invalid coordinates."},
+            ]}), timeline, mode)
+    # Reproduction: do not mix absolute seconds and indices within one event.
+    text = '{"events":[{"start":0,"end":2,"caption":"An action."}]}'
+    with pytest.raises(HarnessError, match="outside its window"):
+        parse_dense_events(text, [2.0, 3.0, 4.0, 5.0])
+    assert parse_dense_events(text, [2.0, 3.0, 4.0, 5.0], "frame_index") == [
+        {"start": 2.0, "end": 4.0, "caption": "An action."}]
     with pytest.raises(HarnessError, match=r"window=\[115.0, 116.0, 117.0, 118.0\]"):
         parse_dense_events(
             '{"events":[{"start":114,"end":115,"caption":"Before the window."}]}',

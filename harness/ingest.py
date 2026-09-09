@@ -9,15 +9,18 @@ import argparse
 import logging
 import math
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from harness.common import (HarnessError, atomic_text, cli, file_hash, identifier,
                             ingest_content_hash, nonempty, now, number, object_hash,
                             parse_json, positive_int, read_json, write_json, write_jsonl)
 from harness.config import load_config
+from harness.checkpoint import IngestCheckpoint
 from harness.freeze import remove_tree, tree_hashes, verify_wiki
 from harness.vlm import VLMClient
 
@@ -119,49 +122,16 @@ def _on_timeline(value: float, timestamps: list[float]) -> float | None:
     return None
 
 
-def _as_window_index(value: float, count: int) -> int | None:
-    nearest = round(value)
-    if abs(value - nearest) > _TIMESTAMP_EPS:
-        return None
-    index = int(nearest)
-    if count <= 0:
-        return None
-    if 0 <= index < count:
-        return index
-    # Exclusive 0-based end, or 1-based last frame (n frames numbered 1..n).
-    if index == count:
-        return count - 1
+def resolve_window_timestamp(value: float, timestamps: list[float],
+                             mode: str = "absolute_seconds") -> float | None:
+    """Use one explicit coordinate system for the entire response, never guess."""
+    if mode == "absolute_seconds":
+        return _on_timeline(value, timestamps)
+    if mode != "frame_index":
+        raise HarnessError("Unknown dense timestamp mode")
+    if value.is_integer() and 0 <= value < len(timestamps):
+        return timestamps[int(value)]
     return None
-
-
-def _exclusive_end(value: float, timestamps: list[float]) -> float | None:
-    if len(timestamps) < 2:
-        return None
-    step = timestamps[-1] - timestamps[-2]
-    if step <= 0:
-        return None
-    exclusive = timestamps[-1] + step
-    if abs(value - exclusive) <= _TIMESTAMP_EPS:
-        return timestamps[-1]
-    return None
-
-
-def resolve_window_timestamp(value: float, timestamps: list[float]) -> float | None:
-    """Map a model timestamp onto this window's sampled times.
-
-    Absolute times already on the timeline win. Otherwise a whole number in
-    ``[0, len(timestamps)]`` is a frame index: ``0..n-1`` as usual, and ``n`` as
-    the exclusive end / 1-based last frame. A time one step past the last
-    sample is the same exclusive end. Invented precision such as ``1.5`` is
-    still rejected.
-    """
-    matched = _on_timeline(value, timestamps)
-    if matched is not None:
-        return matched
-    index = _as_window_index(value, len(timestamps))
-    if index is not None:
-        return timestamps[index]
-    return _exclusive_end(value, timestamps)
 
 
 def _dense_events_payload(payload: object) -> list:
@@ -184,19 +154,21 @@ def _dense_events_payload(payload: object) -> list:
     )
 
 
-def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
+def parse_dense_events(text: str, timestamps: list[float],
+                       timestamp_mode: str = "absolute_seconds") -> list[dict]:
     """Validate and normalize one dense-caption response.
 
     Event boundaries must select timestamps from the window verbatim. This
     prevents the captioner from inventing temporal precision unavailable in
     the sampled frames. A surrounding Markdown code fence is discarded.
-    Extra object keys and a top-level events list are accepted. Whole-number
-    frame indices, including an exclusive end of ``n``, map onto the window
-    timeline.
+    Extra top-level keys and a bare events list are accepted. Frame-index mode
+    uses zero-based inclusive indices for both boundaries. No exclusive ends
+    or mixed coordinate systems are inferred.
     """
     payload = parse_json(unwrap_markdown_json_fence(text))
     events = _dense_events_payload(payload)
-    window = ", ".join(str(stamp) for stamp in timestamps)
+    allowed_values = list(range(len(timestamps))) if timestamp_mode == "frame_index" else timestamps
+    window = ", ".join(str(stamp) for stamp in allowed_values)
     normalized = []
     previous_start: float | None = None
     for index, event in enumerate(events, 1):
@@ -205,10 +177,10 @@ def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
                 f"Dense caption event {index} must contain only start, end, and caption"
             )
         start = resolve_window_timestamp(
-            number(event["start"], f"dense event {index} start"), timestamps
+            number(event["start"], f"dense event {index} start"), timestamps, timestamp_mode
         )
         end = resolve_window_timestamp(
-            number(event["end"], f"dense event {index} end"), timestamps
+            number(event["end"], f"dense event {index} end"), timestamps, timestamp_mode
         )
         if start is None or end is None:
             raise HarnessError(
@@ -229,7 +201,8 @@ def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
 
 
 def dense_events(client, images: list[Path], timestamps: list[float], max_repairs: int,
-                 *, cancel_event: threading.Event | None = None) -> list[dict]:
+                 *, cancel_event: threading.Event | None = None,
+                 timestamp_mode: str = "absolute_seconds", record=None) -> list[dict]:
     """Caption one window, re-asking a bounded number of times on a violation.
 
     A rejected dense answer is usually the captioner ignoring the window
@@ -242,15 +215,37 @@ def dense_events(client, images: list[Path], timestamps: list[float], max_repair
         # Only a repair passes correction, so the first call of a run stays
         # identical to a captioner that does not accept one.
         repair = {} if correction is None else {"correction": correction}
-        response = client.caption(images, timestamps=timestamps, **repair)
+        # The model sees only values from the selected coordinate system.
+        timeline = list(range(len(timestamps))) if timestamp_mode == "frame_index" else timestamps
+        started = time.monotonic()
+        attempt = {"correction": correction, "timestamp_mode": timestamp_mode}
         try:
-            return parse_dense_events(response, timestamps)
-        except HarnessError as exc:
+            response = client.caption(images, timestamps=timeline, **repair)
+            attempt["raw_response"] = response
+            events = parse_dense_events(response, timestamps, timestamp_mode)
+            attempt.update(status="success", normalized_events=events)
+            return events
+        except BaseException as exc:
+            attempt.update(status="failed", error=str(exc) if isinstance(exc, HarnessError)
+                           else type(exc).__name__)
+            # Interrupts and unexpected client errors must leave a complete
+            # audit record so a later resumption can aggregate all attempts.
+            if not isinstance(exc, HarnessError):
+                raise
+            # Transport failures and truncated responses follow the VLM retry
+            # policy, not the schema-repair budget.
+            if "raw_response" not in attempt:
+                raise
             if not remaining:
                 raise
             correction = str(exc)
             logger.warning("Re-asking the captioner for window %s: %s",
                            f"[{timestamps[0]}, {timestamps[-1]}]", exc)
+        finally:
+            attempt["elapsed_sec"] = time.monotonic() - started
+            attempt["requests"] = getattr(client, "last_requests", [])
+            if record is not None:
+                record(attempt)
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -361,8 +356,16 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         if output.exists():
             raise HarnessError("Ingest completed concurrently; rerun to verify existing output")
         duration, video_stream_duration = probe_durations(video)
+        ffmpeg_version = media_command(["ffmpeg", "-version"]).splitlines()[0]
+        checkpoint = IngestCheckpoint(output, {
+            "version": 2, "output": str(output.resolve()), "video_id": video_id,
+            "source_sha256": source_hash, "content_hash": content_hash,
+            "ffmpeg_version": ffmpeg_version,
+            "duration": duration, "video_stream_duration": video_stream_duration,
+        })
         _check_cancelled(cancel_event)
-        client = captioner if captioner is not None else VLMClient(cfg["ingest"]["vlm"])
+        client = captioner if captioner is not None else VLMClient(
+            cfg["ingest"]["vlm"], timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"))
         staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
         (staging / "frames").mkdir()
         sampling_times = sample_times(
@@ -378,21 +381,58 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         caption_mode = cfg["ingest"]["caption_mode"]
         windows = caption_windows(sampled_frames, window_frames, stride_frames)
         used_ids = {frame["frame_id"] for window in windows for frame in window}
+        extraction_sec = 0.0
+        extraction_total_sec = 0.0
+        reused_frames = reused_windows = 0
         for frame in sampled_frames:
             if frame["frame_id"] not in used_ids:
                 continue
             _check_cancelled(cancel_event)
-            extract_frame(video, frame["timestamp"], staging / frame["frame"], cfg["ingest"])
+            image = checkpoint.image(frame)
+            if image is None:
+                image = checkpoint.root / frame["frame"]
+                image.parent.mkdir(parents=True, exist_ok=True)
+                started = time.monotonic()
+                extract_frame(video, frame["timestamp"], image, cfg["ingest"])
+                elapsed = time.monotonic() - started
+                extraction_sec += elapsed
+                checkpoint.seal_image(frame, elapsed)
+            else:
+                reused_frames += 1
+            extraction_total_sec += checkpoint.read(frame["frame"] + ".json")["elapsed_sec"]
+            shutil.copyfile(image, staging / frame["frame"])
 
         entries = []
+        audit = []
         for window_index, window in enumerate(windows, 1):
             _check_cancelled(cancel_event)
-            images = [staging / frame["frame"] for frame in window]
+            window_id = f"w{window_index:06d}"
+            checkpoint_name = f"windows/{window_id}.json"
+            saved = checkpoint.read(checkpoint_name)
+            if saved is not None:
+                if saved["frames"] != window:
+                    raise HarnessError(f"Checkpoint window changed: {window_id}")
+                entries.append(saved["entry"])
+                audit.append({"window_id": window_id, "attempts": checkpoint.attempts(window_id)})
+                reused_windows += 1
+                continue
+            # Stable paths allow encoded image reuse across windows and retries.
+            images = [checkpoint.root / frame["frame"] for frame in window]
+            def record(attempt):
+                attempt["model"] = cfg["ingest"]["vlm"]["model"]
+                # Transport can change between resumptions without changing
+                # content identity; retain what was used for each attempt.
+                attempt["transport"] = {key: cfg["ingest"]["vlm"].get(key)
+                                        for key in ("provider", "base_url", "api_key_env",
+                                                    "timeout_sec", "max_retries")}
+                checkpoint.record_attempt(window_id, attempt)
             if caption_mode == "dense":
                 timestamps = [frame["timestamp"] for frame in window]
                 events = dense_events(
                     client, images, timestamps, cfg["ingest"]["caption_max_repairs"],
                     cancel_event=cancel_event,
+                    timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"),
+                    record=record,
                 )
                 _check_cancelled(cancel_event)
                 entries.append({
@@ -402,20 +442,36 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
                     "frames": window,
                     "events": events,
                 })
-                continue
-            caption_input = images[0] if window_frames == 1 else images
-            caption = nonempty(client.caption(caption_input), "caption")
-            _check_cancelled(cancel_event)
-            if window_frames == 1:
-                entries.append({**window[0], "caption": caption})
             else:
-                entries.append({
-                    "window_id": f"w{window_index:06d}",
-                    "start_timestamp": window[0]["timestamp"],
-                    "end_timestamp": window[-1]["timestamp"],
-                    "frames": window,
-                    "caption": caption,
-                })
+                caption_input = images[0] if window_frames == 1 else images
+                started = time.monotonic()
+                attempt = {}
+                try:
+                    caption = nonempty(client.caption(caption_input), "caption")
+                    attempt.update(status="success", raw_response=caption)
+                except BaseException as exc:
+                    attempt.update(status="failed", error=str(exc) if isinstance(exc, HarnessError)
+                                   else type(exc).__name__)
+                    raise
+                finally:
+                    attempt.update(elapsed_sec=time.monotonic() - started,
+                                   requests=getattr(client, "last_requests", []))
+                    record(attempt)
+                _check_cancelled(cancel_event)
+                if window_frames == 1:
+                    entries.append({**window[0], "caption": caption})
+                else:
+                    entries.append({
+                        "window_id": window_id,
+                        "start_timestamp": window[0]["timestamp"],
+                        "end_timestamp": window[-1]["timestamp"],
+                        "frames": window, "caption": caption,
+                    })
+            checkpoint.write(checkpoint_name, {"frames": window, "entry": entries[-1]})
+            audit.append({"window_id": window_id, "attempts": checkpoint.attempts(window_id)})
+        write_jsonl(staging / "caption_audit.jsonl", audit)
+        attempts = [attempt for row in audit for attempt in row["attempts"]]
+        requests = [request for attempt in attempts for request in attempt["requests"]]
         write_jsonl(staging / "frames.jsonl", entries)
         atomic_text(staging / "wiki.md", render_wiki(
             duration, cfg["ingest"]["sample_interval_sec"], entries,
@@ -430,17 +486,35 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
                     # Hash of content-determining settings only; transport,
                     # auth, timeouts, and retries remain provenance metadata.
                     "ingest_config_hash": content_hash, "created_at": now(),
-                    "ffmpeg_version": media_command(["ffmpeg", "-version"]).splitlines()[0],
+                    "ffmpeg_version": ffmpeg_version,
+                    "caption_processing_version": cfg["ingest"].get("caption_processing_version", 2),
+                    "telemetry": {"extraction_sec_this_run": extraction_sec,
+                                  "extraction_sec": extraction_total_sec,
+                                  "caption_sec": sum(a["elapsed_sec"] for a in attempts),
+                                  "caption_attempts": len(attempts),
+                                  "rejected_attempts": sum(a["status"] != "success" for a in attempts),
+                                  "api_requests": len(requests),
+                                  "requests_with_usage": sum(bool(r.get("usage")) for r in requests),
+                                  "requests_with_total_tokens": sum("total_tokens" in r.get("usage", {})
+                                                                    for r in requests),
+                                  "usage": {key: sum(r.get("usage", {}).get(key, 0) for r in requests)
+                                            for key in ("prompt_tokens", "completion_tokens", "total_tokens")},
+                                  "reused_frames": reused_frames, "reused_windows": reused_windows,
+                                  "window_count": len(windows)},
                     "content_hashes": tree_hashes(staging)}
         write_json(staging / "ingest.json", metadata)
         staging.rename(output)
+        try:
+            remove_tree(checkpoint.root)
+        except OSError:
+            logger.warning("Wiki published successfully; could not remove checkpoint: %s", checkpoint.root)
         return metadata
     finally:
         if staging is not None and staging.exists():
             remove_tree(staging)
         lock.unlink(missing_ok=True)
         # If we never produced output, remove the (now empty) parent directory
-        # so a failed ingest leaves no trace at all. rmdir only succeeds when
+        # while keeping the private checkpoint for resume. rmdir only succeeds when
         # empty (non-empty = concurrent ingest or other videos: leave it).
         if not output.exists():
             try:

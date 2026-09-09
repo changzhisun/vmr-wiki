@@ -178,7 +178,9 @@ python harness/ingest_all.py --dataset qvhighlights --split val --freeze
 python harness/freeze.py --dataset qvhighlights --split val
 ```
 
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内的采样时间替换进 `{{FRAME_TIMESTAMPS}}`（只给时间值，不给帧文件名，因为文件名从 1 开始而时间从 0 开始，成对出现会诱发偏移），要求 VLM 返回只使用这些时间点的有序事件 JSON；若模型把 `start`/`end` 写成 `0..n` 的帧序号（含半开区间的 `n`）或写成最后一个采样点再加一步，会映射回该窗口的采样时间，其它时刻仍直接拒绝。被拒绝时最多按 `caption_max_repairs` 重问该窗口，并把拒绝原因回传给模型；`temperature` 为 0，不回传原因的重试只会得到同样的答案。Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内的采样时间替换进 `{{FRAME_TIMESTAMPS}}`（只给时间值，不给帧文件名），要求 VLM 返回只使用这些时间点的有序事件 JSON。Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+
+Dense 时间坐标必须显式选择，不能自动猜测：默认 `dense_timestamp_mode: absolute_seconds` 只接受当前窗口提供的秒数；`frame_index` 则向模型提供 `0..n-1` 的帧索引，要求 `start` / `end` 都为闭区间索引，再整体转换回秒数。两种模式均拒绝半开区间终点 `n`、非采样时刻及越界值。例如窗口 `[2,3,4,5]` 中的事件 `[0,2]` 在秒数模式下非法，在索引模式下转换为 `[2,4]`，不会混用两种解释。处理规则版本 `caption_processing_version: 2` 由代码维护，并与坐标模式一起进入 Dense 内容哈希；旧自动转换规则生成的 Dense Wiki 不能直接复用，需要新的 Wiki 根目录。
 
 每个视频输出：
 
@@ -186,16 +188,21 @@ Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 
 wiki/qvhighlights/videos/<video_id>/
 ├── wiki.md
 ├── frames.jsonl
+├── caption_audit.jsonl
 ├── frames/
 ├── ingest.json
 └── frozen.json
 ```
 
-`ingest.json` 记录媒体 SHA256、配置、FFmpeg 版本和内容哈希；`frozen.json` 覆盖 Markdown、JSONL、**每一张图像**及 Ingest 元数据。每个视频独立冻结，实验的 `experiment.json` 保存所选视频的哈希快照；不再使用阻止新增视频的数据集级 `freeze.json`。
+`ingest.json` 记录媒体 SHA256、配置、FFmpeg 版本、处理规则版本、内容哈希和 `telemetry`。`caption_audit.jsonl` 保留每个窗口的原始响应、标准化事件、修复原因、请求状态、耗时和服务端提供的 token 用量。审计文件参与冻结，但不会复制进 Query Agent 工作区，Agent 仍只看到 `wiki.md`、`frames.jsonl` 和 `frames/`。`frozen.json` 覆盖 Markdown、JSONL、**每一张图像**及 Ingest 元数据。每个视频独立冻结，实验的 `experiment.json` 保存所选视频的哈希快照；不再使用阻止新增视频的数据集级 `freeze.json`。
 
 Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式；Simple 多图模式的每行包含窗口信息、`frames` 数组和一个窗口 Caption。Dense 模式的每行包含窗口信息、按时间排序的 `frames` 数组和经过校验的 `events` 数组，每个事件都包含来自当前窗口时间线的 `start`、`end` 及 Caption。`wiki.md` 按窗口列出 Dense 事件时间范围及对应图片。重叠窗口的原始事件会完整保留，不做语义合并。
 
-完整 Ingest 再次执行时只核验并复用，不重新 caption。失败的临时输出被清除；API 仅对临时网络错误、限流和服务端错误做有限重试，达到 Token 上限的截断响应会直接失败。Dense 响应若整段包在 Markdown JSON 代码围栏里，只剥掉围栏再解析；顶层 `events` 数组或带多余字段的对象都可以；`start`/`end` 若是当前窗口的帧序号（含半开区间的 `n`）则映射为采样时间。事件字段不符、事件无序、时间越界、使用非采样时间点、或围栏外还有其它文字时同样直接失败，不会发明中间时刻。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
+完整 Ingest 再次执行时只核验并复用，不重新 caption。处理中每个抽帧文件、已完成窗口和请求审计原子保存到 `wiki/<dataset>/.ingest-checkpoints/<video_id>/<identity_hash>/`。失败或正常 Ctrl-C 会清除发布用 staging，但保留 checkpoint；重新执行相同 Ingest 命令即可验证并复用已完成的帧和窗口。Checkpoint 身份包含源视频哈希、内容配置、媒体时长和 FFmpeg 版本，损坏记录会报错，身份不同的记录不会复用。成功发布后清理对应 checkpoint，其他身份的旧缓存保留。强制杀进程可能留下锁文件，必须确认没有活跃进程后才可手动移除该视频的锁；也可能重做尚未原子保存的调用，不保证 API 恰好调用一次。
+
+API 仅对临时网络错误、限流和服务端错误做有限重试，达到 token 上限的截断响应会直接失败。Dense 响应可以包在 Markdown JSON 围栏里，也兼容顶层事件数组和多余字段；事件字段不符、无序、时间越界、非采样时间点或围栏外有其它文字时，会回传拒绝原因，最多按 `caption_max_repairs` 重问当前窗口，仍不合法则失败。该修复预算按本次运行的窗口调用计算，历史失败审计保留。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
+
+重叠窗口使用每个 VLM client 上限 32 MiB 的图像 Base64 LRU 缓存，减少重复读图和编码；不会减少模型实际接收的图像或 API token。FFmpeg 仍逐采样点 seek，暂不改变抽帧语义。`telemetry.extraction_sec` 汇总保留的成功抽帧耗时，`extraction_sec_this_run` 仅为本次新抽帧耗时；`caption_sec` 包括历史保留的 caption 尝试和重试等待，`reused_frames` / `reused_windows` 显示本次复用量。服务端不返回 usage 时无法推算 token，汇总报告显示 `null`。
 
 批量 Ingest 保留 `--jobs`（默认 4）和 `--verbose`。`--jobs 1` 顺序执行；多个 worker 并发处理当前 split 的不同视频，不会对共享 video_id 重复提交任务。Ingest 与批量 Query 的进度条都会显示已完成数量、平均处理速度和预计剩余时间，结束时显示总耗时。收到 Ctrl-C 时，尚未开始的任务立即取消，运行中的 worker 在当前 FFmpeg/VLM 调用结束后的下一个检查点退出并清理 staging 目录；主进程等待 worker 收敛，不会让后台线程继续发布 Wiki。
 
@@ -384,6 +391,27 @@ python harness/evaluate.py \
 
 上游 R1 不能处理空预测，AP 会遗漏空列表。因此官方桥接仅在评测器内将缺失/空预测表示成零长度、零分数、不可能命中 GT 的 sentinel，以保留全体 Query 分母；原始预测文件不变。空长度分组返回 `null`，不产生非法 JSON NaN。
 
+## 5. Caption 小规模对照实验
+
+先从有 GT 的 split 确定性抽取带 Query 的视频子集，生成四组配置。`prepare` 不调用模型 API，但会读取并计算所选视频的哈希；输出目录必须是新目录：
+
+```bash
+python harness/ablation.py prepare \
+  --config /path/to/local.yaml --dataset uca --split dev \
+  --limit-videos 10 --seed 0 --output experiments/caption_dev
+
+python harness/ablation.py run --suite experiments/caption_dev --stage ingest --jobs 4
+python harness/ablation.py run --suite experiments/caption_dev --stage query
+python harness/ablation.py run --suite experiments/caption_dev --stage evaluate
+python harness/ablation.py summarize --suite experiments/caption_dev
+```
+
+`run` 的 Ingest 和 Query 阶段会实际调用配置中的模型并产生费用；`--stage all` 可以串行完成全部阶段。`--jobs` 只控制 Ingest 视频并发，Query 按顺序运行。每组沿用原有失败/续跑规则，不会为失败的 Agent Query 额外抽一次答案。
+
+四组分别是 Simple 1/1、Simple 4/1、Dense 4/1、Dense 8/4（window/stride）。它们使用相同的视频、Query、GT、采样间隔、模型、token 上限和 Query Agent 配置，但独立生成 Wiki；Simple 与 Dense 使用各自格式的固定 prompt。4/1 与 8/4 同时改变窗口和步长，只能判断组合效果，不能把差异单独归因于窗口大小。配置、数据快照、源视频、模板及代码哈希固定，Agent runtime 也必须一致；输入变化时要求重新准备 suite。
+
+`comparison.json` 汇总每组检索指标、失败情况、完成视频/Query 数、阶段累计 wall time、Caption 尝试数与耗时，以及可用时的 Caption token 总量。未完成组标为 `complete: false`，未开始的统计和不可用的 token 用量为 `null`。成本只覆盖已完成视频保留下来的工作（包括其历史失败 caption），不包含仍失败视频的 checkpoint 或 Query Agent token，不换算价格。真实模型的效果和提速幅度需运行后比较，离线模拟测试不代表模型效果。
+
 ## 旧数据迁移（方案 A）
 
 旧 manifest 缺少 split 或没有 `dataset.json` 时，程序明确提示重新运行 Dataset Adapter；不自动补 `default`，也不猜测 train/val/test。请在新目录重新转换后切换配置，保留原始 annotation 名称。旧实验和不含 split 的预测不能与新实验混用。
@@ -401,6 +429,8 @@ python -m pytest -q
 Split 测试覆盖任意名称、unknown split、严格布尔类型、默认 eval split、视频/Query 筛选、共享 Wiki 增量冻结、跨 split Query ID、预测隔离、无 GT 拒绝和混合 provenance。
 
 测试通过 FFmpeg 生成三秒视频，使用明确的测试 captioner 与短生命周期子进程模拟模型输出。覆盖完整链路、Query/GT 不被 Ingest 读取、GT 不被 Query 读取、隔离输入结构、篡改检测、失败不重跑、超时/非法输出、AP 匹配和排名语义。没有 FFmpeg 时媒体集成测试会明确跳过。模拟 runner 只存在于测试，不是正式实验选项。
+
+新增测试覆盖显式 Dense 时间坐标、窗口续跑与缓存损坏、内容版本隔离、编码缓存和请求遥测，以及四组对照实验的离线完整链路。GitHub Actions 在 Python 3.10 / 3.12 上安装 FFmpeg，运行聚焦错误级别的 Ruff 检查和 pytest。Query 失败日志直接显示失败类别、简短原因及 metadata/stdout/stderr 文件路径。
 
 构建镜像后可执行真实容器检查，测试不调用模型 API：
 
@@ -426,6 +456,7 @@ VMR_OFFICIAL_ROOT=/path/to/moment_detr \
 | Query | `harness/run_query.py`、`harness/run_all_queries.py`、`harness/workspace.py` |
 | Agent | `agents/codex.py`、`agents/claude_code.py`、`agents/runner.py` |
 | Validate / Eval | `harness/validate.py`、`harness/aggregate.py`、`harness/evaluate.py` |
+| Caption ablation | `harness/ablation.py` |
 
 同样支持 `python -m harness.ingest` 等模块形式。第一版不提供 embedding、ASR、重新抽帧、query-specific Wiki、跨 Query memory 或训练。
 
