@@ -90,6 +90,44 @@ def caption_windows(frames: list[dict], window_frames: int, stride_frames: int) 
     return [frames[start:start + window] for start in range(0, len(frames), stride)]
 
 
+def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
+    """Validate and normalize one dense-caption response.
+
+    Event boundaries must select timestamps from the window verbatim. This
+    prevents the captioner from inventing temporal precision unavailable in
+    the sampled frames.
+    """
+    payload = parse_json(text)
+    if not isinstance(payload, dict) or set(payload) != {"events"}:
+        raise HarnessError("Dense caption must be an object containing only events")
+    events = payload["events"]
+    if not isinstance(events, list):
+        raise HarnessError("Dense caption events must be a list")
+    allowed = set(timestamps)
+    normalized = []
+    previous_start: float | None = None
+    for index, event in enumerate(events, 1):
+        if not isinstance(event, dict) or set(event) != {"start", "end", "caption"}:
+            raise HarnessError(
+                f"Dense caption event {index} must contain only start, end, and caption"
+            )
+        start = number(event["start"], f"dense event {index} start")
+        end = number(event["end"], f"dense event {index} end")
+        if start not in allowed or end not in allowed:
+            raise HarnessError(f"Dense caption event {index} uses a timestamp outside its window")
+        if start > end:
+            raise HarnessError(f"Dense caption event {index} start must be <= end")
+        if previous_start is not None and start < previous_start:
+            raise HarnessError("Dense caption events must be in chronological order")
+        previous_start = start
+        normalized.append({
+            "start": start,
+            "end": end,
+            "caption": nonempty(event["caption"], f"dense event {index} caption").strip(),
+        })
+    return normalized
+
+
 def extract_frame(video: Path, timestamp: float, output: Path, cfg: dict) -> None:
     size = cfg["image_max_size"]
     scale = f"scale=w='min({size},iw)':h='min({size},ih)':force_original_aspect_ratio=decrease"
@@ -103,12 +141,21 @@ def extract_frame(video: Path, timestamp: float, output: Path, cfg: dict) -> Non
 
 def render_wiki(duration: float, interval: float, entries: list[dict], *,
                 sampled_frame_count: int | None = None, window_frames: int = 1,
-                stride_frames: int = 1) -> str:
+                stride_frames: int = 1, caption_mode: str = "simple") -> str:
     """Query-independent and identity-neutral: the video id is a lookup key
     into public benchmark data, and the agent never needs it to locate moments."""
     lines = ["# Video", "", "## Metadata", "",
              f"- Duration: {duration} seconds", f"- Sampling interval: {interval} seconds"]
-    if window_frames == 1:
+    if caption_mode == "dense":
+        lines += [
+            "- Caption mode: dense",
+            f"- Number of sampled frames: {sampled_frame_count}",
+            f"- Number of caption windows: {len(entries)}",
+            f"- Number of dense events: {sum(len(entry['events']) for entry in entries)}",
+            f"- Caption window: {window_frames} sampled frames",
+            f"- Caption stride: {stride_frames} sampled frames",
+        ]
+    elif window_frames == 1:
         lines += [f"- Number of frames: {len(entries)}"]
     else:
         lines += [
@@ -119,6 +166,26 @@ def render_wiki(duration: float, interval: float, entries: list[dict], *,
         ]
     lines += ["", "## Timeline", ""]
     for entry in entries:
+        if caption_mode == "dense":
+            start, end = entry["start_timestamp"], entry["end_timestamp"]
+            window_range = f"{start}s" if start == end else f"{start}s–{end}s"
+            lines += [f"### Window {window_range}", ""]
+            if entry["events"]:
+                for event in entry["events"]:
+                    event_start, event_end = event["start"], event["end"]
+                    event_range = (
+                        f"{event_start}s" if event_start == event_end
+                        else f"{event_start}s–{event_end}s"
+                    )
+                    lines += [f"#### Event {event_range}", "", event["caption"], ""]
+            else:
+                lines += ["No meaningful visual event.", ""]
+            lines.append("Frames:")
+            lines += [
+                f"- {frame['timestamp']}s: `{frame['frame']}`" for frame in entry["frames"]
+            ]
+            lines.append("")
+            continue
         if "frames" not in entry:
             lines += [f"### {entry['timestamp']}s", "", entry["caption"], "",
                       f"Frame: `{entry['frame']}`", ""]
@@ -182,6 +249,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         ]
         window_frames = cfg["ingest"]["caption_window_frames"]
         stride_frames = cfg["ingest"]["caption_stride_frames"]
+        caption_mode = cfg["ingest"]["caption_mode"]
         windows = caption_windows(sampled_frames, window_frames, stride_frames)
         used_ids = {frame["frame_id"] for window in windows for frame in window}
         for frame in sampled_frames:
@@ -194,6 +262,19 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         for window_index, window in enumerate(windows, 1):
             _check_cancelled(cancel_event)
             images = [staging / frame["frame"] for frame in window]
+            if caption_mode == "dense":
+                timestamps = [frame["timestamp"] for frame in window]
+                response = client.caption(images, timestamps=timestamps)
+                events = parse_dense_events(response, timestamps)
+                _check_cancelled(cancel_event)
+                entries.append({
+                    "window_id": f"w{window_index:06d}",
+                    "start_timestamp": window[0]["timestamp"],
+                    "end_timestamp": window[-1]["timestamp"],
+                    "frames": window,
+                    "events": events,
+                })
+                continue
             caption_input = images[0] if window_frames == 1 else images
             caption = nonempty(client.caption(caption_input), "caption")
             _check_cancelled(cancel_event)
@@ -211,7 +292,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         atomic_text(staging / "wiki.md", render_wiki(
             duration, cfg["ingest"]["sample_interval_sec"], entries,
             sampled_frame_count=len(used_ids), window_frames=window_frames,
-            stride_frames=stride_frames))
+            stride_frames=stride_frames, caption_mode=caption_mode))
         if file_hash(video) != source_hash:
             raise HarnessError("Source video changed during ingest")
         _check_cancelled(cancel_event)

@@ -50,10 +50,12 @@ def cfg(tmp_path):
     config["ingest"]["sample_interval_sec"] = 1.0
     # Most pipeline tests exercise the legacy single-frame schema. Multi-frame
     # window behavior is covered explicitly in test_adapter_ingest.py.
+    config["ingest"]["caption_mode"] = "simple"
     config["ingest"]["caption_window_frames"] = 1
     config["ingest"]["caption_stride_frames"] = 1
     config["ingest"]["image_max_size"] = 64
     config["ingest"]["vlm"]["model"] = "fixture-vlm"
+    config["ingest"]["vlm"]["prompt"] = "Describe the visible frame."
     config["query"]["model"] = "fixture-agent"
     yield config
     for kind in ("wiki", "runs"):

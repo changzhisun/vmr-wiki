@@ -377,9 +377,9 @@ python harness/ingest_all.py \
         ↓
 按固定 window / stride 组成 frame 窗口
         ↓
-对每个窗口调用固定 VLM API
+对每个窗口调用固定 VLM API，并注入采样时间线
         ↓
-获得时间范围 + caption
+获得并校验时间事件 JSON（或兼容的 Simple Caption）
         ↓
 写 frames.jsonl
         ↓
@@ -389,6 +389,7 @@ python harness/ingest_all.py \
 所有视频必须使用相同：
 
 - sampling interval；
+- caption mode；
 - caption window / stride；
 - VLM model；
 - VLM prompt；
@@ -420,13 +421,21 @@ wiki/<dataset>/videos/<video_id>/
 {"frame_id":"f000003","timestamp":10.0,"frame":"frames/000003.jpg","caption":"The refrigerator door is open."}
 ```
 
-多图模式下每一行表示一个时间窗口：
+Simple 多图模式下每一行表示一个时间窗口：
 
 ```json
 {"window_id":"w000001","start_timestamp":0.0,"end_timestamp":10.0,"frames":[{"frame_id":"f000001","timestamp":0.0,"frame":"frames/000001.jpg"},{"frame_id":"f000002","timestamp":5.0,"frame":"frames/000002.jpg"},{"frame_id":"f000003","timestamp":10.0,"frame":"frames/000003.jpg"}],"caption":"A man approaches and opens a refrigerator."}
 ```
 
 最后一个窗口可以少于配置的 window 帧数；frames 始终按时间顺序排列。
+
+Dense 模式下每一行保存一个时间窗口及其中经过严格校验的原子事件：
+
+```json
+{"window_id":"w000001","start_timestamp":0.0,"end_timestamp":3.0,"frames":[{"frame_id":"f000001","timestamp":0.0,"frame":"frames/000001.jpg"},{"frame_id":"f000002","timestamp":1.0,"frame":"frames/000002.jpg"},{"frame_id":"f000003","timestamp":2.0,"frame":"frames/000003.jpg"},{"frame_id":"f000004","timestamp":3.0,"frame":"frames/000004.jpg"}],"events":[{"start":0.0,"end":1.0,"caption":"A man approaches a refrigerator."},{"start":2.0,"end":3.0,"caption":"The man opens the refrigerator door."}]}
+```
+
+事件时间必须来自当前窗口的 frame timeline，并按时间顺序排列；重叠窗口的原始事件不做语义合并。
 
 ### 7.2 wiki.md
 

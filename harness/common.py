@@ -111,10 +111,12 @@ def object_hash(value: Any) -> str:
 # API key environment variable, request timeout, or retry count must not
 # invalidate an existing ingest.
 _INGEST_CONTENT_KEYS = frozenset({
-    "sample_interval_sec", "caption_window_frames", "caption_stride_frames",
+    "sample_interval_sec", "caption_mode", "caption_window_frames", "caption_stride_frames",
     "image_max_size", "jpeg_quality",
 })
-_INGEST_CONTENT_DEFAULTS = {"caption_window_frames": 1, "caption_stride_frames": 1}
+_INGEST_CONTENT_DEFAULTS = {
+    "caption_mode": "simple", "caption_window_frames": 1, "caption_stride_frames": 1,
+}
 _VLM_CONTENT_KEYS = frozenset({"model", "prompt", "temperature", "max_tokens"})
 
 

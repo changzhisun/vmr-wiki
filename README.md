@@ -44,9 +44,10 @@ docker build -f docker/Dockerfile \
 - `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
 - `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
 - `query.base_url`：可选地为每个 Agent 指定兼容 OpenAI / Anthropic 的网关 endpoint，`null` 表示使用官方默认地址。必须是 443 端口上的 https URL，且主机名同时出现在 `query.egress_allowed_hosts` 中，否则加载配置时即报错——代理只隧道 443 的 CONNECT，Agent 那一侧只会看到一个无 body 的 403。
+- `caption_mode`：`dense` 要求 VLM 返回严格校验的时间事件 JSON；`simple` 保留旧的普通 Caption 格式。默认使用 `dense`。
 - `caption_window_frames`：每次 VLM 请求包含的连续采样帧数量；设为 `1` 时是单图 Caption。
 - `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；小于窗口时产生重叠窗口。
-- `sample_interval_sec`、窗口、stride、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
+- `sample_interval_sec`、Caption 模式、窗口、stride、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
 
 通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。可以在配置中指定其他变量名。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
 
@@ -176,7 +177,7 @@ python harness/ingest_all.py --dataset qvhighlights --split val --freeze
 python harness/freeze.py --dataset qvhighlights --split val
 ```
 
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后一个窗口可以少于配置帧数；`1/1` 保持原来的逐张单图 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内文件名和采样时间替换进 `{{FRAME_TIMESTAMPS}}`，严格要求 VLM 返回只使用这些时间点的有序事件 JSON；Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
 
 每个视频输出：
 
@@ -191,9 +192,9 @@ wiki/qvhighlights/videos/<video_id>/
 
 `ingest.json` 记录媒体 SHA256、配置、FFmpeg 版本和内容哈希；`frozen.json` 覆盖 Markdown、JSONL、**每一张图像**及 Ingest 元数据。每个视频独立冻结，实验的 `experiment.json` 保存所选视频的哈希快照；不再使用阻止新增视频的数据集级 `freeze.json`。
 
-单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式。多图模式下每行代表一个 Caption 窗口，包含 `window_id`、起止采样时间、按时间排序的 `frames` 数组和窗口 Caption；`wiki.md` 同时列出窗口时间范围及全部对应图片。
+Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式；Simple 多图模式的每行包含窗口信息、`frames` 数组和一个窗口 Caption。Dense 模式的每行包含窗口信息、按时间排序的 `frames` 数组和经过校验的 `events` 数组，每个事件都包含来自当前窗口时间线的 `start`、`end` 及 Caption。`wiki.md` 按窗口列出 Dense 事件时间范围及对应图片。重叠窗口的原始事件会完整保留，不做语义合并。
 
-完整 Ingest 再次执行时只核验并复用，不重新 caption。失败的临时输出被清除；API 仅对临时网络错误、限流和服务端错误做有限重试，达到 Token 上限的截断响应会直接失败。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
+完整 Ingest 再次执行时只核验并复用，不重新 caption。失败的临时输出被清除；API 仅对临时网络错误、限流和服务端错误做有限重试，达到 Token 上限的截断响应会直接失败。Dense 响应不是纯 JSON、字段不符、事件无序、时间越界或使用非采样时间点时同样直接失败，不会静默修复。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
 
 批量 Ingest 保留 `--jobs`（默认 4）和 `--verbose`。`--jobs 1` 顺序执行；多个 worker 并发处理当前 split 的不同视频，不会对共享 video_id 重复提交任务。Ingest 与批量 Query 的进度条都会显示已完成数量、平均处理速度和预计剩余时间，结束时显示总耗时。收到 Ctrl-C 时，尚未开始的任务立即取消，运行中的 worker 在当前 FFmpeg/VLM 调用结束后的下一个检查点退出并清理 staging 目录；主进程等待 worker 收敛，不会让后台线程继续发布 Wiki。
 

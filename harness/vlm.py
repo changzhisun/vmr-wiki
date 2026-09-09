@@ -69,14 +69,28 @@ class VLMClient:
         if config["model"].startswith("REPLACE_"):
             raise HarnessError("Configure an explicit VLM model before ingest")
 
-    def caption(self, images: Path | Sequence[Path]) -> str:
+    def caption(self, images: Path | Sequence[Path], *,
+                timestamps: Sequence[float] | None = None) -> str:
         cfg = self.config
         paths = [images] if isinstance(images, Path) else list(images)
         if not paths:
             raise HarnessError("VLM caption requires at least one image")
         suffix, extras = _request_extras(cfg["model"])
         prompt = cfg["prompt"]
-        if len(paths) > 1:
+        placeholder = "{{FRAME_TIMESTAMPS}}"
+        if timestamps is not None:
+            timeline = list(timestamps)
+            if len(timeline) != len(paths):
+                raise HarnessError("VLM image and timestamp counts differ")
+            if prompt.count(placeholder) != 1:
+                raise HarnessError("VLM timestamp prompt must contain exactly one placeholder")
+            prompt = prompt.replace(placeholder, "\n".join(
+                f"{image.name} -> {timestamp}s"
+                for image, timestamp in zip(paths, timeline, strict=True)
+            ))
+        elif placeholder in prompt:
+            raise HarnessError("VLM timestamp prompt requires frame timestamps")
+        elif len(paths) > 1:
             prompt += (
                 "\nThe images are sampled video frames in chronological order. "
                 "Describe the visible temporal progression across them."

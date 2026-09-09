@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 import threading
 
 import pytest
+import yaml
 
 from adapters.qvhighlights import QVHighlightsAdapter
 from harness.common import (HarnessError, ingest_content_hash, read_json, read_jsonl,
@@ -9,7 +11,7 @@ from harness.common import (HarnessError, ingest_content_hash, read_json, read_j
 from harness.config import load_config
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
 from harness.ingest import (caption_windows, ingest_video, probe_duration, probe_durations,
-                            sample_times)
+                            parse_dense_events, sample_times)
 from harness.ingest_all import _run_parallel, ingest_all
 from harness.run_query import Experiment
 
@@ -52,10 +54,26 @@ def test_default_config_uses_overlapping_multi_frame_captions():
     config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
     ingest = config["ingest"]
     assert ingest["sample_interval_sec"] == 1.0
+    assert ingest["caption_mode"] == "dense"
     assert ingest["caption_window_frames"] == 4
     assert ingest["caption_stride_frames"] == 1
     assert ingest["vlm"]["max_tokens"] == 2048
-    assert "frame or frames" in ingest["vlm"]["prompt"]
+    assert ingest["vlm"]["prompt"].count("{{FRAME_TIMESTAMPS}}") == 1
+
+
+def test_caption_mode_and_dense_prompt_template_are_validated(tmp_path):
+    source = Path(__file__).resolve().parents[1] / "config.yaml"
+    raw = yaml.safe_load(source.read_text())
+    raw["ingest"]["caption_mode"] = "dense"
+    raw["ingest"]["vlm"]["prompt"] = "No frame timeline placeholder."
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(HarnessError, match="exactly one.*FRAME_TIMESTAMPS"):
+        load_config(path)
+
+    raw["ingest"].pop("caption_mode")
+    path.write_text(yaml.safe_dump(raw))
+    assert load_config(path)["ingest"]["caption_mode"] == "simple"
 
 
 def test_caption_windows_support_overlap_and_partial_tail():
@@ -68,6 +86,33 @@ def test_caption_windows_support_overlap_and_partial_tail():
         caption_windows(frames, window_frames=0, stride_frames=1)
     with pytest.raises(HarnessError, match="caption_stride_frames"):
         caption_windows(frames, window_frames=1, stride_frames=0)
+
+
+def test_dense_events_are_strict_and_use_only_window_timestamps():
+    text = json.dumps({"events": [
+        {"start": 0, "end": 1, "caption": " A person opens a door. "},
+        {"start": 2, "end": 2, "caption": "The person looks inside."},
+    ]})
+    assert parse_dense_events(text, [0.0, 1.0, 2.0]) == [
+        {"start": 0.0, "end": 1.0, "caption": "A person opens a door."},
+        {"start": 2.0, "end": 2.0, "caption": "The person looks inside."},
+    ]
+    assert parse_dense_events(json.dumps({"events": [
+        {"start": 0, "end": 2, "caption": "A person walks."},
+        {"start": 0, "end": 1, "caption": "The person waves."},
+    ]}), [0.0, 1.0, 2.0])
+    with pytest.raises(HarnessError, match="outside its window"):
+        parse_dense_events(
+            '{"events":[{"start":0,"end":1.5,"caption":"Invented precision."}]}',
+            [0.0, 1.0, 2.0],
+        )
+    with pytest.raises(HarnessError, match="chronological order"):
+        parse_dense_events(json.dumps({"events": [
+            {"start": 2, "end": 2, "caption": "Later."},
+            {"start": 1, "end": 1, "caption": "Earlier."},
+        ]}), [0.0, 1.0, 2.0])
+    with pytest.raises(HarnessError, match="only events"):
+        parse_dense_events('{"events":[],"summary":"extra"}', [0.0])
 
 
 def test_ingest_once_query_independent_and_freeze(prepared):
@@ -192,8 +237,62 @@ def test_ingest_captions_overlapping_multi_frame_windows(cfg, monkeypatch, tmp_p
     assert "Caption stride: 2 sampled frames" in wiki
 
 
+def test_ingest_writes_validated_dense_events(cfg, monkeypatch, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"source")
+    output = tmp_path / "wiki" / "clip"
+    cfg["ingest"].update({
+        "sample_interval_sec": 5.0,
+        "caption_mode": "dense",
+        "caption_window_frames": 3,
+        "caption_stride_frames": 2,
+    })
+    cfg["ingest"]["vlm"]["prompt"] = "{{FRAME_TIMESTAMPS}}"
+    monkeypatch.setattr("harness.ingest.probe_durations", lambda _path: (21.0, 21.0))
+    monkeypatch.setattr(
+        "harness.ingest.extract_frame",
+        lambda _video, _timestamp, path, _cfg: path.write_bytes(b"jpeg"),
+    )
+    monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: "ffmpeg version test")
+
+    class Captioner:
+        def __init__(self):
+            self.windows = []
+
+        def caption(self, paths, *, timestamps):
+            self.windows.append(([path.name for path in paths], timestamps))
+            if len(timestamps) == 1:
+                return '{"events":[]}'
+            return json.dumps({"events": [{
+                "start": timestamps[0],
+                "end": timestamps[1],
+                "caption": "A visible action changes.",
+            }]})
+
+    captioner = Captioner()
+    ingest_video(video, "clip", output, cfg, captioner=captioner)
+    assert captioner.windows == [
+        (["000001.jpg", "000002.jpg", "000003.jpg"], [0.0, 5.0, 10.0]),
+        (["000003.jpg", "000004.jpg", "000005.jpg"], [10.0, 15.0, 20.0]),
+        (["000005.jpg"], [20.0]),
+    ]
+    entries = read_jsonl(output / "frames.jsonl")
+    assert set(entries[0]) == {
+        "window_id", "start_timestamp", "end_timestamp", "frames", "events",
+    }
+    assert entries[0]["events"] == [{
+        "start": 0.0, "end": 5.0, "caption": "A visible action changes.",
+    }]
+    assert entries[-1]["events"] == []
+    wiki = (output / "wiki.md").read_text()
+    assert "Caption mode: dense" in wiki
+    assert "Number of dense events: 2" in wiki
+    assert "#### Event 0.0s–5.0s" in wiki
+
+
 def test_default_window_settings_match_legacy_ingest_hash(cfg):
     legacy = {**cfg["ingest"]}
+    legacy.pop("caption_mode")
     legacy.pop("caption_window_frames")
     legacy.pop("caption_stride_frames")
     assert ingest_content_hash({"ingest": legacy}) == ingest_content_hash(cfg)

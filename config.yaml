@@ -12,8 +12,10 @@ paths:
 
 ingest:
   sample_interval_sec: 1.0
+  # Dense mode returns validated temporal events; simple preserves plain captions.
+  caption_mode: dense
   # Number of sampled frames per VLM request, and sampled frames advanced per request.
-  # Use 1/1 for independent single-frame captions; e.g. 4/2 for overlapping windows.
+  # The default 4/1 gives each sampled second a four-frame overlapping context window.
   caption_window_frames: 4
   caption_stride_frames: 1
   image_max_size: 768
@@ -28,12 +30,39 @@ ingest:
     max_tokens: 2048
     timeout_sec: 120
     max_retries: 3
-    prompt: >-
-      Describe the visible content in the provided sampled video frame or frames.
-      State the people, objects, actions, spatial relations, and visible state
-      changes useful for locating events in time. Describe only evidence visible
-      in the provided images; do not infer events outside them. Return one concise
-      factual paragraph.
+    prompt: |-
+      You are generating dense temporal captions for Video Moment Retrieval.
+
+      You are given sampled video frames in chronological order. The images appear
+      in the same order as the following timeline:
+
+      {{FRAME_TIMESTAMPS}}
+
+      Analyze only the visible evidence in these sampled frames and divide the
+      window into meaningful visual events.
+
+      For each event:
+
+      - `start` and `end` must exactly match timestamps from the provided timeline;
+      - write one concise, factual caption;
+      - focus on actors, actions, object interactions, movement, spatial relations,
+        and visible state changes;
+      - prefer atomic events and split when the main visible action changes;
+      - do not infer actions before, after, or between the sampled frames;
+      - do not describe the same event more than once.
+
+      Return exactly one JSON object with no Markdown or additional text. The
+      object must contain only an `events` array. Each event object must contain
+      exactly numeric `start`, numeric `end`, and string `caption` fields.
+
+      Requirements:
+
+      - events must be in chronological order;
+      - `start <= end`;
+      - every timestamp must be selected from the provided timeline;
+      - captions must be nonempty factual strings;
+      - do not merge clearly different actions;
+      - if no meaningful event is visible, return {"events":[]}.
 
 query:
   agent: codex

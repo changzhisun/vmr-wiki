@@ -47,6 +47,30 @@ def test_multi_image_payload_preserves_chronological_order(cfg, tmp_path, monkey
     assert [base64.b64decode(value) for value in encoded] == [b"first", b"second"]
 
 
+def test_dense_prompt_injects_frame_timestamps(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    cfg["ingest"]["vlm"]["prompt"] = "Timeline:\n{{FRAME_TIMESTAMPS}}\nReturn JSON."
+    images = [tmp_path / "000001.jpg", tmp_path / "000002.jpg"]
+    for image in images:
+        image.write_bytes(b"image")
+    seen = []
+
+    def request(req, timeout):
+        seen.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"events":[]}'}}]
+        }).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    client = VLMClient(cfg["ingest"]["vlm"])
+    assert client.caption(images, timestamps=[0.0, 1.0]) == '{"events":[]}'
+    prompt = seen[0]["messages"][0]["content"][0]["text"]
+    assert "000001.jpg -> 0.0s\n000002.jpg -> 1.0s" in prompt
+    assert "{{FRAME_TIMESTAMPS}}" not in prompt
+    with pytest.raises(HarnessError, match="counts differ"):
+        client.caption(images, timestamps=[0.0])
+
+
 def test_retry_transient_only_and_no_credential_in_errors(cfg, tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setattr("time.sleep", lambda _: None)

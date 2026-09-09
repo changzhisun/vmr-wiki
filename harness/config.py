@@ -63,6 +63,9 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         ingest = cfg["ingest"]
         if number(ingest["sample_interval_sec"], "sample_interval_sec") <= 0:
             raise HarnessError("sample_interval_sec must be positive")
+        ingest.setdefault("caption_mode", "simple")
+        if ingest["caption_mode"] not in ("simple", "dense"):
+            raise HarnessError("caption_mode must be simple or dense")
         ingest.setdefault("caption_window_frames", 1)
         ingest.setdefault("caption_stride_frames", 1)
         positive_int(ingest["caption_window_frames"], "caption_window_frames")
@@ -75,6 +78,15 @@ def load_config(path: str | Path = "config.yaml") -> dict:
             raise HarnessError("Supported VLM provider: openai-compatible")
         for key in ("model", "prompt", "base_url", "api_key_env"):
             nonempty(vlm[key], f"vlm.{key}")
+        timeline_fields = vlm["prompt"].count("{{FRAME_TIMESTAMPS}}")
+        if ingest["caption_mode"] == "dense" and timeline_fields != 1:
+            raise HarnessError(
+                "dense caption prompt must contain exactly one {{FRAME_TIMESTAMPS}} placeholder"
+            )
+        if ingest["caption_mode"] == "simple" and timeline_fields:
+            raise HarnessError(
+                "simple caption prompt must not contain {{FRAME_TIMESTAMPS}}"
+            )
         number(vlm["temperature"], "temperature", 0)
         positive_int(vlm["max_tokens"], "max_tokens")
         if number(vlm["timeout_sec"], "vlm.timeout_sec") <= 0:
