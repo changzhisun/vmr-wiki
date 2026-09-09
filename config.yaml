@@ -16,7 +16,8 @@ ingest:
   jpeg_quality: 2  # ffmpeg JPEG qscale, 2 (best) through 31
   vlm:
     provider: openai-compatible
-    base_url: http://10.127.48.252:32002/job-f0147972fac1-20260703020458/v1
+    # Replace this reserved example URL with your OpenAI-compatible VLM endpoint.
+    base_url: https://vlm.example.com/v1
     api_key_env: OPENAI_API_KEY
     model: Qwen3-VL-8B-Instruct
     temperature: 0
@@ -41,9 +42,10 @@ query:
     claude_code: ANTHROPIC_API_KEY
   # The agent has no direct internet route. A separate proxy sidecar permits
   # HTTPS CONNECT only to these exact model API hosts.
+  # Replace these reserved example hosts with the endpoints used by each agent.
   egress_allowed_hosts:
-    codex: [api.openai.com, chatgpt.com]
-    claude_code: [api.anthropic.com]
+    codex: [api.example.com, chat.example.com]
+    claude_code: [api.example.net]
 
 evaluation:
   evaluator: qvhighlights

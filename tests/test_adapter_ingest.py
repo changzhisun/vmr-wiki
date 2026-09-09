@@ -1,4 +1,3 @@
-import io
 from pathlib import Path
 import threading
 
@@ -8,7 +7,7 @@ from adapters.qvhighlights import QVHighlightsAdapter
 from harness.common import HarnessError, read_json, read_jsonl, write_json, write_jsonl
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
 from harness.ingest import probe_duration, sample_times
-from harness.ingest_all import ProgressBar, _run_parallel, ingest_all
+from harness.ingest_all import _run_parallel, ingest_all
 from harness.run_query import Experiment
 
 
@@ -192,25 +191,3 @@ def test_parallel_interrupt_propagates_cancellation_and_joins_workers(monkeypatc
         _run_parallel(tasks, {}, None, 2, InterruptingBar(), cancelled)
     assert cancelled.is_set()
     assert worker_stopped.is_set()
-
-
-def test_progress_bar_clears_full_rendered_tty_line(monkeypatch):
-    class TTYBuffer(io.StringIO):
-        def isatty(self):
-            return True
-
-    stdout = TTYBuffer()
-    stderr = io.StringIO()
-    monkeypatch.setattr("sys.stdout", stdout)
-    monkeypatch.setattr("sys.stderr", stderr)
-    bar = ProgressBar(100, desc="Ingesting videos")
-
-    bar.update(10)
-    rendered = "Ingesting videos: [===---------------------------] 10/100 (10%)"
-    bar.log("done")
-    assert "\r" + " " * len(rendered) + "\r" in stdout.getvalue()
-
-    bar.update(90)
-    rendered = "Ingesting videos: [==============================] 100/100 (100%)"
-    bar.log("finished")
-    assert "\r" + " " * len(rendered) + "\r" in stdout.getvalue()

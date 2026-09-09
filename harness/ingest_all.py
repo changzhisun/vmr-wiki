@@ -9,7 +9,6 @@ if __package__ in (None, ""):
 import argparse
 import logging
 import signal
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -19,6 +18,7 @@ from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_videos
 from harness.freeze import freeze_dataset
 from harness.ingest import ingest_video
+from harness.progress import ProgressBar
 
 logger = logging.getLogger(__name__)
 
@@ -33,71 +33,6 @@ def _handle_interrupt(signum: int, frame: object) -> None:
     if _active_bar is not None:
         _active_bar.finish()
     raise KeyboardInterrupt
-
-
-class ProgressBar:
-    """Thread-safe, dependency-free progress bar rendered on stdout.
-
-    On a TTY it draws an updating bar; log lines emitted through ``log()``
-    are written above the bar without corrupting it. On a non-TTY stdout it
-    stays silent during the run and prints a single summary line at the end.
-    """
-
-    def __init__(self, total: int, desc: str = "Ingesting") -> None:
-        self.total = total
-        self.desc = desc
-        self.current = 0
-        self._lock = threading.Lock()
-        self._width = 30
-        self._finished = False
-        self._is_tty = sys.stdout.isatty()
-        self._rendered_width = 0
-
-    def update(self, n: int = 1) -> None:
-        with self._lock:
-            self.current += n
-            if self._is_tty and not self._finished:
-                self._render_unlocked()
-
-    def log(self, message: str) -> None:
-        """Write a log line above the bar without corrupting either."""
-        with self._lock:
-            if self._is_tty and not self._finished:
-                self._clear_unlocked()
-                sys.stderr.write(message + "\n")
-                sys.stderr.flush()
-                self._render_unlocked()
-            else:
-                sys.stderr.write(message + "\n")
-                sys.stderr.flush()
-
-    def _render_unlocked(self) -> None:
-        fraction = min(self.current / self.total, 1.0)
-        filled = int(self._width * fraction)
-        bar = "=" * filled + "-" * (self._width - filled)
-        percent = int(100 * fraction)
-        line = f"{self.desc}: [{bar}] {self.current}/{self.total} ({percent}%)"
-        # Clear at least as many columns as any previously rendered line. The
-        # percentage grows from one to three digits during a run, so a fixed
-        # estimate can otherwise leave trailing characters on the terminal.
-        self._rendered_width = max(self._rendered_width, len(line))
-        sys.stdout.write("\r" + line.ljust(self._rendered_width) + "\r")
-        sys.stdout.flush()
-
-    def _clear_unlocked(self) -> None:
-        sys.stdout.write("\r" + " " * self._rendered_width + "\r")
-        sys.stdout.flush()
-
-    def finish(self) -> None:
-        with self._lock:
-            if self._finished:
-                return
-            self._finished = True
-            percent = int(100 * min(self.current / self.total, 1.0))
-            if self._is_tty:
-                self._clear_unlocked()
-            sys.stdout.write(f"{self.desc}: {self.current}/{self.total} ({percent}%)\n")
-            sys.stdout.flush()
 
 
 class _BarAwareHandler(logging.Handler):
@@ -287,8 +222,9 @@ def ingest_all(
 
     cancel_event = threading.Event()
     global _active_bar, _active_cancel
-    _active_bar = ProgressBar(len(tasks), desc="Ingesting videos")
+    _active_bar = ProgressBar(len(tasks), desc="Ingesting videos", unit="videos")
     _active_cancel = cancel_event
+    _active_bar.start()
     _setup_logging(_active_bar, verbose)
 
     old_handler = None

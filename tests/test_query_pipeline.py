@@ -308,7 +308,9 @@ def test_docker_mount_boundary_and_credentials_not_in_command(cfg, monkeypatch, 
     assert command[command.index("--dns") + 1] == "127.0.0.1"
     assert "HTTPS_PROXY=http://egress-proxy:8080" in command
     assert runner.provenance["egress"] == {
-        "mode": "allowlist-proxy", "hosts": ["api.openai.com", "chatgpt.com"]}
+        "mode": "allowlist-proxy",
+        "hosts": cfg["query"]["egress_allowed_hosts"]["codex"],
+    }
     mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--mount"]
     assert mounts == [f"type=bind,src={tmp_path},dst=/workspace,readonly",
                       f"type=bind,src={tmp_path / 'output'},dst=/workspace/output"]
