@@ -39,6 +39,11 @@ query:
   api_key_env:
     codex: CODEX_API_KEY
     claude_code: ANTHROPIC_API_KEY
+  # The agent has no direct internet route. A separate proxy sidecar permits
+  # HTTPS CONNECT only to these exact model API hosts.
+  egress_allowed_hosts:
+    codex: [api.openai.com, chatgpt.com]
+    claude_code: [api.anthropic.com]
 
 evaluation:
   evaluator: qvhighlights

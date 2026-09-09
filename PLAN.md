@@ -1,5 +1,7 @@
 # VMR Wiki 实现计划
 
+当前版本包含通用 Dataset Split 支持；Split 是 Adapter 定义的 opaque string，Harness 仅验证、筛选和记录。旧的无 split manifest 必须重新运行 Adapter。
+
 ## 1. 项目目标
 
 将一个现成的 Video Moment Retrieval（VMR）数据集改造成一个适合 Codex / Claude Code 等 LLM Agent 独立求解的标准化 Harness。
@@ -223,6 +225,7 @@ vmr-wiki/
 │
 ├── datasets/
 │   └── <dataset_name>/
+│       ├── dataset.json
 │       ├── videos.jsonl
 │       ├── queries.jsonl
 │       └── ground_truth.jsonl
@@ -233,10 +236,11 @@ vmr-wiki/
 │
 ├── wiki/
 │   └── <dataset_name>/
-│       └── <video_id>/
-│           ├── wiki.md
-│           ├── frames.jsonl
-│           └── frames/
+│       └── videos/
+│           └── <video_id>/
+│               ├── wiki.md
+│               ├── frames.jsonl
+│               └── frames/
 │
 ├── runs/
 │
@@ -259,40 +263,60 @@ frames/
 
 ---
 
-## 5. Dataset Adapter
+## 5. Dataset Adapter 与 Split
 
-不同 VMR 数据集原始 annotation 格式不同。
+Adapter 定义并保留原始 split 名称，不能将 `validation` 改名为 `val`。核心 Harness 不包含任何数据集名称或 split 名称的条件分支。
 
-Harness 内部统一转换成三个 manifest：
+标准化输出：
 
 ```text
-videos.jsonl
-queries.jsonl
-ground_truth.jsonl
+datasets/<dataset>/
+├── dataset.json
+├── videos.jsonl
+├── queries.jsonl
+└── ground_truth.jsonl  # 仅含公开标签；全数据集无 GT 时不生成
 ```
+
+`dataset.json`：
+
+```json
+{
+  "name": "example_dataset",
+  "splits": {
+    "training": {"has_ground_truth": true},
+    "validation": {"has_ground_truth": true},
+    "testing": {"has_ground_truth": false}
+  },
+  "default_eval_split": "validation",
+  "evaluator": "generic"
+}
+```
+
+Split 可以是任意非空字符串。`has_ground_truth` 必须为 JSON boolean，`default_eval_split` 可选，但提供时必须是已声明且有 GT 的 split。Unknown split 报错并列出合法名称，不做别名猜测。没有保留的 `all` split 名称；一次运行选择一个确切 split。
 
 ### 5.1 videos.jsonl
 
 ```json
-{"video_id":"video_001","video_path":"videos/video_001.mp4","duration":632.4}
+{"video_id":"video_001","video_path":"videos/video_001.mp4","duration":632.4,"split":"validation"}
 ```
+
+同一 video_id 可以在多个 split 中各有一行，表示 annotation 成员关系；其 video_path 和 duration 必须一致。同一 `(split, video_id)` 不可重复。Wiki 仍然只生成一份。
 
 ### 5.2 queries.jsonl
 
 ```json
-{"query_id":"q001","video_id":"video_001","query":"When does the man open the refrigerator?"}
+{"query_id":"q001","video_id":"video_001","split":"validation","query":"When does the man open the refrigerator?"}
 ```
 
-`queries.jsonl` 不包含 Ground Truth 时间信息。
+Query ID 在 split 内唯一；不同 split 允许复用 ID。Query 必须引用该 split 中的视频，且不能包含 GT 时间信息。
 
 ### 5.3 ground_truth.jsonl
-
-一个 Query 可以包含多个 GT moments：
 
 ```json
 {
   "query_id": "q001",
   "video_id": "video_001",
+  "split": "validation",
   "moments": [
     {"start_sec": 12.0, "end_sec": 15.5},
     {"start_sec": 48.2, "end_sec": 51.0},
@@ -301,35 +325,9 @@ ground_truth.jsonl
 }
 ```
 
-如果原数据集只有一个 Ground Truth moment，也保持统一数组形式：
+单 GT 同样使用 moments 数组。有 GT 的 split 必须覆盖其全部 Query；不允许部分 Query 有标签、部分没有。无 GT 的 split 可以 Ingest、Query 和 Aggregate，Evaluator 必须在读取 GT 前拒绝本地评测。
 
-```json
-{
-  "query_id": "q002",
-  "video_id": "video_001",
-  "moments": [
-    {"start_sec": 73.2, "end_sec": 75.8}
-  ]
-}
-```
-
-这样 Harness 不需要为单 moment / 多 moment 分别设计两套 schema。
-
-其中：
-
-```text
-queries.jsonl
-```
-
-可以进入 Query Harness。
-
-而：
-
-```text
-ground_truth.jsonl
-```
-
-只能由 evaluator 读取。
+QVHighlights Adapter 可以发现 `highlight_<split>_release.jsonl`，或接受显式 `SPLIT=PATH` 映射。UCA Adapter 使用自身文件命名规则。所有数据集专属的发现、转换、评测逻辑限制在 `adapters/`。
 
 ---
 
@@ -343,14 +341,15 @@ ground_truth.jsonl
 python harness/ingest.py \
   --video /path/to/video.mp4 \
   --video-id video_001 \
-  --output wiki/<dataset>/video_001
+  --output wiki/<dataset>/videos/video_001
 ```
 
 批量：
 
 ```bash
 python harness/ingest_all.py \
-  --dataset <dataset_name>
+  --dataset <dataset_name> \
+  --split <split_name>
 ```
 
 ### 6.2 固定流程
@@ -388,7 +387,7 @@ python harness/ingest_all.py \
 每个视频固定生成：
 
 ```text
-wiki/<dataset>/<video_id>/
+wiki/<dataset>/videos/<video_id>/
 ├── wiki.md
 ├── frames.jsonl
 └── frames/
@@ -461,30 +460,22 @@ Wiki 就是一个固定格式的 timestamped visual timeline。
 
 ## 8. Wiki Freeze
 
-所有视频完成 Ingest 后：
+Wiki 的物理布局固定为：
 
 ```text
-wiki/
+wiki/<dataset>/videos/<video_id>/
+├── wiki.md
+├── frames.jsonl
+├── frames/
+├── ingest.json
+└── frozen.json
 ```
 
-进入只读状态。
+`freeze.py --dataset DATASET --split SPLIT` 只核验并冻结选定 split 的 unique videos。单个视频目录只读；父目录不整体锁死，因此后续 split 可以添加未处理的视频。
 
-正式 Query 实验开始后：
+共享 video_id 复用已有 Wiki，不重复 caption。每个 frozen.json 覆盖 Markdown、JSONL、全部图像及 Ingest 元数据的 SHA256。实验 metadata 保存当前 split 使用的 `video_id -> wiki_hash` 快照；Query 前后均验证输入，不能修改已冻结内容。
 
-- 不重新 caption；
-- 不更新 Wiki；
-- 不允许 Agent 修改 Wiki；
-- 同一视频的所有 Query 使用完全相同的 Wiki 版本。
-
-建议记录每个 Wiki 的 SHA256：
-
-```text
-video_id
-wiki_hash
-frames_jsonl_hash
-```
-
-确保 Query 实验过程中输入没有发生变化。
+Ingest 配置中决定 caption 内容的参数变化时应使用新 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 次数等传输参数保留在 provenance 中，但不参与 ingest_content_hash，也不触发重复 caption。不存在 split 专属 Wiki 目录，也不使用阻止其他 split 增量 Ingest 的全局 freeze.json。
 
 ---
 
@@ -496,6 +487,7 @@ frames_jsonl_hash
 {
   "query_id": "q001",
   "video_id": "video_001",
+  "split": "val",
   "query": "When does the man open the refrigerator?"
 }
 ```
@@ -538,6 +530,7 @@ Query Agent 只能基于当前视频已经冻结的 Wiki 和 sampled frames 完�
 {
   "query_id": "q001",
   "video_id": "video_001",
+  "split": "val",
   "query": "When does the man open the refrigerator?",
   "max_predictions": 5
 }
@@ -612,115 +605,35 @@ Wiki 是当前视频预先生成并冻结的 timestamped visual timeline。
 
 ## 12. Query 输出格式
 
-每个 Query 只允许产生一个最终结果文件：
-
-```text
-output/prediction.json
-```
-
-但一个结果文件中可以包含多个预测 moments。
-
-统一格式：
+每条 Query 只生成 `output/prediction.json`，其中可包含多个按 score 降序排列的 moments：
 
 ```json
 {
   "query_id": "q001",
   "video_id": "video_001",
+  "split": "val",
   "moments": [
-    {
-      "start_sec": 12.0,
-      "end_sec": 15.0,
-      "score": 0.92,
-      "evidence": "The man opens the refrigerator around this interval."
-    },
-    {
-      "start_sec": 48.0,
-      "end_sec": 51.5,
-      "score": 0.81,
-      "evidence": "A second refrigerator-opening action occurs here."
-    }
-  ]
+    {"start_sec": 12.0, "end_sec": 15.0, "score": 0.92},
+    {"start_sec": 48.0, "end_sec": 51.5, "score": 0.81}
+  ],
+  "evidence": "Visual evidence from the frozen timeline."
 }
 ```
 
-`moments` 必须按：
-
-```text
-score 从高到低
-```
-
-排序。
-
-Evaluator 真正依赖的字段是：
-
-```text
-query_id
-video_id
-moments[].start_sec
-moments[].end_sec
-moments[].score
-```
-
-`evidence` 用于后续 error analysis，不参与标准 VMR 指标计算。
-
----
+query_id、video_id、split 必须与当前 task 一致。evidence 可放在顶层或每个 moment 内，为可选字符串，不参与指标计算。聚合保留全部 moments、split 和已提供的 evidence。
 
 ## 13. Prediction JSON Schema 约束
 
-`prediction.json` 必须满足：
+必需字段：query_id、video_id、split、moments。每个 moment 必须包含 start_sec、end_sec、score，不接受未定义字段；evidence 可选。
 
 ```text
-query_id: string
-video_id: string
-moments: array
-```
-
-每个 prediction moment：
-
-```text
-start_sec: number
-end_sec: number
-score: number
-evidence: string
-```
-
-并满足：
-
-```text
-start_sec >= 0
-end_sec > start_sec
+0 <= start_sec < end_sec <= video duration
 0 <= score <= 1
 len(moments) <= max_predictions
-```
-
-同时：
-
-```text
 moments[i].score >= moments[i+1].score
 ```
 
-即预测必须按 score 降序排列。
-
-允许：
-
-```json
-"moments": []
-```
-
-用于 Agent 明确认定没有可信 moment 的情况。
-
-如果 JSON：
-
-- 不存在；
-- 无法解析；
-- 字段缺失；
-- moment 数量超过限制；
-- 数值非法；
-- 排序非法；
-
-则该 Query 记为 failed run。
-
-不要自动让另一个 Agent 修复结果，否则会破坏每个 Query 一次独立运行的定义。
+数值必须有限且不是布尔值；允许 `moments: []` 表示成功 abstention。输出缺失、JSON 无法解析、字段缺失、额外输出、错误 split/ID、数量越限、时间非法或排序错误均记为 failed run，不自动修复或重跑 Agent。
 
 ---
 
@@ -731,6 +644,7 @@ moments[i].score >= moments[i+1].score
 ```bash
 python harness/run_all_queries.py \
   --dataset <dataset_name> \
+  --split <split_name> \
   --agent codex \
   --experiment codex_wiki_v1
 ```
@@ -738,7 +652,7 @@ python harness/run_all_queries.py \
 内部逻辑：
 
 ```text
-for query in queries:
+for query in selected_split_queries:
 
     创建 fresh workspace
 
@@ -813,6 +727,8 @@ Query prediction 与运行 metadata 分开保存。
 ```json
 {
   "query_id": "q001",
+  "dataset": "qvhighlights",
+  "split": "val",
   "agent": "codex",
   "model": "MODEL_NAME",
   "exit_code": 0,
@@ -834,6 +750,8 @@ Query prediction 与运行 metadata 分开保存。
 
 ```bash
 python harness/aggregate.py \
+  --dataset <dataset_name> \
+  --split <split_name> \
   --input results/codex_wiki_v1/predictions \
   --output results/codex_wiki_v1/predictions.jsonl
 ```
@@ -841,8 +759,8 @@ python harness/aggregate.py \
 聚合后仍然保留多个 moments：
 
 ```json
-{"query_id":"q001","video_id":"video_001","moments":[{"start_sec":12.0,"end_sec":15.0,"score":0.92},{"start_sec":48.0,"end_sec":51.5,"score":0.81}]}
-{"query_id":"q002","video_id":"video_001","moments":[{"start_sec":73.0,"end_sec":76.0,"score":0.88}]}
+{"query_id":"q001","video_id":"video_001","split":"val","moments":[{"start_sec":12.0,"end_sec":15.0,"score":0.92},{"start_sec":48.0,"end_sec":51.5,"score":0.81}]}
+{"query_id":"q002","video_id":"video_001","split":"val","moments":[{"start_sec":73.0,"end_sec":76.0,"score":0.88}]}
 ```
 
 Aggregate 阶段不能只保留 top-1，除非某个具体 evaluator 明确要求 top-1。
@@ -857,6 +775,8 @@ Evaluator 完全独立于 Agent。
 
 ```bash
 python harness/evaluate.py \
+  --dataset <dataset_name> \
+  --split <split_name> \
   --pred results/codex_wiki_v1/predictions.jsonl \
   --gt datasets/<dataset>/ground_truth.jsonl
 ```
@@ -999,6 +919,7 @@ results/claude_wiki_v1/
 ```yaml
 dataset:
   name: qvhighlights
+  split: val  # exact name from dataset.json; may be overridden by --split
 
 ingest:
   sample_interval_sec: 5.0
@@ -1225,3 +1146,29 @@ timestamped Video Wiki          │
 > **Ground Truth 和 Prediction 都统一使用 `moments: [...]` 数组，因此天然支持一个 Query 对应一个或多个 temporal moments。**
 
 这就是第一版 `vmr-wiki` Harness。
+
+---
+
+## 25. Split 实现与验收
+
+已实现统一入口：
+
+```bash
+python harness/ingest_all.py --dataset DATASET --split SPLIT --freeze
+python harness/run_all_queries.py --dataset DATASET --split SPLIT --agent codex --experiment EXPERIMENT
+python harness/aggregate.py --dataset DATASET --split SPLIT --input results/EXPERIMENT/predictions --output results/EXPERIMENT/predictions.jsonl
+python harness/evaluate.py --dataset DATASET --split SPLIT --pred results/EXPERIMENT/predictions.jsonl
+```
+
+- `harness/dataset.py` 统一读取 dataset.json、验证 split、筛选 videos/queries/GT；不解释名称含义。
+- `task.json`、prediction、experiment.json、run_metadata、metrics 都记录 split，实验还记录 dataset 和 agent。
+- 同一实验禁止混用 dataset、split、Agent 或配置。聚合核验 Query/video 成员关系和各运行的 dataset/split provenance。
+- `predictions.jsonl.metadata.json` 保存聚合结果的 dataset、split、SHA256 和 annotation 哈希；评测默认强制要求 sidecar，不能通过删除 provenance 降级绕过校验。外部原始 submission 只能通过显式 unverified opt-in 进入。
+- Evaluation 先验证 metadata 和 has_ground_truth，再读取选定 split 的 GT；失败/缺失 Query 仍留在该 split 分母内。无 GT split 只生成预测。
+- 默认 evaluator 由 dataset.json 指向 Adapter；官方代码优先，缺省使用 dataset-specific 实现，最后才用 generic。原有 QVHighlights 多 relevant instances mAP 语义不变。
+- `default_eval_split` 仅作为评测的默认值；Ingest/Freeze/Query 要求 --split 或 config.dataset.split。Unknown split 不做别名映射。
+- 旧 manifest 采用迁移方案 A：明确要求重新运行 Adapter。不自动补 split。旧 Wiki 可在保持内容不变的前提下迁入新的 videos/ 布局并校验，不自动移动用户产物。
+- VLM provider、endpoint、认证、timeout 和 retry 等传输参数保留在 provenance 中，但不进入 ingest hash。并发 Ingest 使用协作式取消事件，Ctrl-C 后等待运行 worker 清理退出。
+- Query Agent 仅连接临时 internal Docker network，通过无密钥 allowlist proxy 访问配置中的模型 API hostname；代理不挂载 workspace，任务结束时与网络一并删除。
+
+验收测试覆盖任意 split 名称、has_ground_truth 布尔验证、unknown split、共享视频跨 split 去重、增量 Freeze、跨 split 重复 Query ID、Query/GT 隔离、无 GT 拒绝、多 GT/预测、聚合混入其他 split/dataset 拒绝、CLI help 与默认 split。原有独立进程、只读挂载、超时清理和官方评测一致性测试继续保留。

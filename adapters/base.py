@@ -32,6 +32,8 @@ class DatasetAdapter(ABC):
             v, q, gt = self.convert(source, video_root, name)
             if not q:
                 raise HarnessError(f"Split {name!r} contains no queries")
+            if any(row.get("split") != name for row in [*v, *q, *gt]):
+                raise HarnessError(f"Adapter changed the original split name {name!r}")
             videos.extend(v)
             queries.extend(q)
             truth.extend(gt)

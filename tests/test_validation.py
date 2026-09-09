@@ -7,7 +7,7 @@ from harness.validate import validate_prediction
 
 
 def prediction():
-    return {"query_id": "q1", "video_id": "v1", "moments": [
+    return {"query_id": "q1", "video_id": "v1", "split": "train", "moments": [
         {"start_sec": 0.0, "end_sec": 1.0, "score": 0.9, "evidence": "first"},
         {"start_sec": 2.0, "end_sec": 3.0, "score": 0.8, "evidence": "second"},
     ]}
@@ -42,7 +42,7 @@ def test_ids_count_duration_order_and_missing_fields():
     with pytest.raises(HarnessError):
         validate_prediction(row)
     row = prediction()
-    del row["moments"][0]["evidence"]
+    del row["moments"][0]["score"]
     with pytest.raises(HarnessError):
         validate_prediction(row)
 

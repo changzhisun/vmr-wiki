@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -6,7 +7,7 @@ from adapters.qvhighlights import QVHighlightsAdapter
 from harness.common import HarnessError, read_jsonl, write_jsonl
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
 from harness.ingest import sample_times
-from harness.ingest_all import ingest_all
+from harness.ingest_all import _run_parallel, ingest_all
 
 
 def test_adapter_preserves_all_gt_and_hides_labels(prepared):
@@ -21,7 +22,7 @@ def test_adapter_preserves_all_gt_and_hides_labels(prepared):
 
 
 @pytest.mark.parametrize("rows", [
-    [{"qid": 1, "vid": "v", "duration": 3, "query": "x"}],
+    [{"qid": 1, "vid": "v", "duration": 3, "query": "x", "relevant_windows": None}],
     [{"qid": 1, "vid": "../v", "duration": 3, "query": "x", "relevant_windows": [[0, 1]]}],
     [{"qid": 1, "vid": "v", "duration": 3, "query": "x", "relevant_windows": [[2, 4]]}],
     [{"qid": 1, "vid": "v", "duration": 3, "query": "x", "relevant_windows": [[0, 1]]}] * 2,
@@ -30,7 +31,7 @@ def test_adapter_rejects_invalid_data(tmp_path, rows):
     raw = tmp_path / "raw.jsonl"
     write_jsonl(raw, rows)
     with pytest.raises(HarnessError):
-        QVHighlightsAdapter().prepare(raw, tmp_path, tmp_path / "dataset")
+        QVHighlightsAdapter().prepare(raw, tmp_path, tmp_path / "dataset", split="train")
     assert not (tmp_path / "dataset").exists()
 
 
@@ -84,28 +85,58 @@ def test_failed_ingest_has_no_partial_output(prepared):
             raise HarnessError("API unavailable")
     with pytest.raises(HarnessError):
         ingest_all(cfg, captioner=BrokenCaptioner())
-    wiki = Path(cfg["paths"]["wiki"]) / "qvhighlights"
-    assert list(wiki.iterdir()) == []
+    wiki = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos"
+    assert not wiki.exists() or list(wiki.iterdir()) == []
 
 
-def test_cache_invalidates_on_content_settings_not_on_transport(prepared):
+def test_cache_invalidates_on_content_settings_not_transport(prepared):
     cfg, captioner = prepared
     ingest_all(cfg, captioner=captioner)
     assert captioner.calls == 3
 
-    # Transport-only changes (endpoint, timeout, retries) must NOT invalidate
-    # an existing ingest: verification reuses the cached captions.
+    # Transport/auth changes remain provenance and do not invalidate captions.
+    original_provider = cfg["ingest"]["vlm"]["provider"]
+    original_base_url = cfg["ingest"]["vlm"]["base_url"]
+    cfg["ingest"]["vlm"]["provider"] = "another-compatible-provider"
     cfg["ingest"]["vlm"]["base_url"] += "/other"
     cfg["ingest"]["vlm"]["timeout_sec"] = 30
     cfg["ingest"]["vlm"]["max_retries"] = 5
+    cfg["ingest"]["vlm"]["api_key_env"] = "OTHER_API_KEY"
     ingest_all(cfg, captioner=captioner)
     assert captioner.calls == 3
 
-    # A content-determining change (model) MUST invalidate the cache.
-    cfg["ingest"]["vlm"]["base_url"] = cfg["ingest"]["vlm"]["base_url"].removesuffix("/other")
+    # A content-determining model change still invalidates the cache.
+    cfg["ingest"]["vlm"]["provider"] = original_provider
+    cfg["ingest"]["vlm"]["base_url"] = original_base_url
     cfg["ingest"]["vlm"]["timeout_sec"] = 120
     cfg["ingest"]["vlm"]["max_retries"] = 3
     cfg["ingest"]["vlm"]["model"] = "other-model"
     with pytest.raises(HarnessError, match="different video/settings"):
         ingest_all(cfg, captioner=captioner, jobs=1)
 
+
+def test_parallel_interrupt_propagates_cancellation_and_joins_workers(monkeypatch):
+    worker_started = threading.Event()
+    worker_stopped = threading.Event()
+
+    def fake_ingest(vid, video, path, output, cfg, *, captioner, cancel_event):
+        if vid == "slow":
+            worker_started.set()
+            cancel_event.wait(2)
+            worker_stopped.set()
+            raise HarnessError("Ingest cancelled")
+        assert worker_started.wait(1)
+        return {"video_id": vid}, False
+
+    class InterruptingBar:
+        def update(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("harness.ingest_all._ingest_one", fake_ingest)
+    tasks = [("slow", {}, Path("slow"), Path("out-slow")),
+             ("fast", {}, Path("fast"), Path("out-fast"))]
+    cancelled = threading.Event()
+    with pytest.raises(KeyboardInterrupt):
+        _run_parallel(tasks, {}, None, 2, InterruptingBar(), cancelled)
+    assert cancelled.is_set()
+    assert worker_stopped.is_set()

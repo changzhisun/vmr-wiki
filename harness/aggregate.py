@@ -8,45 +8,69 @@ if __package__ in (None, ""):
 import argparse
 from pathlib import Path
 
-import yaml
+from harness.common import (HarnessError, cli, file_hash, identifier, object_hash,
+                            read_json, unique_index, write_json, write_jsonl)
+from harness.config import dataset_path, load_config
+from harness.results import bundle_metadata_path, check_identity, experiment_context, validate_result
 
-from harness.common import HarnessError, cli, file_hash, read_json, unique_index, write_jsonl
-from harness.validate import validate_prediction
 
-
-def aggregate(input_dir: Path, output: Path, max_predictions: int | None = None) -> list[dict]:
+def aggregate(input_dir: Path, output: Path, max_predictions: int | None = None, *,
+              dataset_dir: Path | None = None, split: str | None = None) -> list[dict]:
     if not input_dir.is_dir():
         raise HarnessError(f"Prediction directory not found: {input_dir}")
-    saved_config = input_dir.parent / "config.yaml"
+    dataset, split, videos, queries, saved, experiment = experiment_context(input_dir.parent, dataset_dir, split)
     if max_predictions is None:
-        max_predictions = (yaml.safe_load(saved_config.read_text())["query"]["max_predictions"]
-                           if saved_config.exists() else 5)
+        max_predictions = saved["query"]["max_predictions"] if saved else 5
+    query_index = unique_index(queries, "query_id")
     rows = []
     for path in sorted(input_dir.iterdir()):
         if path.suffix != ".json" or path.is_symlink() or not path.is_file():
             raise HarnessError(f"Unexpected prediction entry: {path}")
-        prediction = validate_prediction(read_json(path), query_id=path.stem,
-                                         max_predictions=max_predictions)
+        prediction = validate_result(read_json(path), query_index, videos, split, max_predictions)
+        if prediction["query_id"] != path.stem:
+            raise HarnessError(f"Prediction filename/query_id mismatch: {path.name}")
         meta_path = input_dir.parent / "run_metadata" / path.name
-        if (input_dir.parent / "experiment.json").exists():
+        if experiment or meta_path.exists():
             metadata = read_json(meta_path)
-            if metadata["status"] != "success" or metadata["prediction_hash"] != file_hash(path):
+            check_identity(metadata, dataset["name"], split)
+            if (metadata.get("query_id") != prediction["query_id"]
+                    or metadata.get("video_id") != prediction["video_id"]
+                    or metadata.get("status") != "success"
+                    or metadata.get("prediction_hash") != file_hash(path)):
                 raise HarnessError(f"Result is not an intact successful run: {path.name}")
         rows.append(prediction)
     unique_index(rows, "query_id")
-    write_jsonl(output, rows)  # all moments and evidence are retained, including empty lists
+    if output.resolve().parent == input_dir.resolve():
+        raise HarnessError("Write aggregate output outside the individual prediction directory")
+    write_jsonl(output, rows)
+    write_json(bundle_metadata_path(output), {
+        "dataset": dataset["name"], "split": split, "dataset_hash": object_hash(dataset),
+        "queries_hash": object_hash(queries), "prediction_sha256": file_hash(output),
+    })
     return rows
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Aggregate validated predictions, preserving every moment")
+    parser = argparse.ArgumentParser(description="Aggregate one dataset/split; reject mixed predictions")
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--dataset", help="Dataset name; defaults to saved experiment identity")
+    parser.add_argument("--split", help="Exact dataset.json split name; defaults to saved experiment split")
+    parser.add_argument("--config", type=Path, help="Config for dataset paths; otherwise use experiment config")
     parser.add_argument("--max-predictions", type=int)
     args = parser.parse_args()
-    print(f"Aggregated {len(aggregate(args.input, args.output, args.max_predictions))} queries")
+    directory = None
+    if args.dataset or args.config:
+        saved = args.input.parent / "config.yaml"
+        cfg = load_config(args.config or (saved if saved.exists() else "config.yaml"))
+        if args.dataset:
+            cfg["dataset"]["name"] = identifier(args.dataset)
+        directory = dataset_path(cfg, "datasets")
+        if args.split is None:
+            args.split = cfg["dataset"].get("split")
+    rows = aggregate(args.input, args.output, args.max_predictions, dataset_dir=directory, split=args.split)
+    print(f"Aggregated {len(rows)} queries")
 
 
 if __name__ == "__main__":
     cli(main)
-

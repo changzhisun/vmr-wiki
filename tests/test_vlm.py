@@ -37,5 +37,5 @@ def test_retry_transient_only_and_no_credential_in_errors(cfg, tmp_path, monkeyp
     monkeypatch.setattr("urllib.request.urlopen", request)
     with pytest.raises(HarnessError) as exc:
         VLMClient(cfg["ingest"]["vlm"]).caption(image)
-    assert len(calls) == 3
+    assert len(calls) == cfg["ingest"]["vlm"]["max_retries"] + 1
     assert "secret" not in str(exc.value)

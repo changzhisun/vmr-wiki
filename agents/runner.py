@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,8 +34,10 @@ class DockerRunner:
         destination = "CODEX_API_KEY" if self.agent == "codex" else "ANTHROPIC_API_KEY"
         self.env = {**os.environ, destination: key}
         self.destination_key = destination
+        self.allowed_hosts = tuple(cfg["query"]["egress_allowed_hosts"][self.agent])
         self.provenance = {"runtime": "docker", "image_id": self.image,
-                           "agent_command": self.agent_command()}
+                           "agent_command": self.agent_command(),
+                           "egress": {"mode": "allowlist-proxy", "hosts": list(self.allowed_hosts)}}
 
     @staticmethod
     def _inspect(image: str) -> str:
@@ -52,12 +55,17 @@ class DockerRunner:
         adapter = codex if self.agent == "codex" else claude_code
         return adapter.command(self.cfg["query"]["model"])
 
-    def docker_command(self, workspace: Path, name: str) -> list[str]:
+    def docker_command(self, workspace: Path, name: str, network: str) -> list[str]:
         # A read-only root mount plus a nested writable output mount is a filesystem
         # boundary, unlike chmod or an agent's workspace-write sandbox alone.
         if "," in str(workspace):
             raise HarnessError("Docker bind paths must not contain commas")
+        proxy = "http://egress-proxy:8080"
         return ["docker", "run", "--rm", "--interactive", "--init", "--name", name,
+                "--network", network,
+                # Keep Docker's local service discovery for the proxy alias but
+                # give its embedded resolver no usable external upstream.
+                "--dns", "127.0.0.1",
                 "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                 "--user", "1000:1000", "--pids-limit", "256", "--memory", "4g", "--cpus", "2",
                 "--tmpfs", "/tmp:rw,nosuid,size=512m,mode=1777",
@@ -65,14 +73,58 @@ class DockerRunner:
                 "--mount", f"type=bind,src={workspace},dst=/workspace,readonly",
                 "--mount", f"type=bind,src={workspace / 'output'},dst=/workspace/output",
                 "--workdir", "/workspace", "--env", self.destination_key,
+                "--env", f"HTTPS_PROXY={proxy}", "--env", f"HTTP_PROXY={proxy}",
+                "--env", f"ALL_PROXY={proxy}", "--env", "NO_PROXY=",
                 "--env", "DISABLE_AUTOUPDATER=1", "--env", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
                 self.image, *self.agent_command()]
 
+    @staticmethod
+    def _docker(command: list[str], message: str, *, timeout: int = 30) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(command, capture_output=True, text=True, check=True, timeout=timeout)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            raise HarnessError(message) from exc
+
+    def _start_egress_proxy(self, network: str, name: str) -> None:
+        command = ["docker", "run", "--detach", "--rm", "--name", name,
+                   "--network", "bridge", "--read-only", "--cap-drop=ALL",
+                   "--security-opt=no-new-privileges", "--user", "1000:1000",
+                   "--pids-limit", "64", "--memory", "256m", "--cpus", "0.5",
+                   "--tmpfs", "/tmp:rw,nosuid,size=16m,mode=1777", self.image,
+                   "python3", "/opt/vmr/egress_proxy.py"]
+        for host in self.allowed_hosts:
+            command.extend(["--allow-host", host])
+        self._docker(command, "Could not start the allowlisted egress proxy")
+        self._docker(["docker", "network", "connect", "--alias", "egress-proxy", network, name],
+                     "Could not attach the egress proxy to the isolated network")
+        probe = ["docker", "exec", name, "python3", "-c",
+                 "import socket; socket.create_connection(('127.0.0.1',8080),1).close()"]
+        for _ in range(50):
+            result = subprocess.run(probe, capture_output=True, text=True)
+            if result.returncode == 0:
+                return
+            time.sleep(0.1)
+        raise HarnessError("Allowlisted egress proxy did not become ready; rebuild the agent image")
+
+    @staticmethod
+    def _remove_container(name: str) -> None:
+        removed = subprocess.run(["docker", "rm", "--force", name],
+                                 capture_output=True, text=True, timeout=30)
+        if removed.returncode and "No such container" not in removed.stderr:
+            raise HarnessError(f"Could not confirm cleanup of container {name}")
+
     def run(self, workspace: Path, prompt: str, stdout: Path, stderr: Path) -> AgentResult:
         name = f"vmr-{uuid.uuid4().hex}"
-        command = self.docker_command(workspace, name)
+        network = f"{name}-internal"
+        proxy_name = f"{name}-proxy"
         process = None
+        network_created = False
         try:
+            self._docker(["docker", "network", "create", "--internal", network],
+                         "Could not create an isolated agent network")
+            network_created = True
+            self._start_egress_proxy(network, proxy_name)
+            command = self.docker_command(workspace, name, network)
             with stdout.open("wb") as out, stderr.open("wb") as err:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
                                            env=self.env, start_new_session=True)
@@ -85,10 +137,7 @@ class DockerRunner:
             # Kill the container as well as its client, including on Ctrl-C.
             # This prevents descendants from writing output after timeout/cleanup.
             try:
-                removed = subprocess.run(["docker", "rm", "--force", name],
-                                         capture_output=True, text=True, timeout=30)
-                if removed.returncode and "No such container" not in removed.stderr:
-                    raise HarnessError(f"Could not confirm cleanup of container {name}")
+                self._remove_container(name)
             finally:
                 if process is not None and process.poll() is None:
                     # docker rm already terminates the workload's process tree.
@@ -99,3 +148,11 @@ class DockerRunner:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=10)
+                try:
+                    self._remove_container(proxy_name)
+                finally:
+                    if network_created:
+                        removed = subprocess.run(["docker", "network", "rm", network],
+                                                 capture_output=True, text=True, timeout=30)
+                        if removed.returncode and "not found" not in removed.stderr.lower():
+                            raise HarnessError(f"Could not remove isolated network {network}")

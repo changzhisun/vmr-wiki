@@ -6,11 +6,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 from adapters.base import DatasetAdapter
-from harness.common import (HarnessError, cli, identifier, nonempty,
-                            number, read_jsonl)
+from harness.common import (HarnessError, cli, file_hash, identifier, nonempty,
+                            number, read_json, read_jsonl, write_json)
 
 
 class QVHighlightsAdapter(DatasetAdapter):
@@ -59,6 +62,30 @@ class QVHighlightsAdapter(DatasetAdapter):
         if not sources:
             raise HarnessError("No highlight_<split>_release.jsonl annotation files found")
         return sources
+
+
+def evaluate_predictions(predictions: dict, ground_truth: dict, *, official_root: Path | None = None) -> dict:
+    from adapters.qvhighlights_metrics import evaluate_qvhighlights
+    result = {"gt_semantics": "multiple_relevant_instances", "primary_metric": "MR-full-mAP"}
+    if official_root is not None:
+        result["official_source_hashes"] = {
+            name: file_hash(official_root / "standalone_eval" / name) for name in ("eval.py", "utils.py")}
+        with tempfile.TemporaryDirectory(prefix="vmr-evaluate-") as directory:
+            payload, output = Path(directory) / "input.json", Path(directory) / "output.json"
+            write_json(payload, {"predictions": predictions, "ground_truth": ground_truth})
+            try:
+                subprocess.run([sys.executable, str(Path(__file__).with_name("qvhighlights_official.py")),
+                                "--root", str(official_root.resolve()), "--input", str(payload),
+                                "--output", str(output)], check=True, timeout=600)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                raise HarnessError("Official evaluator failed; no silent fallback was applied") from exc
+            result["benchmark"] = read_json(output)
+        result["implementation"] = "official-with-empty-prediction-adapter"
+    else:
+        result["benchmark"] = evaluate_qvhighlights(predictions, ground_truth)
+        result["implementation"] = "dataset-adapter"
+    result["primary_score"] = result["benchmark"]["brief"]["MR-full-mAP"]
+    return result
 
 
 def main():

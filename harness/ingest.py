@@ -9,6 +9,7 @@ import argparse
 import math
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 from harness.common import (HarnessError, atomic_text, cli, file_hash, identifier,
@@ -74,7 +75,13 @@ def render_wiki(video_id: str, duration: float, interval: float, frames: list[di
     return "\n".join(lines)
 
 
-def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, captioner=None) -> dict:
+def _check_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise HarnessError("Ingest cancelled")
+
+
+def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, captioner=None,
+                 cancel_event: threading.Event | None = None) -> dict:
     """No query or GT argument is accepted. Existing completed ingest is never recaptioned."""
     identifier(video_id, "video_id")
     video = video.resolve()
@@ -101,17 +108,22 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
     staging = None
     try:
         fd.close()
+        _check_cancelled(cancel_event)
         if output.exists():
             raise HarnessError("Ingest completed concurrently; rerun to verify existing output")
         duration = probe_duration(video)
+        _check_cancelled(cancel_event)
         client = captioner if captioner is not None else VLMClient(cfg["ingest"]["vlm"])
         staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
         (staging / "frames").mkdir()
         frames = []
         for index, timestamp in enumerate(sample_times(duration, cfg["ingest"]["sample_interval_sec"]), 1):
+            _check_cancelled(cancel_event)
             relative = f"frames/{index:06d}.jpg"
             extract_frame(video, timestamp, staging / relative, cfg["ingest"])
+            _check_cancelled(cancel_event)
             caption = client.caption(staging / relative)
+            _check_cancelled(cancel_event)
             from harness.common import nonempty
             frames.append({"frame_id": f"f{index:06d}", "timestamp": timestamp,
                            "frame": relative, "caption": nonempty(caption, "caption")})
@@ -120,10 +132,11 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
             video_id, duration, cfg["ingest"]["sample_interval_sec"], frames))
         if file_hash(video) != source_hash:
             raise HarnessError("Source video changed during ingest")
+        _check_cancelled(cancel_event)
         metadata = {"version": 1, "video_id": video_id, "duration": duration,
                     "source_sha256": source_hash, "ingest_config": cfg["ingest"],
-                    # Hash of content-determining settings only (not base_url/
-                    # timeout/retries); see ingest_content_hash for the rationale.
+                    # Hash of content-determining settings only; transport,
+                    # auth, timeouts, and retries remain provenance metadata.
                     "ingest_config_hash": content_hash, "created_at": now(),
                     "ffmpeg_version": media_command(["ffmpeg", "-version"]).splitlines()[0],
                     "content_hashes": tree_hashes(staging)}

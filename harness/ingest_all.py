@@ -24,9 +24,12 @@ logger = logging.getLogger(__name__)
 
 # Module-level handle so an interrupt can close the progress bar cleanly.
 _active_bar: "ProgressBar | None" = None
+_active_cancel: "threading.Event | None" = None
 
 
 def _handle_interrupt(signum: int, frame: object) -> None:
+    if _active_cancel is not None:
+        _active_cancel.set()
     if _active_bar is not None:
         _active_bar.finish()
     raise KeyboardInterrupt
@@ -125,6 +128,7 @@ def _ingest_one(
     output: Path,
     cfg: dict,
     captioner=None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[dict, bool]:
     """Ingest a single video.
 
@@ -137,7 +141,8 @@ def _ingest_one(
     else:
         logger.info("%s: ingesting new video (%.1fs)", vid, video["duration"])
 
-    metadata = ingest_video(video_path, vid, output, cfg, captioner=captioner)
+    metadata = ingest_video(video_path, vid, output, cfg, captioner=captioner,
+                            cancel_event=cancel_event)
 
     if abs(metadata["duration"] - video["duration"]) > 0.1:
         raise HarnessError(
@@ -157,10 +162,12 @@ def _run_sequential(
     cfg: dict,
     captioner,
     bar: ProgressBar,
+    cancel_event: threading.Event,
 ) -> list[dict]:
     results: list[dict] = []
     for vid, video, path, output in tasks:
-        metadata, _ = _ingest_one(vid, video, path, output, cfg, captioner=captioner)
+        metadata, _ = _ingest_one(vid, video, path, output, cfg, captioner=captioner,
+                                  cancel_event=cancel_event)
         results.append(metadata)
         bar.update()
     return results
@@ -172,6 +179,7 @@ def _run_parallel(
     captioner,
     jobs: int,
     bar: ProgressBar,
+    cancel_event: threading.Event,
 ) -> list[dict]:
     results: list[dict] = [None] * len(tasks)  # type: ignore[list-item]
     failures: list[tuple[str, str]] = []
@@ -184,7 +192,8 @@ def _run_parallel(
         # Results are written back by index so the return order matches the input
         # order (same contract as the sequential path), regardless of completion order.
         future_to_idx = {
-            executor.submit(_ingest_one, vid, video, path, output, cfg, captioner=captioner): idx
+            executor.submit(_ingest_one, vid, video, path, output, cfg,
+                            captioner=captioner, cancel_event=cancel_event): idx
             for idx, (vid, video, path, output) in enumerate(tasks)
         }
         for future in as_completed(future_to_idx):
@@ -203,7 +212,10 @@ def _run_parallel(
             bar.update()
     except KeyboardInterrupt:
         logger.warning("Interrupted by user; cancelling remaining work")
-        executor.shutdown(wait=False, cancel_futures=True)
+        cancel_event.set()
+        # Queued futures are cancelled immediately. Running workers observe the
+        # event between frame extraction/API calls and clean their staging dirs.
+        executor.shutdown(wait=True, cancel_futures=True)
         shut_down = True
         raise
     finally:
@@ -276,8 +288,10 @@ def ingest_all(
             path = dataset / path
         tasks.append((vid, video, path, wiki_root / vid))
 
-    global _active_bar
+    cancel_event = threading.Event()
+    global _active_bar, _active_cancel
     _active_bar = ProgressBar(len(tasks), desc="Ingesting videos")
+    _active_cancel = cancel_event
     _setup_logging(_active_bar, verbose)
 
     old_handler = None
@@ -292,14 +306,15 @@ def ingest_all(
 
     try:
         if jobs == 1:
-            results = _run_sequential(tasks, cfg, captioner, _active_bar)
+            results = _run_sequential(tasks, cfg, captioner, _active_bar, cancel_event)
         else:
-            results = _run_parallel(tasks, cfg, captioner, jobs, _active_bar)
+            results = _run_parallel(tasks, cfg, captioner, jobs, _active_bar, cancel_event)
     finally:
         if old_handler is not None:
             signal.signal(signal.SIGINT, old_handler)
         _active_bar.finish()
         _active_bar = None
+        _active_cancel = None
 
     return results
 

@@ -10,6 +10,7 @@ RUN test -n "$CODEX_VERSION" && test -n "$CLAUDE_VERSION" \
     && npm install -g "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
     && npm cache clean --force
 
+COPY --chown=node:node docker/egress_proxy.py /opt/vmr/egress_proxy.py
+
 USER node
 WORKDIR /workspace
-

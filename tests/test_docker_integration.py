@@ -15,10 +15,26 @@ class ContainerProbeRunner(DockerRunner):
     def agent_command(self):
         return ["python3", "-c", '''
 import os
+import socket
 from pathlib import Path
 assert os.getuid() == 1000
 assert not Path("/var/run/docker.sock").exists()
 assert sorted(p.name for p in Path("/home/node").iterdir()) == []
+try:
+    socket.create_connection(("1.1.1.1", 443), 1)
+except OSError:
+    pass
+else:
+    raise AssertionError("agent has a direct internet route")
+try:
+    socket.getaddrinfo("example.com", 443)
+except socket.gaierror:
+    pass
+else:
+    raise AssertionError("agent can use external DNS")
+with socket.create_connection(("egress-proxy", 8080), 2) as proxy:
+    proxy.sendall(b"CONNECT attacker.example:443 HTTP/1.1\\r\\nHost: attacker.example\\r\\n\\r\\n")
+    assert b"403 Forbidden" in proxy.recv(1024)
 for path in ("/workspace/wiki/wiki.md", "/workspace/task.json", "/workspace/forbidden", "/root/forbidden"):
     try:
         Path(path).write_text("forbidden")
@@ -50,9 +66,19 @@ def test_actual_container_readonly_mounts_fresh_home_and_cli_flags(cfg, tmp_path
         cfg["query"]["agent"] = agent
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-no-api-call")
         adapter = DockerRunner(cfg)
-        command = adapter.docker_command(workspace.resolve(), f"vmr-cli-{agent}") + ["--help"]
-        proc = subprocess.run(command, env=adapter.env, capture_output=True, text=True, timeout=60)
-        assert proc.returncode == 0, proc.stderr
+        network = f"vmr-cli-{agent}-network"
+        proxy = f"vmr-cli-{agent}-proxy"
+        try:
+            subprocess.run(["docker", "network", "create", "--internal", network], check=True,
+                           capture_output=True, text=True)
+            adapter._start_egress_proxy(network, proxy)
+            command = adapter.docker_command(workspace.resolve(), f"vmr-cli-{agent}", network) + ["--help"]
+            proc = subprocess.run(command, env=adapter.env, capture_output=True, text=True, timeout=60)
+            assert proc.returncode == 0, proc.stderr
+        finally:
+            adapter._remove_container(proxy)
+            subprocess.run(["docker", "network", "rm", network],
+                           capture_output=True, text=True)
 
 
 def test_actual_timeout_removes_container(cfg, tmp_path, monkeypatch):
@@ -63,9 +89,9 @@ def test_actual_timeout_removes_container(cfg, tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "agent_command", lambda: ["python3", "-c", "import time; time.sleep(90)"])
     names = []
     original_command = runner.docker_command
-    def tracked_command(workspace, name):
+    def tracked_command(workspace, name, network):
         names.append(name)
-        return original_command(workspace, name)
+        return original_command(workspace, name, network)
     monkeypatch.setattr(runner, "docker_command", tracked_command)
     result = runner.run(tmp_path, "", tmp_path / "stdout", tmp_path / "stderr")
     assert result.timed_out

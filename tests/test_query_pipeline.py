@@ -85,7 +85,7 @@ def test_end_to_end_fresh_processes_cleanup_and_no_gt_reads(frozen):
     root = Path(cfg["paths"]["results"]) / "test"
     rows = aggregate(root / "predictions", root / "predictions.jsonl")
     assert len(rows) == 3 and all(len(r["moments"]) == 2 for r in rows)
-    metrics = evaluate(root / "predictions.jsonl", truth, evaluator="qvhighlights",
+    metrics = evaluate(root / "predictions.jsonl", truth, split="train", evaluator="qvhighlights",
                        metadata_dir=root / "run_metadata")
     assert metrics["failed_runs"] == 0
     assert metrics["primary_score"] == 100.0
@@ -148,10 +148,15 @@ def test_docker_mount_boundary_and_credentials_not_in_command(cfg, monkeypatch, 
     monkeypatch.setenv("CODEX_API_KEY", "test-secret")
     monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
     runner = DockerRunner(cfg)
-    command = runner.docker_command(tmp_path, "test-container")
+    command = runner.docker_command(tmp_path, "test-container", "isolated-network")
     assert "test-secret" not in " ".join(command)
     assert "CODEX_API_KEY" in command
     assert "--read-only" in command and "--cap-drop=ALL" in command
+    assert command[command.index("--network") + 1] == "isolated-network"
+    assert command[command.index("--dns") + 1] == "127.0.0.1"
+    assert "HTTPS_PROXY=http://egress-proxy:8080" in command
+    assert runner.provenance["egress"] == {
+        "mode": "allowlist-proxy", "hosts": ["api.openai.com", "chatgpt.com"]}
     mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--mount"]
     assert mounts == [f"type=bind,src={tmp_path},dst=/workspace,readonly",
                       f"type=bind,src={tmp_path / 'output'},dst=/workspace/output"]

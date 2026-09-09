@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import ipaddress
+import re
 from pathlib import Path
 
 import yaml
 
 from harness.common import HarnessError, identifier, nonempty, number, positive_int
+
+
+def hostname(value, field: str) -> str:
+    value = nonempty(value, field).lower()
+    if len(value) > 253 or "." not in value or not re.fullmatch(r"[a-z0-9.-]+", value):
+        raise HarnessError(f"{field} must be an exact DNS hostname")
+    if any(not label or len(label) > 63 or label[0] == "-" or label[-1] == "-"
+           for label in value.split(".")):
+        raise HarnessError(f"{field} must be an exact DNS hostname")
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return value
+    raise HarnessError(f"{field} must not be an IP address")
 
 
 def load_config(path: str | Path = "config.yaml") -> dict:
@@ -50,6 +66,13 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         nonempty(query["container_image"], "container_image")
         for agent in ("codex", "claude_code"):
             identifier(query["api_key_env"][agent], "api_key_env")
+            hosts = query["egress_allowed_hosts"][agent]
+            if not isinstance(hosts, list) or not hosts:
+                raise HarnessError(f"query.egress_allowed_hosts.{agent} must be a nonempty list")
+            normalized = [hostname(host, f"query.egress_allowed_hosts.{agent}") for host in hosts]
+            if len(set(normalized)) != len(normalized):
+                raise HarnessError(f"query.egress_allowed_hosts.{agent} contains duplicates")
+            query["egress_allowed_hosts"][agent] = normalized
         ev = cfg["evaluation"]
         identifier(ev["evaluator"], "evaluator")
         if not ev["top_k"] or not ev["iou_thresholds"]:
