@@ -31,13 +31,21 @@ def media_command(command: list[str]) -> str:
 
 
 def probe_duration(video: Path) -> float:
+    """Return container duration, falling back to the video stream.
+
+    Annotations are written against what a player shows, which tracks the
+    container. Preferring the stream would treat a correct file as truncated
+    whenever an audio track or muxer delay makes the two differ.
+    """
     metadata = parse_json(media_command([
         "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
         "stream=codec_type,duration:format=duration", "-of", "json", str(video),
     ]))
     if not metadata.get("streams"):
         raise HarnessError("Input contains no video stream")
-    raw = metadata["streams"][0].get("duration", metadata.get("format", {}).get("duration"))
+    raw = metadata.get("format", {}).get("duration")
+    if raw is None:
+        raw = metadata["streams"][0].get("duration")
     try:
         duration = number(float(raw), "video duration", 0)
     except (TypeError, ValueError) as exc:

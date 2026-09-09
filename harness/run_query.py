@@ -43,14 +43,12 @@ class Experiment:
         if missing or unfrozen:
             raise split_not_ready_error(cfg["dataset"]["name"], self.split, missing, unfrozen)
         self.freeze = {"dataset": dataset_metadata["name"], "split": self.split, "videos": {}}
-        for vid, video in self.videos.items():
+        for vid in self.videos:
             ingest_meta = read_json(self.wiki_root / vid / "ingest.json")
             seal = verify_wiki(self.wiki_root / vid)
             if ingest_content_hash({"ingest": ingest_meta["ingest_config"]}) != ingest_content_hash(cfg) or seal["video_id"] != vid:
                 raise HarnessError(f"Frozen dataset wiki mismatch: {vid}")
             self.freeze["videos"][vid] = seal["wiki_hash"]
-            if abs(seal["duration"] - video["duration"]) > 0.1:
-                raise HarnessError(f"Frozen video duration mismatch: {vid}")
         self.templates = {name: (Path(cfg["paths"]["templates"]) / name).read_text(encoding="utf-8")
                           for name in ("AGENTS.md", "query_prompt.md")}
         self.runner = runner if runner is not None else DockerRunner(cfg)

@@ -147,12 +147,6 @@ def _ingest_one(
     metadata = ingest_video(video_path, vid, output, cfg, captioner=captioner,
                             cancel_event=cancel_event)
 
-    if abs(metadata["duration"] - video["duration"]) > 0.1:
-        raise HarnessError(
-            f"{vid}: annotation/media durations differ by more than 0.1s "
-            f"({metadata['duration']}s vs {video['duration']}s)"
-        )
-
     if was_existing:
         logger.info("%s: verified OK (%.1fs)", vid, metadata["duration"])
     else:

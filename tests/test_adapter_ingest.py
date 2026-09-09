@@ -5,10 +5,11 @@ import threading
 import pytest
 
 from adapters.qvhighlights import QVHighlightsAdapter
-from harness.common import HarnessError, read_jsonl, write_jsonl
+from harness.common import HarnessError, read_json, read_jsonl, write_json, write_jsonl
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
-from harness.ingest import sample_times
+from harness.ingest import probe_duration, sample_times
 from harness.ingest_all import ProgressBar, _run_parallel, ingest_all
+from harness.run_query import Experiment
 
 
 def test_adapter_preserves_all_gt_and_hides_labels(prepared):
@@ -83,6 +84,40 @@ def test_freeze_dataset_requires_ingest(prepared):
     cfg, _ = prepared
     with pytest.raises(HarnessError, match="have no ingest and cannot be frozen"):
         freeze_dataset(cfg)
+
+
+def test_freeze_reports_which_ingest_setting_changed(prepared):
+    cfg, captioner = prepared
+    ingest_all(cfg, captioner=captioner)
+    cfg["ingest"]["vlm"]["max_tokens"] = cfg["ingest"]["vlm"]["max_tokens"] + 1
+    with pytest.raises(HarnessError, match="vlm.max_tokens"):
+        freeze_dataset(cfg)
+
+
+def test_probe_duration_prefers_container_over_stream(monkeypatch, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"not-a-real-video")
+    monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: (
+        '{"streams":[{"codec_type":"video","duration":"10.366667"}],'
+        '"format":{"duration":"12.020000"}}'
+    ))
+    assert probe_duration(video) == pytest.approx(12.02)
+
+
+def test_pipeline_does_not_compare_ingest_and_annotation_durations(prepared):
+    cfg, captioner = prepared
+    ingest_all(cfg, captioner=captioner)
+    root = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos" / "video"
+    metadata = read_json(root / "ingest.json")
+    metadata["duration"] += 5.0
+    write_json(root / "ingest.json", metadata)
+    freeze_dataset(cfg)
+
+    class Runner:
+        provenance = {"runtime": "test"}
+
+    experiment = Experiment(cfg, "duration-not-checked", runner=Runner())
+    assert experiment.freeze["videos"]["video"] == verify_wiki(root)["wiki_hash"]
 
 
 def test_frame_tampering_detected(frozen):

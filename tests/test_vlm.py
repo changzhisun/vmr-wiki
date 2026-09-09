@@ -39,3 +39,69 @@ def test_retry_transient_only_and_no_credential_in_errors(cfg, tmp_path, monkeyp
         VLMClient(cfg["ingest"]["vlm"]).caption(image)
     assert len(calls) == cfg["ingest"]["vlm"]["max_retries"] + 1
     assert "secret" not in str(exc.value)
+
+
+def test_length_with_visible_caption_is_rejected(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"image")
+    calls = []
+    def request(req, timeout):
+        calls.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "length",
+                         "message": {"content": "A person stands indoors near a doorway."}}]
+        }).encode())
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    with pytest.raises(HarnessError, match="finish_reason='length'"):
+        VLMClient(cfg["ingest"]["vlm"]).caption(image)
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == cfg["ingest"]["vlm"]["max_tokens"]
+
+
+def test_qwen3_disables_thinking(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    cfg["ingest"]["vlm"]["model"] = "Qwen3-VL-8B-Instruct"
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"image")
+    payloads = []
+    def request(req, timeout):
+        payloads.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "stop",
+                         "message": {"content": "A person stands indoors."}}]
+        }).encode())
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    assert VLMClient(cfg["ingest"]["vlm"]).caption(image) == "A person stands indoors."
+    assert payloads[0]["messages"][0]["content"][0]["text"].endswith("/no_think")
+    assert payloads[0]["enable_thinking"] is False
+    assert payloads[0]["max_tokens"] == cfg["ingest"]["vlm"]["max_tokens"]
+
+
+def test_think_block_is_stripped_from_caption(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"image")
+    def request(req, timeout):
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {
+                "content": "<think>plan</think>\nA red chair is in the room."}}]
+        }).encode())
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    assert VLMClient(cfg["ingest"]["vlm"]).caption(image) == "A red chair is in the room."
+
+
+def test_content_filter_fails_immediately(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"image")
+    calls = []
+    def request(req, timeout):
+        calls.append(req)
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "content_filter", "message": {"content": ""}}]
+        }).encode())
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    with pytest.raises(HarnessError, match="finish_reason='content_filter'"):
+        VLMClient(cfg["ingest"]["vlm"]).caption(image)
+    assert len(calls) == 1

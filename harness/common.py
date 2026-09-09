@@ -129,6 +129,24 @@ def ingest_content_hash(cfg: dict) -> str:
     })
 
 
+def ingest_content_diff(stored: dict, cfg: dict) -> list[str]:
+    """Human-readable content-setting differences between a wiki and current config."""
+    if ingest_content_hash({"ingest": stored}) == ingest_content_hash(cfg):
+        return []
+    diffs = []
+    for key in sorted(_INGEST_CONTENT_KEYS):
+        if stored.get(key) != cfg["ingest"].get(key):
+            diffs.append(f"{key} {stored.get(key)!r} vs {cfg['ingest'].get(key)!r}")
+    stored_vlm = stored.get("vlm") or {}
+    current_vlm = cfg["ingest"]["vlm"]
+    for key in sorted(_VLM_CONTENT_KEYS):
+        left, right = stored_vlm.get(key), current_vlm.get(key)
+        if left != right:
+            diffs.append(f"vlm.{key} {left!r} vs {right!r}" if key != "prompt"
+                         else "vlm.prompt differs")
+    return diffs or ["ingest content hash"]
+
+
 def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:

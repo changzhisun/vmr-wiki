@@ -20,7 +20,7 @@ ingest:
     api_key_env: OPENAI_API_KEY
     model: Qwen3-VL-8B-Instruct
     temperature: 0
-    max_tokens: 512
+    max_tokens: 1024
     timeout_sec: 120
     max_retries: 3
     prompt: >-

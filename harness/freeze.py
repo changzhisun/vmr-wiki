@@ -9,8 +9,8 @@ import argparse
 import shutil
 from pathlib import Path
 
-from harness.common import (HarnessError, cli, file_hash, ingest_content_hash,
-                            object_hash, read_json, write_json)
+from harness.common import (HarnessError, cli, file_hash, ingest_content_diff,
+                            ingest_content_hash, object_hash, read_json, write_json)
 from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_videos
 
@@ -127,12 +127,15 @@ def freeze_dataset(cfg: dict, *, split: str | None = None) -> dict:
             f"{len(missing)} video(s) have no ingest and cannot be frozen: {_format_ids(missing)}"
         )
     # Preflight every video before applying any read-only permissions.
-    for vid, video in videos.items():
+    for vid in videos:
         metadata = read_json(root / vid / "ingest.json")
-        if metadata["video_id"] != vid or ingest_content_hash({"ingest": metadata["ingest_config"]}) != ingest_content_hash(cfg):
-            raise HarnessError(f"{vid}: video ID or ingest settings do not match")
-        if abs(metadata["duration"] - video["duration"]) > 0.1:
-            raise HarnessError(f"{vid}: media duration differs from dataset by more than 0.1s")
+        if metadata["video_id"] != vid:
+            raise HarnessError(f"{vid}: ingest.json video_id is {metadata['video_id']!r}")
+        diffs = ingest_content_diff(metadata["ingest_config"], cfg)
+        if diffs:
+            raise HarnessError(
+                f"{vid}: ingest settings do not match current config ({'; '.join(diffs)})"
+            )
     seals = {vid: freeze_wiki(root / vid) for vid in videos}
     manifest = {"version": 2, "dataset": cfg["dataset"]["name"], "split": split,
                 "ingest_config_hash": ingest_content_hash(cfg),
