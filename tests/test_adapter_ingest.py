@@ -111,8 +111,12 @@ def test_dense_events_are_strict_and_use_only_window_timestamps():
             {"start": 2, "end": 2, "caption": "Later."},
             {"start": 1, "end": 1, "caption": "Earlier."},
         ]}), [0.0, 1.0, 2.0])
-    with pytest.raises(HarnessError, match="only events"):
-        parse_dense_events('{"events":[],"summary":"extra"}', [0.0])
+    assert parse_dense_events('{"events":[],"summary":"extra"}', [0.0]) == []
+    assert parse_dense_events(
+        json.dumps([{"start": 0, "end": 0, "caption": "Bare list."}]), [0.0]
+    ) == [{"start": 0.0, "end": 0.0, "caption": "Bare list."}]
+    with pytest.raises(HarnessError, match=r"keys=\[summary\]"):
+        parse_dense_events('{"summary":"no events"}', [0.0])
 
 
 def test_dense_events_map_frame_indices_onto_shifted_windows():
@@ -128,6 +132,26 @@ def test_dense_events_map_frame_indices_onto_shifted_windows():
         {"start": 115, "end": 118, "caption": "Absolute times."},
     ]}), timeline) == [
         {"start": 115.0, "end": 118.0, "caption": "Absolute times."},
+    ]
+    assert parse_dense_events(json.dumps({"events": [
+        {"start": 0, "end": 4, "caption": "Exclusive end as frame count."},
+    ]}), timeline) == [
+        {"start": 115.0, "end": 118.0, "caption": "Exclusive end as frame count."},
+    ]
+    assert parse_dense_events(json.dumps({"events": [
+        {"start": 0.0, "end": 4.0, "caption": "Covers the four-frame window."},
+    ]}), [0.0, 1.0, 2.0, 3.0]) == [
+        {"start": 0.0, "end": 3.0, "caption": "Covers the four-frame window."},
+    ]
+    assert parse_dense_events(json.dumps({"events": [
+        {"start": 4, "end": 4, "caption": "One-based last frame."},
+    ]}), [0.0, 1.0, 2.0, 3.0]) == [
+        {"start": 3.0, "end": 3.0, "caption": "One-based last frame."},
+    ]
+    assert parse_dense_events(json.dumps({"events": [
+        {"start": 115, "end": 119, "caption": "Exclusive time past last sample."},
+    ]}), timeline) == [
+        {"start": 115.0, "end": 118.0, "caption": "Exclusive time past last sample."},
     ]
     with pytest.raises(HarnessError, match=r"window=\[115.0, 116.0, 117.0, 118.0\]"):
         parse_dense_events(

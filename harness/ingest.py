@@ -121,8 +121,25 @@ def _as_window_index(value: float, count: int) -> int | None:
     if abs(value - nearest) > _TIMESTAMP_EPS:
         return None
     index = int(nearest)
+    if count <= 0:
+        return None
     if 0 <= index < count:
         return index
+    # Exclusive 0-based end, or 1-based last frame (n frames numbered 1..n).
+    if index == count:
+        return count - 1
+    return None
+
+
+def _exclusive_end(value: float, timestamps: list[float]) -> float | None:
+    if len(timestamps) < 2:
+        return None
+    step = timestamps[-1] - timestamps[-2]
+    if step <= 0:
+        return None
+    exclusive = timestamps[-1] + step
+    if abs(value - exclusive) <= _TIMESTAMP_EPS:
+        return timestamps[-1]
     return None
 
 
@@ -130,8 +147,10 @@ def resolve_window_timestamp(value: float, timestamps: list[float]) -> float | N
     """Map a model timestamp onto this window's sampled times.
 
     Absolute times already on the timeline win. Otherwise a whole number in
-    ``[0, len(timestamps))`` is treated as a frame index: models often emit
-    0..n-1 for a window that actually starts at t=115s.
+    ``[0, len(timestamps)]`` is a frame index: ``0..n-1`` as usual, and ``n`` as
+    the exclusive end / 1-based last frame. A time one step past the last
+    sample is the same exclusive end. Invented precision such as ``1.5`` is
+    still rejected.
     """
     matched = _on_timeline(value, timestamps)
     if matched is not None:
@@ -139,7 +158,27 @@ def resolve_window_timestamp(value: float, timestamps: list[float]) -> float | N
     index = _as_window_index(value, len(timestamps))
     if index is not None:
         return timestamps[index]
-    return None
+    return _exclusive_end(value, timestamps)
+
+
+def _dense_events_payload(payload: object) -> list:
+    """Take the events array; ignore extra object keys and a bare list."""
+    if isinstance(payload, str):
+        payload = parse_json(payload)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("events", "Events", "event"):
+            if key in payload:
+                events = payload[key]
+                if not isinstance(events, list):
+                    raise HarnessError("Dense caption events must be a list")
+                return events
+        keys = ", ".join(sorted(map(str, payload)))
+        raise HarnessError(f"Dense caption must contain an events array (keys=[{keys}])")
+    raise HarnessError(
+        f"Dense caption must be a JSON object with events (got {type(payload).__name__})"
+    )
 
 
 def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
@@ -147,16 +186,13 @@ def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
 
     Event boundaries must select timestamps from the window verbatim. This
     prevents the captioner from inventing temporal precision unavailable in
-    the sampled frames. A surrounding Markdown code fence is discarded; the
-    JSON object itself is not repaired. Whole-number frame indices are mapped
-    onto the window timeline.
+    the sampled frames. A surrounding Markdown code fence is discarded.
+    Extra object keys and a top-level events list are accepted. Whole-number
+    frame indices, including an exclusive end of ``n``, map onto the window
+    timeline.
     """
     payload = parse_json(unwrap_markdown_json_fence(text))
-    if not isinstance(payload, dict) or set(payload) != {"events"}:
-        raise HarnessError("Dense caption must be an object containing only events")
-    events = payload["events"]
-    if not isinstance(events, list):
-        raise HarnessError("Dense caption events must be a list")
+    events = _dense_events_payload(payload)
     window = ", ".join(str(stamp) for stamp in timestamps)
     normalized = []
     previous_start: float | None = None
