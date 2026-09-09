@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import urllib.error
@@ -23,6 +24,27 @@ def test_fixed_image_payload_and_caption(cfg, tmp_path, monkeypatch):
     assert len(seen[0]["messages"]) == 1
     assert seen[0]["messages"][0]["content"][0]["text"] == cfg["ingest"]["vlm"]["prompt"]
     assert seen[0]["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_multi_image_payload_preserves_chronological_order(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    images = [tmp_path / "first.jpg", tmp_path / "second.jpg"]
+    images[0].write_bytes(b"first")
+    images[1].write_bytes(b"second")
+    seen = []
+
+    def request(req, timeout):
+        seen.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {"content": "A sequence."}}]
+        }).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    assert VLMClient(cfg["ingest"]["vlm"]).caption(images) == "A sequence."
+    content = seen[0]["messages"][0]["content"]
+    assert "chronological order" in content[0]["text"]
+    encoded = [part["image_url"]["url"].split(",", 1)[1] for part in content[1:]]
+    assert [base64.b64decode(value) for value in encoded] == [b"first", b"second"]
 
 
 def test_retry_transient_only_and_no_credential_in_errors(cfg, tmp_path, monkeypatch):

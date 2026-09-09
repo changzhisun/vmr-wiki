@@ -375,9 +375,11 @@ python harness/ingest_all.py \
         ↓
 固定时间间隔采样 frame
         ↓
-对每张 frame 调用固定 VLM API
+按固定 window / stride 组成 frame 窗口
         ↓
-获得 timestamp + caption
+对每个窗口调用固定 VLM API
+        ↓
+获得时间范围 + caption
         ↓
 写 frames.jsonl
         ↓
@@ -387,6 +389,7 @@ python harness/ingest_all.py \
 所有视频必须使用相同：
 
 - sampling interval；
+- caption window / stride；
 - VLM model；
 - VLM prompt；
 - image preprocessing；
@@ -409,7 +412,7 @@ wiki/<dataset>/videos/<video_id>/
 
 ### 7.1 frames.jsonl
 
-机器可读格式：
+单图模式（window=1）保持原有机器可读格式：
 
 ```json
 {"frame_id":"f000001","timestamp":0.0,"frame":"frames/000001.jpg","caption":"A man enters a kitchen."}
@@ -417,21 +420,20 @@ wiki/<dataset>/videos/<video_id>/
 {"frame_id":"f000003","timestamp":10.0,"frame":"frames/000003.jpg","caption":"The refrigerator door is open."}
 ```
 
-每一条必须包含：
+多图模式下每一行表示一个时间窗口：
 
-```text
-frame_id
-timestamp
-frame
-caption
+```json
+{"window_id":"w000001","start_timestamp":0.0,"end_timestamp":10.0,"frames":[{"frame_id":"f000001","timestamp":0.0,"frame":"frames/000001.jpg"},{"frame_id":"f000002","timestamp":5.0,"frame":"frames/000002.jpg"},{"frame_id":"f000003","timestamp":10.0,"frame":"frames/000003.jpg"}],"caption":"A man approaches and opens a refrigerator."}
 ```
+
+最后一个窗口可以少于配置的 window 帧数；frames 始终按时间顺序排列。
 
 ### 7.2 wiki.md
 
 给 Agent 阅读的统一 Markdown：
 
 ```markdown
-# Video: video_001
+# Video
 
 ## Metadata
 

@@ -42,6 +42,10 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         ingest = cfg["ingest"]
         if number(ingest["sample_interval_sec"], "sample_interval_sec") <= 0:
             raise HarnessError("sample_interval_sec must be positive")
+        ingest.setdefault("caption_window_frames", 1)
+        ingest.setdefault("caption_stride_frames", 1)
+        positive_int(ingest["caption_window_frames"], "caption_window_frames")
+        positive_int(ingest["caption_stride_frames"], "caption_stride_frames")
         positive_int(ingest["image_max_size"], "image_max_size")
         if not 2 <= positive_int(ingest["jpeg_quality"], "jpeg_quality") <= 31:
             raise HarnessError("jpeg_quality must be in [2, 31]")

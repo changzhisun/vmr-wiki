@@ -4,9 +4,11 @@ import threading
 import pytest
 
 from adapters.qvhighlights import QVHighlightsAdapter
-from harness.common import HarnessError, read_json, read_jsonl, write_json, write_jsonl
+from harness.common import (HarnessError, ingest_content_hash, read_json, read_jsonl,
+                            write_json, write_jsonl)
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
-from harness.ingest import ingest_video, probe_duration, probe_durations, sample_times
+from harness.ingest import (caption_windows, ingest_video, probe_duration, probe_durations,
+                            sample_times)
 from harness.ingest_all import _run_parallel, ingest_all
 from harness.run_query import Experiment
 
@@ -43,6 +45,18 @@ def test_sampling_edges():
     for interval in (0, -1, float("nan")):
         with pytest.raises(HarnessError):
             sample_times(10.0, interval)
+
+
+def test_caption_windows_support_overlap_and_partial_tail():
+    frames = [{"frame_id": f"f{i}"} for i in range(5)]
+    windows = caption_windows(frames, window_frames=3, stride_frames=2)
+    assert [[frame["frame_id"] for frame in window] for window in windows] == [
+        ["f0", "f1", "f2"], ["f2", "f3", "f4"], ["f4"],
+    ]
+    with pytest.raises(HarnessError, match="caption_window_frames"):
+        caption_windows(frames, window_frames=0, stride_frames=1)
+    with pytest.raises(HarnessError, match="caption_stride_frames"):
+        caption_windows(frames, window_frames=1, stride_frames=0)
 
 
 def test_ingest_once_query_independent_and_freeze(prepared):
@@ -124,6 +138,54 @@ def test_ingest_samples_only_within_video_stream(cfg, monkeypatch, tmp_path):
     assert metadata["duration"] == pytest.approx(12.02)
     assert metadata["video_stream_duration"] == pytest.approx(10.0)
     assert [row["timestamp"] for row in read_jsonl(output / "frames.jsonl")] == [0.0, 5.0]
+
+
+def test_ingest_captions_overlapping_multi_frame_windows(cfg, monkeypatch, tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"source")
+    output = tmp_path / "wiki" / "clip"
+    cfg["ingest"].update({
+        "sample_interval_sec": 5.0,
+        "caption_window_frames": 3,
+        "caption_stride_frames": 2,
+    })
+    monkeypatch.setattr("harness.ingest.probe_durations", lambda _path: (21.0, 21.0))
+    monkeypatch.setattr(
+        "harness.ingest.extract_frame",
+        lambda _video, _timestamp, path, _cfg: path.write_bytes(b"jpeg"),
+    )
+    monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: "ffmpeg version test")
+
+    class Captioner:
+        def __init__(self):
+            self.windows = []
+
+        def caption(self, paths):
+            self.windows.append([path.name for path in paths])
+            return "A chronological sequence."
+
+    captioner = Captioner()
+    metadata = ingest_video(video, "clip", output, cfg, captioner=captioner)
+    assert captioner.windows == [
+        ["000001.jpg", "000002.jpg", "000003.jpg"],
+        ["000003.jpg", "000004.jpg", "000005.jpg"],
+        ["000005.jpg"],
+    ]
+    entries = read_jsonl(output / "frames.jsonl")
+    assert [(row["start_timestamp"], row["end_timestamp"]) for row in entries] == [
+        (0.0, 10.0), (10.0, 20.0), (20.0, 20.0),
+    ]
+    assert metadata["ingest_config"]["caption_window_frames"] == 3
+    wiki = (output / "wiki.md").read_text()
+    assert "Number of caption windows: 3" in wiki
+    assert "Caption stride: 2 sampled frames" in wiki
+
+
+def test_default_window_settings_match_legacy_ingest_hash(cfg):
+    legacy = {**cfg["ingest"]}
+    legacy.pop("caption_window_frames")
+    legacy.pop("caption_stride_frames")
+    assert ingest_content_hash({"ingest": legacy}) == ingest_content_hash(cfg)
 
 
 def test_pipeline_does_not_compare_ingest_and_annotation_durations(prepared):

@@ -110,8 +110,18 @@ def object_hash(value: Any) -> str:
 # retry settings are deliberately excluded: changing the provider, endpoint,
 # API key environment variable, request timeout, or retry count must not
 # invalidate an existing ingest.
-_INGEST_CONTENT_KEYS = frozenset({"sample_interval_sec", "image_max_size", "jpeg_quality"})
+_INGEST_CONTENT_KEYS = frozenset({
+    "sample_interval_sec", "caption_window_frames", "caption_stride_frames",
+    "image_max_size", "jpeg_quality",
+})
+_INGEST_CONTENT_DEFAULTS = {"caption_window_frames": 1, "caption_stride_frames": 1}
 _VLM_CONTENT_KEYS = frozenset({"model", "prompt", "temperature", "max_tokens"})
+
+
+def _ingest_content_value(ingest: dict, key: str):
+    if key in _INGEST_CONTENT_DEFAULTS:
+        return ingest.get(key, _INGEST_CONTENT_DEFAULTS[key])
+    return ingest[key]
 
 
 def ingest_content_hash(cfg: dict) -> str:
@@ -124,7 +134,7 @@ def ingest_content_hash(cfg: dict) -> str:
     ingest = cfg["ingest"]
     vlm = ingest["vlm"]
     return object_hash({
-        **{key: ingest[key] for key in sorted(_INGEST_CONTENT_KEYS)},
+        **{key: _ingest_content_value(ingest, key) for key in sorted(_INGEST_CONTENT_KEYS)},
         "vlm": {key: vlm[key] for key in sorted(_VLM_CONTENT_KEYS)},
     })
 
@@ -135,8 +145,10 @@ def ingest_content_diff(stored: dict, cfg: dict) -> list[str]:
         return []
     diffs = []
     for key in sorted(_INGEST_CONTENT_KEYS):
-        if stored.get(key) != cfg["ingest"].get(key):
-            diffs.append(f"{key} {stored.get(key)!r} vs {cfg['ingest'].get(key)!r}")
+        left = _ingest_content_value(stored, key)
+        right = _ingest_content_value(cfg["ingest"], key)
+        if left != right:
+            diffs.append(f"{key} {left!r} vs {right!r}")
     stored_vlm = stored.get("vlm") or {}
     current_vlm = cfg["ingest"]["vlm"]
     for key in sorted(_VLM_CONTENT_KEYS):

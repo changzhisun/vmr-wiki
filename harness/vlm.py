@@ -8,6 +8,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
 
 from harness.common import HarnessError, nonempty
@@ -68,19 +69,33 @@ class VLMClient:
         if config["model"].startswith("REPLACE_"):
             raise HarnessError("Configure an explicit VLM model before ingest")
 
-    def caption(self, image: Path) -> str:
+    def caption(self, images: Path | Sequence[Path]) -> str:
         cfg = self.config
-        image_url = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
+        paths = [images] if isinstance(images, Path) else list(images)
+        if not paths:
+            raise HarnessError("VLM caption requires at least one image")
         suffix, extras = _request_extras(cfg["model"])
-        prompt = cfg["prompt"] + suffix
+        prompt = cfg["prompt"]
+        if len(paths) > 1:
+            prompt += (
+                "\nThe images are sampled video frames in chronological order. "
+                "Describe the visible temporal progression across them."
+            )
+        prompt += suffix
+        content = [{"type": "text", "text": prompt}]
+        for image in paths:
+            image_url = (
+                "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
+            )
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": image_url, "detail": "high"},
+            })
         for attempt in range(cfg["max_retries"] + 1):
             payload = {
                 "model": cfg["model"], "temperature": cfg["temperature"],
                 "max_tokens": cfg["max_tokens"],
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url, "detail": "high"}},
-                ]}],
+                "messages": [{"role": "user", "content": content}],
                 **extras,
             }
             request = urllib.request.Request(

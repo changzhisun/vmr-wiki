@@ -13,8 +13,8 @@ import threading
 from pathlib import Path
 
 from harness.common import (HarnessError, atomic_text, cli, file_hash, identifier,
-                            ingest_content_hash, now, number, object_hash, parse_json,
-                            read_json, write_json, write_jsonl)
+                            ingest_content_hash, nonempty, now, number, object_hash,
+                            parse_json, positive_int, read_json, write_json, write_jsonl)
 from harness.config import load_config
 from harness.freeze import remove_tree, tree_hashes, verify_wiki
 from harness.vlm import VLMClient
@@ -79,6 +79,17 @@ def sample_times(duration: float, interval: float) -> list[float]:
             if i * interval < duration]
 
 
+def caption_windows(frames: list[dict], window_frames: int, stride_frames: int) -> list[list[dict]]:
+    """Group sampled frames into chronological, possibly overlapping windows.
+
+    The final window may contain fewer frames than ``window_frames``. A stride
+    larger than the window intentionally leaves unsampled gaps.
+    """
+    window = positive_int(window_frames, "caption_window_frames")
+    stride = positive_int(stride_frames, "caption_stride_frames")
+    return [frames[start:start + window] for start in range(0, len(frames), stride)]
+
+
 def extract_frame(video: Path, timestamp: float, output: Path, cfg: dict) -> None:
     size = cfg["image_max_size"]
     scale = f"scale=w='min({size},iw)':h='min({size},ih)':force_original_aspect_ratio=decrease"
@@ -90,15 +101,33 @@ def extract_frame(video: Path, timestamp: float, output: Path, cfg: dict) -> Non
         raise HarnessError(f"No frame decoded at {timestamp}s")
 
 
-def render_wiki(duration: float, interval: float, frames: list[dict]) -> str:
+def render_wiki(duration: float, interval: float, entries: list[dict], *,
+                sampled_frame_count: int | None = None, window_frames: int = 1,
+                stride_frames: int = 1) -> str:
     """Query-independent and identity-neutral: the video id is a lookup key
     into public benchmark data, and the agent never needs it to locate moments."""
     lines = ["# Video", "", "## Metadata", "",
-             f"- Duration: {duration} seconds", f"- Sampling interval: {interval} seconds",
-             f"- Number of frames: {len(frames)}", "", "## Timeline", ""]
-    for frame in frames:
-        lines += [f"### {frame['timestamp']}s", "", frame["caption"], "",
-                  f"Frame: `{frame['frame']}`", ""]
+             f"- Duration: {duration} seconds", f"- Sampling interval: {interval} seconds"]
+    if window_frames == 1:
+        lines += [f"- Number of frames: {len(entries)}"]
+    else:
+        lines += [
+            f"- Number of sampled frames: {sampled_frame_count}",
+            f"- Number of caption windows: {len(entries)}",
+            f"- Caption window: {window_frames} sampled frames",
+            f"- Caption stride: {stride_frames} sampled frames",
+        ]
+    lines += ["", "## Timeline", ""]
+    for entry in entries:
+        if "frames" not in entry:
+            lines += [f"### {entry['timestamp']}s", "", entry["caption"], "",
+                      f"Frame: `{entry['frame']}`", ""]
+            continue
+        start, end = entry["start_timestamp"], entry["end_timestamp"]
+        heading = f"### {start}s" if start == end else f"### {start}s–{end}s"
+        lines += [heading, "", entry["caption"], "", "Frames:"]
+        lines += [f"- {frame['timestamp']}s: `{frame['frame']}`" for frame in entry["frames"]]
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -143,23 +172,46 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         client = captioner if captioner is not None else VLMClient(cfg["ingest"]["vlm"])
         staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
         (staging / "frames").mkdir()
-        frames = []
         sampling_times = sample_times(
             video_stream_duration, cfg["ingest"]["sample_interval_sec"]
         )
-        for index, timestamp in enumerate(sampling_times, 1):
+        sampled_frames = [
+            {"frame_id": f"f{index:06d}", "timestamp": timestamp,
+             "frame": f"frames/{index:06d}.jpg"}
+            for index, timestamp in enumerate(sampling_times, 1)
+        ]
+        window_frames = cfg["ingest"]["caption_window_frames"]
+        stride_frames = cfg["ingest"]["caption_stride_frames"]
+        windows = caption_windows(sampled_frames, window_frames, stride_frames)
+        used_ids = {frame["frame_id"] for window in windows for frame in window}
+        for frame in sampled_frames:
+            if frame["frame_id"] not in used_ids:
+                continue
             _check_cancelled(cancel_event)
-            relative = f"frames/{index:06d}.jpg"
-            extract_frame(video, timestamp, staging / relative, cfg["ingest"])
+            extract_frame(video, frame["timestamp"], staging / frame["frame"], cfg["ingest"])
+
+        entries = []
+        for window_index, window in enumerate(windows, 1):
             _check_cancelled(cancel_event)
-            caption = client.caption(staging / relative)
+            images = [staging / frame["frame"] for frame in window]
+            caption_input = images[0] if window_frames == 1 else images
+            caption = nonempty(client.caption(caption_input), "caption")
             _check_cancelled(cancel_event)
-            from harness.common import nonempty
-            frames.append({"frame_id": f"f{index:06d}", "timestamp": timestamp,
-                           "frame": relative, "caption": nonempty(caption, "caption")})
-        write_jsonl(staging / "frames.jsonl", frames)
+            if window_frames == 1:
+                entries.append({**window[0], "caption": caption})
+            else:
+                entries.append({
+                    "window_id": f"w{window_index:06d}",
+                    "start_timestamp": window[0]["timestamp"],
+                    "end_timestamp": window[-1]["timestamp"],
+                    "frames": window,
+                    "caption": caption,
+                })
+        write_jsonl(staging / "frames.jsonl", entries)
         atomic_text(staging / "wiki.md", render_wiki(
-            duration, cfg["ingest"]["sample_interval_sec"], frames))
+            duration, cfg["ingest"]["sample_interval_sec"], entries,
+            sampled_frame_count=len(used_ids), window_frames=window_frames,
+            stride_frames=stride_frames))
         if file_hash(video) != source_hash:
             raise HarnessError("Source video changed during ingest")
         _check_cancelled(cancel_event)

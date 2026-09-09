@@ -12,6 +12,10 @@ paths:
 
 ingest:
   sample_interval_sec: 5.0
+  # Number of sampled frames per VLM request, and sampled frames advanced per request.
+  # Use 1/1 for independent single-frame captions; e.g. 4/2 for overlapping windows.
+  caption_window_frames: 1
+  caption_stride_frames: 1
   image_max_size: 768
   jpeg_quality: 2  # ffmpeg JPEG qscale, 2 (best) through 31
   vlm:

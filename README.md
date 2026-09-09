@@ -43,7 +43,9 @@ docker build -f docker/Dockerfile \
 - `ingest.vlm.base_url`：按当前配置选择兼容 Chat Completions 的 VLM `/v1` endpoint。
 - `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
 - `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
-- `sample_interval_sec`、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
+- `caption_window_frames`：每次 VLM 请求包含的连续采样帧数量；设为 `1` 时是单图 Caption。
+- `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；小于窗口时产生重叠窗口。
+- `sample_interval_sec`、窗口、stride、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
 
 通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。可以在配置中指定其他变量名。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
 
@@ -173,7 +175,7 @@ python harness/ingest_all.py --dataset qvhighlights --split val --freeze
 python harness/freeze.py --dataset qvhighlights --split val
 ```
 
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < duration` 抽帧，每张图独立调用同一个固定 VLM prompt。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后一个窗口可以少于配置帧数；`1/1` 保持原来的逐张单图 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
 
 每个视频输出：
 
@@ -187,6 +189,8 @@ wiki/qvhighlights/videos/<video_id>/
 ```
 
 `ingest.json` 记录媒体 SHA256、配置、FFmpeg 版本和内容哈希；`frozen.json` 覆盖 Markdown、JSONL、**每一张图像**及 Ingest 元数据。每个视频独立冻结，实验的 `experiment.json` 保存所选视频的哈希快照；不再使用阻止新增视频的数据集级 `freeze.json`。
+
+单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式。多图模式下每行代表一个 Caption 窗口，包含 `window_id`、起止采样时间、按时间排序的 `frames` 数组和窗口 Caption；`wiki.md` 同时列出窗口时间范围及全部对应图片。
 
 完整 Ingest 再次执行时只核验并复用，不重新 caption。失败的临时输出被清除；API 仅对临时网络错误、限流和服务端错误做有限重试，达到 Token 上限的截断响应会直接失败。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
 
