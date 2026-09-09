@@ -18,6 +18,9 @@ ingest:
   # The default 4/1 gives each sampled second a four-frame overlapping context window.
   caption_window_frames: 4
   caption_stride_frames: 1
+  # Extra attempts allowed when a dense answer breaks the window contract; the
+  # rejection is sent back to the captioner. 0 fails the video immediately.
+  caption_max_repairs: 2
   image_max_size: 768
   jpeg_quality: 2  # ffmpeg JPEG qscale, 2 (best) through 31
   vlm:
@@ -33,10 +36,13 @@ ingest:
     prompt: |-
       You are generating dense temporal captions for Video Moment Retrieval.
 
-      You are given sampled video frames in chronological order. The images appear
-      in the same order as the following timeline:
+      You are given sampled video frames in chronological order. The images
+      correspond, in the same order, to exactly these timestamps in seconds:
 
       {{FRAME_TIMESTAMPS}}
+
+      That list is the complete set of values you may use. This window ends at
+      the last listed timestamp; later frames belong to other windows.
 
       Analyze only the visible evidence in these sampled frames and divide the
       window into meaningful visual events.
@@ -59,7 +65,9 @@ ingest:
 
       - events must be in chronological order;
       - `start <= end`;
-      - every timestamp must be selected from the provided timeline;
+      - every `start` and `end` must copy one of the listed values exactly; never
+        round, interpolate, or extend past the last listed timestamp, even when
+        an action clearly continues;
       - captions must be nonempty factual strings;
       - do not merge clearly different actions;
       - if no meaningful event is visible, return {"events":[]}.

@@ -47,6 +47,7 @@ docker build -f docker/Dockerfile \
 - `caption_mode`：`dense` 要求 VLM 返回严格校验的时间事件 JSON；`simple` 保留旧的普通 Caption 格式。默认使用 `dense`。
 - `caption_window_frames`：每次 VLM 请求包含的连续采样帧数量；设为 `1` 时是单图 Caption。
 - `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；小于窗口时产生重叠窗口。
+- `caption_max_repairs`：Dense 答案违反窗口约束时允许的额外重问次数，默认 2；`0` 表示第一次违规就让该视频失败。它参与 `ingest_content_hash`，因为重问会改变最终存下来的 Caption。
 - `sample_interval_sec`、Caption 模式、窗口、stride、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
 
 通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。可以在配置中指定其他变量名。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
@@ -177,7 +178,7 @@ python harness/ingest_all.py --dataset qvhighlights --split val --freeze
 python harness/freeze.py --dataset qvhighlights --split val
 ```
 
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内文件名和采样时间替换进 `{{FRAME_TIMESTAMPS}}`，要求 VLM 返回只使用这些时间点的有序事件 JSON；若模型把 `start`/`end` 写成 `0..n` 的帧序号（含半开区间的 `n`）或写成最后一个采样点再加一步，会映射回该窗口的采样时间，其它时刻仍直接拒绝。Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内的采样时间替换进 `{{FRAME_TIMESTAMPS}}`（只给时间值，不给帧文件名，因为文件名从 1 开始而时间从 0 开始，成对出现会诱发偏移），要求 VLM 返回只使用这些时间点的有序事件 JSON；若模型把 `start`/`end` 写成 `0..n` 的帧序号（含半开区间的 `n`）或写成最后一个采样点再加一步，会映射回该窗口的采样时间，其它时刻仍直接拒绝。被拒绝时最多按 `caption_max_repairs` 重问该窗口，并把拒绝原因回传给模型；`temperature` 为 0，不回传原因的重试只会得到同样的答案。Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
 
 每个视频输出：
 

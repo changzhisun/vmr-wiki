@@ -10,8 +10,8 @@ from harness.common import (HarnessError, ingest_content_hash, parse_json, read_
                             write_json, write_jsonl)
 from harness.config import load_config
 from harness.freeze import freeze_dataset, freeze_wiki, verify_wiki
-from harness.ingest import (caption_windows, ingest_video, probe_duration, probe_durations,
-                            parse_dense_events, sample_times)
+from harness.ingest import (caption_windows, dense_events, ingest_video, probe_duration,
+                            probe_durations, parse_dense_events, sample_times)
 from harness.ingest_all import _run_parallel, ingest_all
 from harness.run_query import Experiment
 
@@ -86,6 +86,43 @@ def test_caption_windows_support_overlap_and_partial_tail():
         caption_windows(frames, window_frames=0, stride_frames=1)
     with pytest.raises(HarnessError, match="caption_stride_frames"):
         caption_windows(frames, window_frames=1, stride_frames=0)
+
+
+class RepairCaptioner:
+    """Answer out of window until the rejection has been fed back ``after`` times."""
+
+    def __init__(self, after: int):
+        self.after = after
+        self.corrections = []
+
+    def caption(self, images, *, timestamps=None, correction=None):
+        self.corrections.append(correction)
+        if len(self.corrections) > self.after:
+            return json.dumps({"events": [
+                {"start": timestamps[0], "end": timestamps[-1], "caption": "In window."}]})
+        return json.dumps({"events": [
+            {"start": timestamps[-1], "end": timestamps[-1] + 3, "caption": "Past the window."}]})
+
+
+def test_out_of_window_answer_is_repaired_within_budget():
+    captioner = RepairCaptioner(after=1)
+    assert dense_events(captioner, [Path("f.jpg")], [8.0, 9.0, 10.0, 11.0], 2) == [
+        {"start": 8.0, "end": 11.0, "caption": "In window."}]
+    # The first attempt carries no correction; the repair carries the rejection.
+    assert captioner.corrections[0] is None
+    assert "outside its window" in captioner.corrections[1]
+
+
+def test_repair_budget_is_bounded_and_then_fails():
+    captioner = RepairCaptioner(after=99)
+    with pytest.raises(HarnessError, match="outside its window"):
+        dense_events(captioner, [Path("f.jpg")], [8.0, 9.0, 10.0, 11.0], 2)
+    assert len(captioner.corrections) == 3
+
+    immediate = RepairCaptioner(after=99)
+    with pytest.raises(HarnessError, match="outside its window"):
+        dense_events(immediate, [Path("f.jpg")], [8.0, 9.0, 10.0, 11.0], 0)
+    assert immediate.corrections == [None]
 
 
 def test_dense_events_are_strict_and_use_only_window_timestamps():

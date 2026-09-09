@@ -6,6 +6,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
+import logging
 import math
 import re
 import subprocess
@@ -19,6 +20,8 @@ from harness.common import (HarnessError, atomic_text, cli, file_hash, identifie
 from harness.config import load_config
 from harness.freeze import remove_tree, tree_hashes, verify_wiki
 from harness.vlm import VLMClient
+
+logger = logging.getLogger(__name__)
 
 
 def media_command(command: list[str]) -> str:
@@ -225,6 +228,32 @@ def parse_dense_events(text: str, timestamps: list[float]) -> list[dict]:
     return normalized
 
 
+def dense_events(client, images: list[Path], timestamps: list[float], max_repairs: int,
+                 *, cancel_event: threading.Event | None = None) -> list[dict]:
+    """Caption one window, re-asking a bounded number of times on a violation.
+
+    A rejected dense answer is usually the captioner ignoring the window
+    rather than a broken endpoint, so the rejection is fed back instead of
+    failing the whole video on the first bad window.
+    """
+    correction = None
+    for remaining in range(max_repairs, -1, -1):
+        _check_cancelled(cancel_event)
+        # Only a repair passes correction, so the first call of a run stays
+        # identical to a captioner that does not accept one.
+        repair = {} if correction is None else {"correction": correction}
+        response = client.caption(images, timestamps=timestamps, **repair)
+        try:
+            return parse_dense_events(response, timestamps)
+        except HarnessError as exc:
+            if not remaining:
+                raise
+            correction = str(exc)
+            logger.warning("Re-asking the captioner for window %s: %s",
+                           f"[{timestamps[0]}, {timestamps[-1]}]", exc)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def extract_frame(video: Path, timestamp: float, output: Path, cfg: dict) -> None:
     size = cfg["image_max_size"]
     scale = f"scale=w='min({size},iw)':h='min({size},ih)':force_original_aspect_ratio=decrease"
@@ -361,8 +390,10 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
             images = [staging / frame["frame"] for frame in window]
             if caption_mode == "dense":
                 timestamps = [frame["timestamp"] for frame in window]
-                response = client.caption(images, timestamps=timestamps)
-                events = parse_dense_events(response, timestamps)
+                events = dense_events(
+                    client, images, timestamps, cfg["ingest"]["caption_max_repairs"],
+                    cancel_event=cancel_event,
+                )
                 _check_cancelled(cancel_event)
                 entries.append({
                     "window_id": f"w{window_index:06d}",

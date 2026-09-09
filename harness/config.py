@@ -70,6 +70,9 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         ingest.setdefault("caption_stride_frames", 1)
         positive_int(ingest["caption_window_frames"], "caption_window_frames")
         positive_int(ingest["caption_stride_frames"], "caption_stride_frames")
+        ingest.setdefault("caption_max_repairs", 2)
+        if type(ingest["caption_max_repairs"]) is not int or ingest["caption_max_repairs"] < 0:
+            raise HarnessError("caption_max_repairs must be a nonnegative integer")
         positive_int(ingest["image_max_size"], "image_max_size")
         if not 2 <= positive_int(ingest["jpeg_quality"], "jpeg_quality") <= 31:
             raise HarnessError("jpeg_quality must be in [2, 31]")

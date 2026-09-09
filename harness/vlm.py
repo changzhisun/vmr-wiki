@@ -70,7 +70,8 @@ class VLMClient:
             raise HarnessError("Configure an explicit VLM model before ingest")
 
     def caption(self, images: Path | Sequence[Path], *,
-                timestamps: Sequence[float] | None = None) -> str:
+                timestamps: Sequence[float] | None = None,
+                correction: str | None = None) -> str:
         cfg = self.config
         paths = [images] if isinstance(images, Path) else list(images)
         if not paths:
@@ -84,9 +85,11 @@ class VLMClient:
                 raise HarnessError("VLM image and timestamp counts differ")
             if prompt.count(placeholder) != 1:
                 raise HarnessError("VLM timestamp prompt must contain exactly one placeholder")
-            prompt = prompt.replace(placeholder, "\n".join(
-                f"{image.name} -> {timestamp}s"
-                for image, timestamp in zip(paths, timeline, strict=True)
+            # A closed set of values, without frame numbers: a filename is
+            # 1-based while its timestamp starts at zero, and pairing the two
+            # invites off-by-one boundaries the window cannot express.
+            prompt = prompt.replace(placeholder, ", ".join(
+                f"{timestamp}" for timestamp in timeline
             ))
         elif placeholder in prompt:
             raise HarnessError("VLM timestamp prompt requires frame timestamps")
@@ -94,6 +97,14 @@ class VLMClient:
             prompt += (
                 "\nThe images are sampled video frames in chronological order. "
                 "Describe the visible temporal progression across them."
+            )
+        if correction is not None:
+            # Temperature is 0, so an identical request would return the
+            # identical rejected answer; the rejection has to go back in.
+            prompt += (
+                "\n\nYour previous answer was rejected: "
+                f"{nonempty(correction, 'correction')}\n"
+                "Answer again and satisfy every requirement above."
             )
         prompt += suffix
         content = [{"type": "text", "text": prompt}]

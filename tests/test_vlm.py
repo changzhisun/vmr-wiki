@@ -65,10 +65,33 @@ def test_dense_prompt_injects_frame_timestamps(cfg, tmp_path, monkeypatch):
     client = VLMClient(cfg["ingest"]["vlm"])
     assert client.caption(images, timestamps=[0.0, 1.0]) == '{"events":[]}'
     prompt = seen[0]["messages"][0]["content"][0]["text"]
-    assert "000001.jpg -> 0.0s\n000002.jpg -> 1.0s" in prompt
+    # Frame numbers are 1-based while their timestamps start at zero, so the
+    # timeline lists only the values the window may use.
+    assert "Timeline:\n0.0, 1.0\n" in prompt
+    assert "000001.jpg" not in prompt
     assert "{{FRAME_TIMESTAMPS}}" not in prompt
     with pytest.raises(HarnessError, match="counts differ"):
         client.caption(images, timestamps=[0.0])
+
+
+def test_rejection_is_fed_back_to_the_captioner(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    cfg["ingest"]["vlm"]["prompt"] = "Timeline:\n{{FRAME_TIMESTAMPS}}\nReturn JSON."
+    image = tmp_path / "000001.jpg"
+    image.write_bytes(b"image")
+    seen = []
+
+    def request(req, timeout):
+        seen.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"events":[]}'}}]
+        }).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    client = VLMClient(cfg["ingest"]["vlm"])
+    client.caption([image], timestamps=[0.0], correction="end 14.0 is outside its window")
+    prompt = seen[0]["messages"][0]["content"][0]["text"]
+    assert "previous answer was rejected: end 14.0 is outside its window" in prompt
 
 
 def test_retry_transient_only_and_no_credential_in_errors(cfg, tmp_path, monkeypatch):
