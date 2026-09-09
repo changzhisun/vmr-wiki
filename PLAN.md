@@ -1203,6 +1203,6 @@ python harness/evaluate.py --dataset DATASET --split SPLIT --pred results/EXPERI
 - 旧 manifest 采用迁移方案 A：明确要求重新运行 Adapter。不自动补 split。旧 Wiki 可在保持内容不变的前提下迁入新的 videos/ 布局并校验，不自动移动用户产物。
 - VLM provider、endpoint、认证、timeout 和 retry 等传输参数保留在 provenance 中，但不进入 ingest hash。并发 Ingest 使用协作式取消事件，Ctrl-C 后等待运行 worker 清理退出。
 - Query Agent 仅连接临时 internal Docker network，通过无密钥 allowlist proxy 访问配置中的模型 API hostname；代理不挂载 workspace，任务结束时与网络一并删除。
-- Workspace 中的 `query_id` / `video_id` / `split` 是 per-experiment HMAC 别名（见 3.3.1），Wiki 标题不含 video id，临时目录名亦用别名；预测按别名校验后翻译回真实 ID 落盘。旧 Wiki 用 `harness/migrate_wiki_title.py` 只改标题迁移，不重新 caption。
+- Workspace 中的 `query_id` / `video_id` / `split` 是 per-experiment HMAC 别名（见 3.3.1），Wiki 标题不含 video id，临时目录名亦用别名；预测按别名校验后翻译回真实 ID 落盘。
 
 验收测试覆盖任意 split 名称、has_ground_truth 布尔验证、unknown split、共享视频跨 split 去重、增量 Freeze、跨 split 重复 Query ID、Query/GT 隔离、无 GT 拒绝、多 GT/预测、聚合混入其他 split/dataset 拒绝、CLI help 与默认 split。原有独立进程、只读挂载、超时清理和官方评测一致性测试继续保留。

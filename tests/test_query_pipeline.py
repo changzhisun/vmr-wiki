@@ -7,11 +7,10 @@ import pytest
 
 from agents.runner import AgentResult, DockerRunner
 from harness.aggregate import aggregate
-from harness.common import HarnessError, atomic_text, file_hash, read_json, read_jsonl, write_json
+from harness.common import HarnessError, read_json, write_json
 from harness.evaluate import evaluate
 from harness.freeze import freeze_dataset
 from harness.ingest_all import ingest_all
-from harness.migrate_wiki_title import migrate_wiki
 from harness.run_query import Experiment
 from harness.workspace import require_anonymous_wiki
 
@@ -184,32 +183,6 @@ def test_wiki_naming_its_video_is_refused(frozen, tmp_path):
     legacy.write_text("# Video: video\n" + current.read_text().split("\n", 1)[1], encoding="utf-8")
     with pytest.raises(HarnessError, match="names its own video"):
         require_anonymous_wiki(legacy)
-
-
-def test_legacy_wiki_title_migrates_without_recaptioning(prepared):
-    cfg, captioner = prepared
-    ingest_all(cfg, captioner=captioner)
-    calls_after_ingest = captioner.calls
-    root = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos" / "video"
-    frames = read_jsonl(root / "frames.jsonl")
-    body = (root / "wiki.md").read_text().split("\n", 1)[1]
-    atomic_text(root / "wiki.md", f"# Video: video\n{body}")
-    metadata = read_json(root / "ingest.json")
-    metadata["content_hashes"]["wiki.md"] = file_hash(root / "wiki.md")
-    write_json(root / "ingest.json", metadata)
-    with pytest.raises(HarnessError, match="names its own video"):
-        require_anonymous_wiki(root / "wiki.md")
-    assert migrate_wiki(root) is True
-    require_anonymous_wiki(root / "wiki.md")
-    assert migrate_wiki(root) is False  # idempotent
-    assert read_jsonl(root / "frames.jsonl") == frames
-    # Re-verification passes and no caption is requested again.
-    ingest_all(cfg, captioner=captioner)
-    assert captioner.calls == calls_after_ingest
-    assert read_json(root / "ingest.json")["migrations"] == ["anonymous_wiki_title"]
-    freeze_dataset(cfg)
-    with pytest.raises(HarnessError, match="re-freeze"):
-        migrate_wiki(root)
 
 
 def test_experiment_without_alias_secret_is_refused(frozen):

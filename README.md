@@ -255,17 +255,6 @@ Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Q
 
 > **这条措施缩小了通道，但没有关闭它。** `query` 文本本身就是任务输入，无法遮蔽，而公开 benchmark 的 query 文本同样可检索。采样帧里若出现视频自带的标题字幕也会泄露。把别名理解为「移除了精确查表键」，不要当成去污染的保证；报告结果时应当说明这一点。
 
-### 旧 Wiki 迁移
-
-`render_wiki` 过去会写 `# Video: <video_id>`。captions 和采样帧完全不受影响，所以不必重新调用 VLM，只改标题即可：
-
-```bash
-python harness/migrate_wiki_title.py --dataset uca            # 先干跑，报告将要改动的数量
-python harness/migrate_wiki_title.py --dataset uca --apply
-```
-
-迁移前会核验除 `wiki.md` 外的每一项 `content_hashes` 仍然吻合（这就是 captions 未被改动的证据），然后重写标题、更新记录的哈希，并在 `ingest.json` 的 `migrations` 中留痕。已 Freeze 的 Wiki 会被拒绝：先删掉 `frozen.json`，迁移后重新 Freeze，让 seal 证明真实存在的内容。
-
 `task.json` 保留 `query_id`、`video_id`、`split`、`query` 和固定的 `max_predictions`（均为别名形式）。Agent 必须在预测中原样复制 split；示例中为可读性使用真实 ID：
 
 ```json
