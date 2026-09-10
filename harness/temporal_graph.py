@@ -54,6 +54,15 @@ def _clamp_interval(start, end, duration):
     return start, end
 
 
+def clip_to_range(node_start, node_end, lo, hi):
+    """Clip [node_start, node_end] to [lo, hi]. None if they do not overlap."""
+    start = max(lo, min(node_start, hi))
+    end = max(lo, min(node_end, hi))
+    if not start < end:
+        return None
+    return start, end
+
+
 def _uncertainty_range(bounds, point, duration):
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
         return [point, point]

@@ -10,7 +10,7 @@ from harness.bidirectional_io import FrameIndex, RequestJournal, batches, stream
 from harness.common import HarnessError, canonical, file_hash, now, object_hash, write_json
 from harness.freeze import remove_tree, tree_hashes
 from harness.temporal_graph import (NODE_EXAMPLE, OPERATIONS, SEMANTICS, TemporalGraph, cite_ids,
-                                    combine_evidence, normalize_node, strings)
+                                    clip_to_range, combine_evidence, normalize_node, strings)
 
 LOG = logging.getLogger(__name__)
 NODE_SCHEMA = json.dumps(NODE_EXAMPLE)
@@ -96,12 +96,24 @@ class BidirectionalBuilder:
         rows = []
         for raw in payload["nodes"]:
             node = normalize_node(raw, self.duration)
-            if not start <= node["start"] < node["end"] <= end:
-                raise HarnessError("Node lies outside the request target")
+            clipped = clip_to_range(node["start"], node["end"], start, end)
+            if clipped is None:
+                LOG.warning(
+                    "Dropped node %r [%g, %g]: no overlap with request window [%g, %g]",
+                    node.get("title", ""), node["start"], node["end"], start, end)
+                continue
+            if clipped != (node["start"], node["end"]):
+                LOG.warning(
+                    "Clipped node %r from [%g, %g] to request window [%g, %g] -> [%g, %g]",
+                    node.get("title", ""), node["start"], node["end"], start, end, clipped[0], clipped[1])
+                node["start"], node["end"] = clipped
+                node = normalize_node(node, self.duration)
             if parent and (node["start"], node["end"], node["title"], node["summary"]) == (
                     parent["start"], parent["end"], parent["title"], parent["summary"]):
                 raise HarnessError("Recursive subdivision made no progress")
             rows.append(node)
+        if require and not rows:
+            raise HarnessError("Global scan requires at least one coarse phase")
         if [r["start"] for r in rows] != sorted(r["start"] for r in rows):
             raise HarnessError("Nodes must be chronological")
         return rows

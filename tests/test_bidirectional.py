@@ -4,12 +4,13 @@ from pathlib import Path
 
 import pytest
 
+from harness.bidirectional import BidirectionalBuilder
 from harness.bidirectional_config import settings
 from harness.bidirectional_io import batches, windows
 from harness.common import HarnessError, read_jsonl
 from harness.freeze import freeze_wiki, verify_wiki
 from harness.ingest import ingest_video
-from harness.temporal_graph import NODE_EXAMPLE, TemporalGraph, normalize_node, read_node
+from harness.temporal_graph import NODE_EXAMPLE, TemporalGraph, clip_to_range, normalize_node, read_node
 from harness.workspace import query_workspace
 
 
@@ -252,6 +253,26 @@ def test_normalize_node_clamps_copied_example_uncertainty():
     overflow["end"] = 32
     clamped = normalize_node(overflow, 31.5)
     assert clamped["end"] == 31.5
+
+
+def test_clip_to_range_keeps_overlap_and_drops_disjoint():
+    assert clip_to_range(40, 60, 0, 45) == (40, 45)
+    assert clip_to_range(10, 20, 0, 45) == (10, 20)
+    assert clip_to_range(0, 10, 45, 90) is None
+    assert clip_to_range(100, 120, 0, 45) is None
+
+
+def test_parse_nodes_clips_to_request_window(caplog):
+    builder = BidirectionalBuilder.__new__(BidirectionalBuilder)
+    builder.duration = 100
+    overlapping = node(10, 50, title="Partial overlap")
+    disjoint = node(80, 90, title="Outside window")
+    with caplog.at_level("WARNING"):
+        rows = builder.parse_nodes({"nodes": [overlapping, disjoint]}, 20, 40)
+    assert len(rows) == 1
+    assert rows[0]["start"] == 20 and rows[0]["end"] == 40
+    assert "Clipped node 'Partial overlap' from [10, 50] to request window [20, 40] -> [20, 40]" in caplog.text
+    assert "Dropped node 'Outside window' [80, 90]: no overlap with request window [20, 40]" in caplog.text
 
 
 def test_split_accepts_singular_node_id(graph):
