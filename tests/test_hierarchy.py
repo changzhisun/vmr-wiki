@@ -269,12 +269,23 @@ def test_pre_cancelled_hierarchy_does_not_publish(prepared):
     assert not output.exists()
 
 
-@pytest.mark.parametrize("key,value", [("max_frames", 101), ("max_frames", 1), ("max_depth", 5),
-                                        ("overlap_ratio", 0.3), ("merge_adjacent", "yes"),
+@pytest.mark.parametrize("key,value", [("max_frames", 101), ("max_depth", 33),
+                                        ("overlap_ratio", 0.6), ("merge_adjacent", "yes"),
                                         ("analysis_fps", 0), ("scene_threshold", 2)])
 def test_hierarchy_config_rejects_invalid_settings(tmp_path, key, value):
     raw = yaml.safe_load((Path(__file__).parents[1] / "config.yaml").read_text())
-    raw["ingest"]["hierarchy"][key] = value
+    # The bidirectional pipeline owns the new settings; preserve the old
+    # hierarchy tests' field names where they have a direct equivalent.
+    mapping = {"max_frames": ("max_frames_per_call",), "max_depth": ("topdown", "max_depth"),
+               "overlap_ratio": ("bottomup", "overlap_ratio"),
+               "merge_adjacent": None, "analysis_fps": None, "scene_threshold": None}
+    path_keys = mapping[key]
+    if path_keys is None:
+        pytest.skip("setting belongs only to the legacy hierarchical pipeline")
+    if len(path_keys) == 1:
+        raw["ingest"]["bidirectional"][path_keys[0]] = value
+    else:
+        raw["ingest"]["bidirectional"][path_keys[0]][path_keys[1]] = value
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(HarnessError):

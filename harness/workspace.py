@@ -38,7 +38,8 @@ def query_workspace(query: dict, task: dict, wiki: Path, templates: dict[str, st
     try:
         target = root / "wiki"
         target.mkdir()
-        public_files = {"wiki.md", "frames.jsonl", "nodes.jsonl", "observations.jsonl"}
+        public_files = {"wiki.md", "frames.jsonl", "nodes.jsonl", "observations.jsonl",
+                        "bottomup_observations.jsonl", "coverage.jsonl"}
         for name in sorted(public_files & seal["files"].keys()):
             shutil.copyfile(wiki / name, target / name)
         shutil.copytree(wiki / "frames", target / "frames")

@@ -80,6 +80,10 @@ class VLMClient:
     def last_requests(self) -> list[dict]:
         return getattr(self._local, "requests", [])
 
+    def complete(self, prompt: str, images: Sequence[Path] = ()) -> str:
+        """Stateless text/vision calls through exactly the same configured model."""
+        return self.caption(list(images), prompt_override=prompt, text_only=not images)
+
     def _image_url(self, image: Path) -> str:
         stat = image.stat()
         key = (str(image.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
@@ -102,13 +106,15 @@ class VLMClient:
                 timestamps: Sequence[float] | None = None,
                 target_timestamps: Sequence[float] | None = None,
                 correction: str | None = None,
-                prompt_override: str | None = None) -> str:
+                prompt_override: str | None = None, text_only: bool = False) -> str:
         cfg = self.config
         self._local.requests = []
         paths = [images] if isinstance(images, Path) else list(images)
-        if not paths:
+        if text_only and (paths or prompt_override is None):
+            raise HarnessError("Text-only calls require an explicit prompt and no images")
+        if not paths and not text_only:
             raise HarnessError("VLM caption requires at least one image")
-        if prompt_override is not None and len(paths) > 100:
+        if len(paths) > 100:
             raise HarnessError("Hierarchical VLM requests accept at most 100 frames")
         suffix, extras = _request_extras(cfg["model"])
         prompt = cfg["prompt"] if prompt_override is None else nonempty(prompt_override, "prompt_override")

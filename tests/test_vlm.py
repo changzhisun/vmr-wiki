@@ -46,6 +46,27 @@ def test_fixed_image_payload_and_caption(cfg, tmp_path, monkeypatch):
     assert seen[0]["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
+def test_complete_supports_text_only_requests_with_same_model(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    payloads = []
+
+    def request(req, timeout):
+        payloads.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"ok":true}'}}]
+        }).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    client = VLMClient(cfg["ingest"]["vlm"])
+    assert client.complete("Compare these text records.") == '{"ok":true}'
+    payload = payloads[0]
+    assert payload["model"] == cfg["ingest"]["vlm"]["model"]
+    assert payload["messages"][0]["content"] == [{"type": "text", "text": "Compare these text records."}]
+    assert all("image_url" not in part for part in payload["messages"][0]["content"])
+    with pytest.raises(HarnessError, match="at most 100"):
+        client.complete("too many frames", [tmp_path / "missing.jpg"] * 101)
+
+
 def test_multi_image_payload_preserves_chronological_order(cfg, tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
     images = [tmp_path / "first.jpg", tmp_path / "second.jpg"]

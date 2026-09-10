@@ -44,7 +44,7 @@ docker build -f docker/Dockerfile \
 - `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
 - `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
 - `query.base_url`：可选地为每个 Agent 指定兼容 OpenAI / Anthropic 的网关 endpoint，`null` 表示使用官方默认地址。必须是 443 端口上的 https URL，且主机名同时出现在 `query.egress_allowed_hosts` 中，否则加载配置时即报错——代理只隧道 443 的 CONNECT，Agent 那一侧只会看到一个无 body 的 403。
-- `caption_mode`：默认 `hierarchical`，生成 Chapter → Scene → Event → Action 语义树。`dense` 返回带 `state` / `action` / `transition` 类型的时间段 JSON；`simple` 保留普通 Caption 格式。
+- `caption_mode`：默认 `bidirectional`，执行 Top-down、独立 Bottom-up、reconciliation、边界复查和 coverage review。`hierarchical`、`dense`、`simple` 保留兼容入口。
 - `caption_window_frames`：旧版 Simple / Dense 每次 VLM 请求包含的连续采样帧数量；默认 `5`，为中心目标区间提供前后画面；设为 `1` 时是单图 Caption。
 - `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；Dense 模式不能超过窗口大小的一半，以保证中心目标仍处于当前上下文中。
 - `caption_max_repairs`：Hierarchical / Dense 答案违反结构或时间约束时允许的额外重问次数，默认 2；`0` 表示第一次违规就让该视频失败。它参与 `ingest_content_hash`，因为重问会改变最终存下来的 Caption。
@@ -157,15 +157,29 @@ datasets/uca/
 
 ## 2. Ingest 与 Freeze
 
-### 2.1 层次化 Wiki（默认）
+### 2.1 双向 Wiki（默认）
 
-默认配置写入新的 `wiki-hierarchical/`，不会覆盖 `wiki/` 中的旧产物。填写 VLM endpoint、模型和认证环境变量后，沿用原入口：
+默认配置写入新的 `wiki-bidirectional/`，不会覆盖旧 Wiki。填写 VLM endpoint、模型和认证环境变量后，沿用原入口：
 
 ```bash
 python harness/ingest_all.py --config config.yaml --dataset monitor --split dev --freeze
 ```
 
-处理流程：
+处理流程是 Top-down 全局骨架、独立 Bottom-up 固定窗口扫描、VLM reconciliation、边界复查和一致性/coverage review。Bottom-up 首轮不会看到 Top-down 标签，避免 confirmation bias；同一 VLM 的纯文本请求用于归并、冲突分析和结构检查。
+
+默认配置为 45 秒窗口、25% 重叠、每次最多 100 帧、180 秒 reconciliation 批次。窗口覆盖表示成功处理过采样请求，不代表所有事件都已召回；无法解释的独立 observation 会作为 `review_status: unresolved` 候选保留，并进入 Query 工作区。
+
+输出文件包括：
+
+```text
+nodes.jsonl topdown_nodes.jsonl bottomup_observations.jsonl observations.jsonl
+reconciliation.jsonl coverage.jsonl sampling.jsonl caption_audit.jsonl
+wiki.md frames.jsonl frames/ ingest.json frozen.json
+```
+
+节点使用 `granularity` 与 `type`，type 可以是 `chapter`、`scene`、`event`、`action`、`state_change`、`transition`、`dialogue` 或 `other`。`confidence` 是分别记录 semantic、boundary、hierarchy 的 high/medium/low 标签；旧版数字 confidence 只作为 legacy 信息，不转换成 high。节点允许 overlap/gap，主 parent 关系无环；一个 observation 可以支持多个节点。
+
+### 2.2 旧版层次化 Wiki
 
 1. 全片均匀采样最多 100 帧，请 VLM 预测覆盖全视频的 Chapter。
 2. 对每个节点重新采样，按 Chapter → Scene → Event → Action 细化。每次图像输入最多 `max_frames`（硬上限 100）；短视频或低帧率视频会去重，少于 100 帧。
@@ -202,7 +216,7 @@ wiki-hierarchical/<dataset>/videos/<video_id>/
 
 图像、变化分析和每次 split/merge 成功响应均可断点恢复。更改层次化内容参数需要新 Wiki 根目录；规则版本为 `hierarchy_processing_version: 1`，进入内容哈希。层次化 Wiki 时长使用主视频流时长，容器时长单独保存在 `container_duration`。
 
-### 2.2 独立 Embedding（可选）
+### 2.3 独立 Embedding（可选）
 
 不把向量写入节点 JSONL 或冻结 Wiki。使用支持 `/embeddings` 的模型，显式运行独立导出：
 
@@ -217,7 +231,7 @@ python harness/embed_wiki.py \
 
 输出 `vectors.npy`（L2 归一化 float32）、`index.jsonl`（行号 → node_id、时间范围、文本哈希）和 `manifest.json`（模型、源 Wiki 哈希、维度和文件哈希）。格式可直接由 NumPy 加载或导入 FAISS；导出器本身无需 NumPy。所有层级都参与向量化，embedding 文本由标题、摘要、实体、动作、前后状态组成。该步骤单独调用 Embedding API，不随 ingest 自动执行，也不会自动挂载到 Query 工作区。
 
-### 2.3 旧版 Simple / Dense
+### 2.4 旧版 Simple / Dense
 
 下文的固定采样和窗口配置适用于旧版模式。切换为 `caption_mode: dense` 时，将 `templates/dense_prompt.md` 的内容写入 `ingest.vlm.prompt`；Simple 则使用无时间戳占位符的普通 Caption prompt。复用旧产物时使用其原始配置及 Wiki 根目录。
 

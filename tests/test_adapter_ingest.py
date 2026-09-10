@@ -51,17 +51,17 @@ def test_sampling_edges():
             sample_times(10.0, interval)
 
 
-def test_default_config_uses_hierarchical_captions():
+def test_default_config_uses_bidirectional_captions():
     config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
     ingest = config["ingest"]
     assert ingest["sample_interval_sec"] == 1.0
-    assert ingest["caption_mode"] == "hierarchical"
+    assert ingest["caption_mode"] == "bidirectional"
     assert ingest["caption_window_frames"] == 5
     assert ingest["caption_stride_frames"] == 1
     assert ingest["caption_processing_version"] == 4
     assert ingest["vlm"]["max_tokens"] == 8192
-    assert ingest["hierarchy"]["max_frames"] == 100
-    assert ingest["hierarchy_processing_version"] == 1
+    assert ingest["bidirectional"]["max_frames_per_call"] == 100
+    assert ingest["pipeline_version"] == "vlm_bidirectional_v1"
 
 
 def test_caption_mode_and_dense_prompt_template_are_validated(tmp_path):

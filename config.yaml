@@ -5,15 +5,15 @@ dataset:
 # Relative paths are resolved against this config file, not the shell's cwd.
 paths:
   datasets: datasets
-  wiki: wiki-hierarchical  # New root; existing flat/frozen Wikis remain reusable with their old config.
+  wiki: wiki-bidirectional  # New root; existing flat/frozen Wikis remain reusable with their old config.
   runs: runs
   results: results
   templates: templates
 
 ingest:
   sample_interval_sec: 1.0
-  # Hierarchical is the new default; dense/simple remain available for legacy experiments.
-  caption_mode: hierarchical
+  # Bidirectional is the new default; simple/dense/hierarchical remain available for legacy experiments.
+  caption_mode: bidirectional
   # Legacy Dense coordinate system; hierarchical always uses absolute seconds.
   dense_timestamp_mode: absolute_seconds
   # Legacy Simple/Dense window parameters; hierarchical uses hierarchy.max_frames.
@@ -38,20 +38,37 @@ ingest:
       Describe observable activities at the requested semantic level. Use concise,
       specific titles and summaries. Keep stable actor/object descriptions across
       levels when supported by the images. Do not infer invisible details.
-  hierarchy:
-    max_frames: 100  # Hard upper bound per VLM request, including merge requests.
-    max_depth: 4     # Chapter -> Scene -> Event -> Action.
-    min_segment_sec: 2.0
-    min_sample_interval_sec: 0.25
-    overlap_ratio: 0.15  # Context overlap at each shared target boundary.
-    uniform_fraction: 0.6  # Remaining quota: scene-change neighborhoods and motion.
-    analysis_fps: 2.0
-    analysis_timeout_sec: 1800
-    scene_threshold: 0.3
-    max_children: 12
-    max_nodes: 2000
-    max_requests: 1000  # Logical split/merge requests, excluding repairs/retries.
-    merge_adjacent: true
+  bidirectional:
+    max_frames_per_call: 100
+    topdown:
+      enabled: true
+      max_depth: 4
+      min_segment_duration_sec: 8.0
+      max_children_per_node: 12
+    bottomup:
+      enabled: true
+      window_sec: 45.0
+      overlap_ratio: 0.25
+      independent_observation: true
+    reconciliation:
+      window_sec: 180.0
+      max_records: 128
+      max_chars: 48000
+    boundary_refinement:
+      enabled: true
+      context_expand_ratio: 0.25
+      max_rounds: 2
+      uncertainty_sec: 2.0
+      endpoint_context_sec: 4.0
+    confidence:
+      self_consistency_for_low_confidence: true
+      max_review_rounds: 2
+    budget:
+      requests_per_hour: 1000
+      nodes_per_hour: 2000
+      max_requests: null
+      max_nodes: null
+    shared_cache_dir: null
 
 query:
   agent: codex

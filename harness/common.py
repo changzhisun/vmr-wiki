@@ -142,6 +142,13 @@ def ingest_content_hash(cfg: dict) -> str:
     """
     ingest = cfg["ingest"]
     vlm = ingest["vlm"]
+    if ingest.get("caption_mode") == "bidirectional":
+        from harness.bidirectional_config import PIPELINE_VERSION, content_settings
+        return object_hash({"caption_mode": "bidirectional",
+            "pipeline_version": ingest.get("pipeline_version", PIPELINE_VERSION),
+            "bidirectional": content_settings(ingest),
+            **{key: ingest[key] for key in ("image_max_size", "jpeg_quality", "caption_max_repairs")},
+            "vlm": {key: vlm[key] for key in sorted(_VLM_CONTENT_KEYS)}})
     if ingest.get("caption_mode") == "hierarchical":
         from harness.hierarchy_config import HIERARCHY_VERSION, settings
         return object_hash({
@@ -162,6 +169,12 @@ def ingest_content_diff(stored: dict, cfg: dict) -> list[str]:
     if ingest_content_hash({"ingest": stored}) == ingest_content_hash(cfg):
         return []
     diffs = []
+    if stored.get("caption_mode") == cfg["ingest"].get("caption_mode") == "bidirectional":
+        from harness.bidirectional_config import PIPELINE_VERSION, content_settings
+        if content_settings(stored) != content_settings(cfg["ingest"]):
+            diffs.append("bidirectional settings differ")
+        if stored.get("pipeline_version", PIPELINE_VERSION) != cfg["ingest"].get("pipeline_version", PIPELINE_VERSION):
+            diffs.append("pipeline_version differs")
     if stored.get("caption_mode") == cfg["ingest"].get("caption_mode") == "hierarchical":
         from harness.hierarchy_config import HIERARCHY_VERSION, settings
         if settings(stored) != settings(cfg["ingest"]):

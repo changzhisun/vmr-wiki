@@ -451,6 +451,12 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
             cfg["ingest"]["vlm"], timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"))
         staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
         (staging / "frames").mkdir()
+        if cfg["ingest"]["caption_mode"] == "bidirectional":
+            from harness.bidirectional import publish_bidirectional
+            return publish_bidirectional(
+                video, video_id, output, staging, checkpoint, client, cfg,
+                duration, video_stream_duration, source_hash, content_hash, ffmpeg_version,
+                lambda: _check_cancelled(cancel_event))
         if cfg["ingest"]["caption_mode"] == "hierarchical":
             from harness.hierarchy import publish_hierarchy
             return publish_hierarchy(

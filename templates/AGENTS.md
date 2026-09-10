@@ -6,7 +6,12 @@
 
 读取 `task.json`、`wiki/wiki.md`、`wiki/frames.jsonl` 和 `wiki/frames/`。
 Wiki 是提前生成并冻结的 timestamped visual timeline。
-Hierarchical Wiki 使用 Chapter → Scene → Event → Action 时间语义树，
+Bidirectional Wiki 使用可变 granularity 的时间语义图；`nodes.jsonl` 是主存储，
+节点使用 granularity 和 type，不要求固定 ontology 或严格覆盖树，允许有意义的 overlap/gap。
+`bottomup_observations.jsonl` 保存独立盲扫证据；`coverage.jsonl` 保存窗口覆盖、支持关系和未解决状态。
+`review_status: unresolved` 的节点是已保留但尚未裁决的候选，也应结合 evidence frame 判断。
+同一 observation 可以支持多个节点；evidence 中保存 observation IDs、frame IDs 和真实 timestamp。
+旧版 Hierarchical Wiki 使用 Chapter → Scene → Event → Action 时间语义树，
 `wiki/nodes.jsonl` 是主存储，每行包含 node_id、parent_id、level、时间范围及语义字段。
 先通过章节及场景定位候选，再检查 Event / Action、状态变化与对应帧。
 并非每个节点都展开到 Action；短片段或语义不可再分时可以提前结束。
