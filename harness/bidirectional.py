@@ -9,30 +9,39 @@ from harness.bidirectional_config import PIPELINE_VERSION, SCHEMA_VERSION, budge
 from harness.bidirectional_io import FrameIndex, RequestJournal, batches, stream_jsonl, windows
 from harness.common import HarnessError, canonical, file_hash, now, object_hash, write_json
 from harness.freeze import remove_tree, tree_hashes
-from harness.temporal_graph import (NODE_EXAMPLE, SEMANTICS, TemporalGraph, combine_evidence,
-                                    normalize_node, strings)
+from harness.temporal_graph import (NODE_EXAMPLE, OPERATIONS, SEMANTICS, TemporalGraph, cite_ids,
+                                    combine_evidence, normalize_node, strings)
 
 LOG = logging.getLogger(__name__)
 NODE_SCHEMA = json.dumps(NODE_EXAMPLE)
 EDIT_INSTRUCTION = """Compare sources without assuming top-down is correct. Preserve supported short moments.
-Return {"operations": [...], "conflicts": [...]}.
+Return JSON with "operations" and "conflicts" arrays (either may be empty). Extra keys are ignored.
+Visual review must also include "refuted_observation_ids" (array, possibly empty) and "resolved" (boolean).
 Allowed operations only: KEEP, INSERT, DELETE, SPLIT, MERGE, SHIFT, RELABEL, REPARENT.
-Every operation has op, node_ids (existing IDs), observation_ids (supplied evidence IDs), reason.
+Every operation has op, node_ids (list of existing IDs; [] if none), observation_ids (list of supplied evidence IDs), reason.
+Cite only IDs present in this INPUT records list. Temporary INSERT refs may use "$name".
 KEEP associates observations with one or more existing nodes.
 INSERT has new_node with all node-schema fields and parent_id (existing ID or null).
-SPLIT has one node_id and new_nodes (at least two); keep the original as their broader parent.
+SPLIT has node_ids with exactly one existing parent ID and new_nodes with at least two children;
+keep the original as their broader parent.
 MERGE has peer node_ids with equal granularity/parent and new_node with combined semantics;
 its time range is the union envelope, inherited children and original evidence are preserved.
 SHIFT has updates containing start, end, boundary_uncertainty; requires visual boundary review.
 RELABEL has updates containing only semantic fields (including type, retrieval_text, confidence).
-REPARENT has one node_id, parent_id, and optional relations; keep child granularity above parent.
+REPARENT has node_ids with exactly one ID, parent_id, and optional relations; keep child granularity above parent.
 INSERT may assign a temporary ref such as "$parent" for subsequent operations in this batch.
 DELETE always needs new visual evidence. Never delete because the other pass omitted a moment.
 For visual contradictions (e.g. salt vs sugar) use conflicts with node_ids, observation_ids, reason;
 do not guess or silently settle them from text. A conflict must cite at least one supplied reference.
 Overlaps and gaps are legal when semantically meaningful. Do not force a time partition or fixed ontology.
 Unknown facts stay unknown; no audio, external lookup, embeddings, detector, or other model is available.
+boundary_uncertainty.start/end are [lo, hi] in seconds and must satisfy 0 <= lo <= that endpoint <= hi <= video duration.
+Never copy example timestamps; they are shape only.
 Node schema: """ + NODE_SCHEMA
+
+
+def is_unusable_response(exc):
+    return isinstance(exc, HarnessError) and "response repair budget exhausted" in str(exc)
 
 
 def view(node):
@@ -78,8 +87,8 @@ class BidirectionalBuilder:
         return result, request_id, self.frames.evidence(role, frames)
 
     def parse_nodes(self, payload, start, end, *, limit=None, require=False, parent=None):
-        if not isinstance(payload, dict) or set(payload) != {"nodes"} or not isinstance(payload["nodes"], list):
-            raise HarnessError("Response must contain only a nodes array")
+        if not isinstance(payload, dict) or not isinstance(payload.get("nodes"), list):
+            raise HarnessError("Response must contain a nodes array")
         if require and not payload["nodes"]:
             raise HarnessError("Global scan requires at least one coarse phase")
         if limit is not None and len(payload["nodes"]) > limit:
@@ -125,7 +134,8 @@ class BidirectionalBuilder:
         instruction = ("Identify coarse phases." if parent is None else "Decompose this semantic interval.") + (
             " Return {\"nodes\":[...]} with chronological nodes, each using the schema below. "
             "Set needs_refinement and semantic_complexity based on visible evidence; multiple_actions=true "
-            "only for several distinct sequential actions. Boundary uncertainty must honestly bracket estimates. "
+            "only for several distinct sequential actions. boundary_uncertainty.start/end must satisfy "
+            "0 <= lo <= the endpoint <= hi <= video duration; never copy example timestamps. "
             "Granularity is a temporal scale, never a fixed ontology. Overlaps/gaps are allowed; static regions "
             "may remain covered by a broader parent. An indivisible parent may return no children. "
             "The global scan must return at least one coarse phase.\n" + NODE_SCHEMA)
@@ -258,24 +268,55 @@ class BidirectionalBuilder:
             yield result
 
     def parse_edits(self, payload, records, role, *, visual=False, evidence=None):
-        if (not isinstance(payload, dict) or set(payload) != {"operations", "conflicts"} or
-                not isinstance(payload["conflicts"], list)):
+        if not isinstance(payload, dict):
+            raise HarnessError("Expected operations and conflicts arrays")
+        operations = payload.get("operations") or []
+        conflicts = payload.get("conflicts") or []
+        if not isinstance(operations, list) or not isinstance(conflicts, list):
             raise HarnessError("Expected operations and conflicts arrays")
         known_nodes = {r["node_id"] for r in records if "node_id" in r}
         known_obs = {r["observation_id"] for r in records if "observation_id" in r}
-        if not isinstance(payload["operations"], list):
-            raise HarnessError("operations must be a list")
-        for item in payload["operations"] + payload["conflicts"]:
+
+        def bound(item, key, known):
+            try:
+                refs = cite_ids(item, key)
+            except HarnessError:
+                return []
+            if key == "node_ids":
+                return [n for n in refs if n in known or n.startswith("$")]
+            return [n for n in refs if n in known]
+
+        def keep(item, *, operation=False):
             if not isinstance(item, dict):
                 raise HarnessError("Edit/conflict must be an object")
-            node_ids = strings(item.get("node_ids", []), "node_ids")
-            obs_ids = strings(item.get("observation_ids", []), "observation_ids")
-            if any(n not in known_nodes and not n.startswith("$") for n in node_ids) or set(obs_ids) - known_obs:
-                raise HarnessError("Edit references evidence outside this comparison batch")
-            if not node_ids and not obs_ids:
-                raise HarnessError("Edit/conflict must cite supplied references")
+            item = {**item, "node_ids": bound(item, "node_ids", known_nodes),
+                    "observation_ids": bound(item, "observation_ids", known_obs)}
+            kind, nodes, obs = item.get("op"), item["node_ids"], item["observation_ids"]
+            if operation:
+                if kind == "SPLIT" and (len(nodes) != 1 or not isinstance(item.get("new_nodes"), list)
+                                        or len(item["new_nodes"]) < 2):
+                    return None
+                if kind == "MERGE" and len(nodes) < 2:
+                    return None
+                if kind in {"DELETE", "SHIFT", "RELABEL", "REPARENT"} and len(nodes) != 1:
+                    return None
+                if kind == "KEEP" and not nodes:
+                    return None
+                if kind == "INSERT":
+                    if not isinstance(item.get("new_node"), dict) or not (obs or visual):
+                        return None
+                elif kind not in OPERATIONS:
+                    return None
+                elif not nodes and not obs:
+                    return None
+            elif not nodes and not obs:
+                return None
             if not isinstance(item.get("reason"), str) or not item["reason"].strip():
                 raise HarnessError("Every discrepancy needs a reason")
+            return item
+
+        payload = {"operations": [item for item in (keep(op, operation=True) for op in operations) if item],
+                   "conflicts": [item for item in (keep(conflict) for conflict in conflicts) if item]}
         self.graph.apply(payload["operations"], expected_version=self.graph.version,
                          request_id=role + "/validation", visual=True, visual_evidence=evidence, dry_run=True)
         return payload
@@ -343,8 +384,14 @@ class BidirectionalBuilder:
                                         "duplicates, meaningful overlaps/gaps and evidence. New visual claims require conflicts.")
                     if role == "bottomup_organization":
                         instruction += "\nOrganize these independent observations into useful temporal hierarchy."
-                    response, req = self.journal.request(role, payload, instruction,
-                        lambda value: self.parse_edits(value, fresh, role))
+                    try:
+                        response, req = self.journal.request(role, payload, instruction,
+                            lambda value: self.parse_edits(value, fresh, role))
+                    except HarnessError as exc:
+                        if not is_unusable_response(exc):
+                            raise
+                        LOG.warning("%s: skipping unusable batch: %s", role, exc)
+                        continue
                     self.apply_response(response, req)
 
     def link_duplicates(self):
@@ -394,22 +441,40 @@ class BidirectionalBuilder:
             end = min(self.duration, max(r["end"] for r in record_pack) + 4)
             for round_index in range(count):
                 def parse(value):
-                    if not isinstance(value, dict) or set(value) != {"operations", "conflicts", "refuted_observation_ids", "resolved"}:
+                    if not isinstance(value, dict):
                         raise HarnessError("Visual review needs edits, refuted_observation_ids and resolved boolean")
-                    if type(value["resolved"]) is not bool:
+                    resolved = value.get("resolved", False)
+                    if isinstance(resolved, str) and resolved.strip().lower() in {"true", "false"}:
+                        resolved = resolved.strip().lower() == "true"
+                    if type(resolved) is not bool:
                         raise HarnessError("resolved must be boolean")
-                    refs = strings(value["refuted_observation_ids"], "refuted_observation_ids")
+                    refs = value.get("refuted_observation_ids") or []
+                    if isinstance(refs, str):
+                        refs = [refs] if refs.strip() else []
+                    try:
+                        refs = strings(refs, "refuted_observation_ids")
+                    except HarnessError:
+                        refs = []
                     available = {r["observation_id"] for r in record_pack if "observation_id" in r}
-                    if set(refs) - available:
-                        raise HarnessError("Cannot refute an observation outside the reviewed evidence")
-                    self.parse_edits({k: value[k] for k in ("operations", "conflicts")}, record_pack, role, visual=True)
-                    return value
-                result, req, evidence = self.visual(role, start, end,
-                    {"records": record_pack, "discrepancy": conflict["reason"], "round": round_index,
-                     "graph_version": self.graph.version},
-                    EDIT_INSTRUCTION + "\nReinspect the images to adjudicate the discrepancy. Add resolved boolean and "
-                    "refuted_observation_ids to the response. Refute only observations demonstrably false from "
-                    "these frames, never merely absent from sparse samples. Empty edits are allowed if unresolved.", parse)
+                    refs = [obs_id for obs_id in refs if obs_id in available]
+                    edited = self.parse_edits(value, record_pack, role, visual=True)
+                    return {**edited, "refuted_observation_ids": refs, "resolved": resolved}
+                try:
+                    result, req, evidence = self.visual(role, start, end,
+                        {"records": record_pack, "discrepancy": conflict["reason"], "round": round_index,
+                         "graph_version": self.graph.version},
+                        EDIT_INSTRUCTION + "\nReinspect the images to adjudicate the discrepancy. "
+                        "Return operations, conflicts, refuted_observation_ids (array) and resolved (boolean). "
+                        "Refute only observations demonstrably false from these frames, never merely absent "
+                        "from sparse samples. Empty edits are allowed if unresolved.", parse)
+                except HarnessError as exc:
+                    if not is_unusable_response(exc):
+                        raise
+                    LOG.warning("%s: unusable response retained as unresolved: %s", role, exc)
+                    for record in record_pack:
+                        if "node_id" in record:
+                            self.mark_unresolved(record["node_id"], conflict["reason"])
+                    break
                 self.apply_response(result, req, visual=True, evidence=evidence)
                 for obs_id in result["refuted_observation_ids"]:
                     self.db.execute("INSERT OR REPLACE INTO refuted VALUES(?,?,?)", (obs_id, req, conflict["reason"]))
@@ -456,7 +521,7 @@ class BidirectionalBuilder:
             next_intervals = []
             for start, end, endpoint in intervals:
                 def parse(value):
-                    if not isinstance(value, dict) or set(value) != {"visible", "start", "end", "boundary_uncertainty", "before", "after"}:
+                    if not isinstance(value, dict) or not {"visible", "start", "end", "boundary_uncertainty", "before", "after"} <= set(value):
                         raise HarnessError("Boundary answer requires visible, start/end, uncertainty, before/after")
                     if type(value["visible"]) is not bool:
                         raise HarnessError("visible must be boolean")
@@ -470,13 +535,21 @@ class BidirectionalBuilder:
                         if any(not start <= value[k] <= end for k in checked):
                             raise HarnessError("Refined endpoint lies outside its inspected interval")
                     return value
-                result, req, evidence = self.visual("boundary_refinement", start, end,
-                    {"target": view(node), "endpoint": endpoint, "round": round_index},
-                    "Find earliest clear beginning, latest ongoing timestamp and immediately before/after evidence. "
-                    "Return {visible:boolean,start:seconds,end:seconds,boundary_uncertainty:{start:[lo,hi],end:[lo,hi]},"
-                    "before:timestamp_or_null,after:timestamp_or_null}. If an endpoint is not visible, retain its "
-                    "estimate and uncertainty. When inspecting only one endpoint keep the other unchanged. "
-                    "Never invent frame-accurate timing from sparse frames.", parse)
+                try:
+                    result, req, evidence = self.visual("boundary_refinement", start, end,
+                        {"target": view(node), "endpoint": endpoint, "round": round_index},
+                        "Find earliest clear beginning, latest ongoing timestamp and immediately before/after evidence. "
+                        "Return {visible:boolean,start:seconds,end:seconds,boundary_uncertainty:{start:[lo,hi],end:[lo,hi]},"
+                        "before:timestamp_or_null,after:timestamp_or_null}. If an endpoint is not visible, retain its "
+                        "estimate and uncertainty. When inspecting only one endpoint keep the other unchanged. "
+                        "Never invent frame-accurate timing from sparse frames. "
+                        "boundary_uncertainty must satisfy 0 <= lo <= the endpoint <= hi <= video duration.", parse)
+                except HarnessError as exc:
+                    if not is_unusable_response(exc):
+                        raise
+                    LOG.warning("boundary_refinement: unusable response retained as unresolved: %s", exc)
+                    self.mark_unresolved(node_id, "boundary_response_unusable")
+                    continue
                 if not result["visible"]:
                     self.mark_unresolved(node_id, "boundary_not_visible")
                     continue
@@ -518,15 +591,22 @@ class BidirectionalBuilder:
             if "low" not in node["confidence"].values():
                 continue
             answers, evidence_sets = [], []
-            for replica in (0, 1):
-                answer, req, evidence = self.visual("independent_check", node["start"], node["end"],
-                    {"target_description": node["title"]}, "Independently describe this target from the frames. "
-                    "Do not assume the target description is correct. Return {\"nodes\":[...]} using the node schema.\n" + NODE_SCHEMA,
-                    lambda payload: self.parse_nodes(payload, node["start"], node["end"]), replicate=replica)
-                answers.append(answer)
-                evidence_sets.append(evidence)
+            try:
+                for replica in (0, 1):
+                    answer, req, evidence = self.visual("independent_check", node["start"], node["end"],
+                        {"target_description": node["title"]}, "Independently describe this target from the frames. "
+                        "Do not assume the target description is correct. Return {\"nodes\":[...]} using the node schema.\n" + NODE_SCHEMA,
+                        lambda payload: self.parse_nodes(payload, node["start"], node["end"]), replicate=replica)
+                    answers.append(answer)
+                    evidence_sets.append(evidence)
+            except HarnessError as exc:
+                if not is_unusable_response(exc):
+                    raise
+                LOG.warning("independent_check: skipping unusable replica: %s", exc)
+                self.mark_unresolved(node["node_id"], "independent_check_unusable")
+                continue
             def parse(payload):
-                if not isinstance(payload, dict) or set(payload) != {"confidence", "reason", "conflict"}:
+                if not isinstance(payload, dict) or not {"confidence", "reason", "conflict"} <= set(payload):
                     raise HarnessError("Comparison requires confidence, reason and conflict")
                 normalize_node({**node, "confidence": payload["confidence"]}, self.duration)
                 if type(payload["conflict"]) is not bool or not isinstance(payload["reason"], str):
@@ -543,11 +623,18 @@ class BidirectionalBuilder:
             payload = {"target": view(node), "answers": [[view(n) for n in answer] for answer in answers],
                        "time_iou": iou, "literal_entity_differences": differences,
                        "parent": view(self.graph.get(node["parent_id"])) if node["parent_id"] else None}
-            result, req = self.journal.request("confidence_comparison", payload,
-                "Compare the two independent visual answers. Return {confidence:{semantic:high|medium|low,"
-                "boundary:high|medium|low,hierarchy:high|medium|low},reason:string,conflict:boolean}. "
-                "Agreement is not truth or calibrated probability. Assess each dimension separately; IoU or "
-                "equal wording alone cannot promote semantic or hierarchy confidence. Missing evidence remains low.", parse)
+            try:
+                result, req = self.journal.request("confidence_comparison", payload,
+                    "Compare the two independent visual answers. Return {confidence:{semantic:high|medium|low,"
+                    "boundary:high|medium|low,hierarchy:high|medium|low},reason:string,conflict:boolean}. "
+                    "Agreement is not truth or calibrated probability. Assess each dimension separately; IoU or "
+                    "equal wording alone cannot promote semantic or hierarchy confidence. Missing evidence remains low.", parse)
+            except HarnessError as exc:
+                if not is_unusable_response(exc):
+                    raise
+                LOG.warning("confidence_comparison: skipping unusable comparison: %s", exc)
+                self.mark_unresolved(node["node_id"], "confidence_comparison_unusable")
+                continue
             node["confidence"] = result["confidence"]
             node["evidence"] = combine_evidence(node["evidence"], *evidence_sets)
             node["history"].append({"pass": "confidence_comparison", "operation": "confidence_review",
@@ -562,7 +649,8 @@ class BidirectionalBuilder:
         self.link_duplicates()
         # Each unsupported observation gets one final independent visual check.
         for obs in self.graph.unsupported():
-            self.review_conflict({"node_ids": [], "observation_ids": [obs["observation_id"]],
+            overlapping = [n["node_id"] for n in self.graph.rows(start=obs["start"], end=obs["end"])]
+            self.review_conflict({"node_ids": overlapping, "observation_ids": [obs["observation_id"]],
                                   "reason": "Bottom-up observation has no corresponding final node"},
                                  role="coverage_review", max_rounds=1)
             supported = self.db.execute("SELECT 1 FROM support WHERE obs=?", (obs["observation_id"],)).fetchone()
@@ -647,9 +735,15 @@ class BidirectionalBuilder:
             related = ([node["parent_id"]] if node["parent_id"] else []) + [r["target_id"] for r in node["relations"]]
             for target in dict.fromkeys(related):
                 records = [view(node), view(self.graph.get(target))]
-                response, req = self.journal.request("relation_review", {"records": records, "graph_version": self.graph.version},
-                    EDIT_INSTRUCTION + "\nReview this cross-reference or parent-child edge, especially state and temporal consistency.",
-                    lambda payload: self.parse_edits(payload, records, "relation_review"))
+                try:
+                    response, req = self.journal.request("relation_review", {"records": records, "graph_version": self.graph.version},
+                        EDIT_INSTRUCTION + "\nReview this cross-reference or parent-child edge, especially state and temporal consistency.",
+                        lambda payload: self.parse_edits(payload, records, "relation_review"))
+                except HarnessError as exc:
+                    if not is_unusable_response(exc):
+                        raise
+                    LOG.warning("relation_review: skipping unusable edge: %s", exc)
+                    continue
                 self.apply_response(response, req)
         for node_id, reason in self.graph.issues():
             self.mark_unresolved(node_id, reason)

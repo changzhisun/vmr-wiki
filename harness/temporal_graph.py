@@ -30,14 +30,51 @@ def strings(value, name):
     return list(dict.fromkeys(nonempty(item, name).strip() for item in value))
 
 
+def cite_ids(item, key):
+    """Read a list of IDs, accepting the singular field name or a bare string."""
+    singular = key[:-1] if key.endswith("s") else key
+    if key in item:
+        value = item[key]
+    elif singular in item:
+        value = item[singular]
+    else:
+        value = []
+    if isinstance(value, str):
+        value = [value] if value.strip() else []
+    if value is None:
+        value = []
+    return strings(value, key)
+
+
+def _clamp_interval(start, end, duration):
+    start = min(max(start, 0.0), duration)
+    end = min(max(end, 0.0), duration)
+    if not start < end:
+        raise HarnessError("Node must satisfy 0 <= start < end <= video duration")
+    return start, end
+
+
+def _uncertainty_range(bounds, point, duration):
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+        return [point, point]
+    try:
+        lo = number(bounds[0], "uncertainty")
+        hi = number(bounds[1], "uncertainty")
+    except HarnessError:
+        return [point, point]
+    lo = min(max(0.0, lo), point)
+    hi = max(min(duration, hi), point)
+    if lo > hi:
+        return [point, point]
+    return [lo, hi]
+
+
 def normalize_node(raw, duration):
     if not isinstance(raw, dict):
         raise HarnessError("Node must be an object")
     row = deepcopy(raw)
     try:
-        start, end = number(row["start"], "start", 0), number(row["end"], "end", 0)
-        if not start < end <= duration:
-            raise HarnessError("Node must satisfy 0 <= start < end <= video duration")
+        start, end = _clamp_interval(number(row["start"], "start"), number(row["end"], "end"), duration)
         row.update(start=start, end=end)
         if type(row["granularity"]) is not int or row["granularity"] < 0 or row["type"] not in TYPES:
             raise HarnessError("Invalid granularity or semantic type")
@@ -53,16 +90,13 @@ def normalize_node(raw, duration):
         if (not isinstance(conf, dict) or set(conf) != {"semantic", "boundary", "hierarchy"} or
                 any(value not in CONFIDENCE for value in conf.values())):
             raise HarnessError("confidence must contain semantic/boundary/hierarchy discrete labels")
-        uncertainty = row["boundary_uncertainty"]
-        if not isinstance(uncertainty, dict) or set(uncertainty) != {"start", "end"}:
-            raise HarnessError("boundary_uncertainty must contain start and end ranges")
-        for key in ("start", "end"):
-            bounds = uncertainty[key]
-            if not isinstance(bounds, list) or len(bounds) != 2:
-                raise HarnessError("Boundary uncertainty must be a pair of seconds")
-            lo, hi = number(bounds[0], "uncertainty", 0), number(bounds[1], "uncertainty", 0)
-            if not lo <= row[key] <= hi <= duration:
-                raise HarnessError("Uncertainty must bracket its boundary within the video")
+        uncertainty = row.get("boundary_uncertainty")
+        if not isinstance(uncertainty, dict):
+            uncertainty = {}
+        row["boundary_uncertainty"] = {
+            "start": _uncertainty_range(uncertainty.get("start"), row["start"], duration),
+            "end": _uncertainty_range(uncertainty.get("end"), row["end"], duration),
+        }
         for key in ("needs_refinement", "multiple_actions"):
             row.setdefault(key, False)
             if type(row[key]) is not bool:
@@ -258,10 +292,10 @@ class TemporalGraph:
                     raise HarnessError("Unsupported edit operation")
                 reason = nonempty(op.get("reason"), "operation reason")
                 kind = op["op"]
-                ids = strings(op.get("node_ids", []), "node_ids")
+                ids = cite_ids(op, "node_ids")
                 ids = [aliases.get(node_id, node_id) for node_id in ids]
                 nodes = [self.get(node_id) for node_id in ids]
-                obs_ids = strings(op.get("observation_ids", []), "observation_ids")
+                obs_ids = cite_ids(op, "observation_ids")
                 observations = [self.observation(obs) for obs in obs_ids]
                 if not nodes and not observations and not visual:
                     raise HarnessError("Every operation needs node or observation evidence")

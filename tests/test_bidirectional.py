@@ -240,6 +240,89 @@ def test_legacy_confidence_is_not_promoted():
     assert old == {"level": "event", "confidence": .99}
 
 
+def test_normalize_node_clamps_copied_example_uncertainty():
+    raw = node(12, 18)
+    raw["boundary_uncertainty"] = {"start": [0.0, 0.5], "end": [0.5, 1.0]}
+    out = normalize_node(raw, 31.5)
+    start_lo, start_hi = out["boundary_uncertainty"]["start"]
+    end_lo, end_hi = out["boundary_uncertainty"]["end"]
+    assert start_lo <= 12 <= start_hi <= 31.5
+    assert end_lo <= 18 <= end_hi <= 31.5
+    overflow = node(0, 32)
+    overflow["end"] = 32
+    clamped = normalize_node(overflow, 31.5)
+    assert clamped["end"] == 31.5
+
+
+def test_split_accepts_singular_node_id(graph):
+    apply(graph, [{"op": "SPLIT", "node_id": "root", "reason": "split", "new_nodes": [
+        node(0, 40, granularity=1), node(50, 100, granularity=1)]}])
+    assert len(list(graph.rows())) == 3
+
+
+class ShapeMistakeVLM(BidirectionalVLM):
+    """Reproduce the production schema mistakes that previously failed ingest."""
+
+    def complete(self, prompt, images=()):
+        if prompt.startswith("Repair only JSON"):
+            return super().complete(prompt, images)
+        role = prompt.split("Role: ", 1)[1].split("\n", 1)[0]
+        data = json.loads(prompt.split("\nINPUT:\n", 1)[1])
+        if role == "top_down":
+            self.calls.append((role, data, len(images)))
+            n = node(data["start"], data["end"], title="Coarse phase")
+            n["boundary_uncertainty"] = {"start": [0.0, 0.5], "end": [0.5, 1.0]}
+            return json.dumps({"nodes": [n], "comment": "extra key"})
+        if role in ("targeted_review", "coverage_review"):
+            self.calls.append((role, data, len(images)))
+            return json.dumps({"operations": [], "conflicts": []})
+        if role in ("reconciliation", "bottomup_organization"):
+            self.calls.append((role, data, len(images)))
+            obs = next(r for r in data["records"] if r["kind"] == "observation")
+            parent = next((r for r in data["records"] if r["kind"] == "node"), None)
+            new = {**node(1, 2, title=obs["title"], type="action"),
+                   "parent_id": parent["node_id"] if parent else None, "granularity": 1 if parent else 0}
+            return json.dumps({"operations": [
+                {"op": "INSERT", "node_ids": [], "observation_ids": [obs["observation_id"]],
+                 "new_node": new, "reason": "Independent short action omitted by H0"},
+                {"op": "SPLIT", "node_id": parent["node_id"] if parent else "n_missing",
+                 "observation_ids": [], "new_nodes": [node(0, 1)], "reason": "incomplete split"},
+                {"op": "KEEP", "node_ids": ["n_not_in_batch"], "observation_ids": [obs["observation_id"]],
+                 "reason": "outside batch"}], "conflicts": []})
+        return super().complete(prompt, images)
+
+
+def test_common_model_shape_mistakes_still_publish(prepared):
+    cfg, _ = prepared
+    config(cfg)
+    video, output = locations(cfg)
+    ingest_video(video, "video", output, cfg, captioner=ShapeMistakeVLM())
+    assert output.exists()
+    final = read_jsonl(output / "nodes.jsonl")
+    assert any(r["title"] == "Brief tomato transfer" for r in final)
+
+
+class GarbageReviewVLM(BidirectionalVLM):
+    def complete(self, prompt, images=()):
+        if prompt.startswith("Repair only JSON"):
+            return super().complete(prompt, images)
+        role = prompt.split("Role: ", 1)[1].split("\n", 1)[0]
+        if role in ("targeted_review", "coverage_review"):
+            self.calls.append((role, {}, len(images)))
+            return json.dumps({"operations": "not-a-list", "conflicts": []})
+        return super().complete(prompt, images)
+
+
+def test_unusable_visual_review_degrades_instead_of_failing(prepared):
+    cfg, _ = prepared
+    config(cfg)
+    video, output = locations(cfg)
+    ingest_video(video, "video", output, cfg, captioner=GarbageReviewVLM(omit=True))
+    assert output.exists()
+    final = read_jsonl(output / "nodes.jsonl")
+    assert any("unexplained_bottomup_observation" in r.get("issues", []) for r in final)
+
+
 @pytest.mark.parametrize("broken", [
     {"nodes": [{"start": 0, "end": 0}]},
     {"nodes": [node(evidence=None)]},
