@@ -38,11 +38,12 @@ def query_workspace(query: dict, task: dict, wiki: Path, templates: dict[str, st
     try:
         target = root / "wiki"
         target.mkdir()
-        for name in ("wiki.md", "frames.jsonl"):
+        public_files = {"wiki.md", "frames.jsonl", "nodes.jsonl", "observations.jsonl"}
+        for name in sorted(public_files & seal["files"].keys()):
             shutil.copyfile(wiki / name, target / name)
         shutil.copytree(wiki / "frames", target / "frames")
         expected = {key: value for key, value in seal["files"].items()
-                    if key in ("wiki.md", "frames.jsonl") or key.startswith("frames/")}
+                    if key in public_files or key.startswith("frames/")}
         if tree_hashes(target) != expected:
             raise HarnessError("Wiki changed while creating workspace")
         make_readonly(target)
@@ -60,4 +61,3 @@ def query_workspace(query: dict, task: dict, wiki: Path, templates: dict[str, st
         verify_wiki(wiki)
     finally:
         remove_tree(root)
-

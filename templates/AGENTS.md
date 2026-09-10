@@ -6,6 +6,15 @@
 
 读取 `task.json`、`wiki/wiki.md`、`wiki/frames.jsonl` 和 `wiki/frames/`。
 Wiki 是提前生成并冻结的 timestamped visual timeline。
+Hierarchical Wiki 使用 Chapter → Scene → Event → Action 时间语义树，
+`wiki/nodes.jsonl` 是主存储，每行包含 node_id、parent_id、level、时间范围及语义字段。
+先通过章节及场景定位候选，再检查 Event / Action、状态变化与对应帧。
+并非每个节点都展开到 Action；短片段或语义不可再分时可以提前结束。
+`wiki/observations.jsonl` 保留合并前和中间节点，source_node_ids 可追溯这些观察。
+层次化 `frames.jsonl` 每行是 frame_id、timestamp、frame，使用节点的 evidence_frame_ids 查找图像。
+相邻上下文有重叠，但主树中兄弟节点的时间范围连续且不重叠。
+节点的时间边界由采样证据估计，confidence 是模型自报值；不能直接当作预测分数或真实概率。
+根据 Query 选择合适的层级，可以跨连续子节点定位完整活动，不能将重复出现的独立活动混为一个片段。
 Dense `wiki.md` 是紧凑时间线：`state` 表示稳定可见状态，`action` 表示进行中的动作，
 `transition` 表示进入、离开、开始、停止或画面切换。完全相同的段落会去重，
 但重复 Caption 的不同时间范围不会扩展合并。跨越 30 秒分组边界的段落会在相交分组中重复显示；

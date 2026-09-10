@@ -64,8 +64,14 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         if number(ingest["sample_interval_sec"], "sample_interval_sec") <= 0:
             raise HarnessError("sample_interval_sec must be positive")
         ingest.setdefault("caption_mode", "simple")
-        if ingest["caption_mode"] not in ("simple", "dense"):
-            raise HarnessError("caption_mode must be simple or dense")
+        if ingest["caption_mode"] not in ("simple", "dense", "hierarchical"):
+            raise HarnessError("caption_mode must be simple, dense, or hierarchical")
+        if ingest["caption_mode"] == "hierarchical":
+            from harness.hierarchy_config import HIERARCHY_VERSION, settings
+            if ingest.get("hierarchy_processing_version", HIERARCHY_VERSION) != HIERARCHY_VERSION:
+                raise HarnessError("Unsupported hierarchy_processing_version; use a new wiki root")
+            ingest["hierarchy_processing_version"] = HIERARCHY_VERSION
+            ingest["hierarchy"] = settings(ingest)
         ingest.setdefault("dense_timestamp_mode", "absolute_seconds")
         if ingest["dense_timestamp_mode"] not in ("absolute_seconds", "frame_index"):
             raise HarnessError("dense_timestamp_mode must be absolute_seconds or frame_index")
@@ -102,6 +108,10 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         if ingest["caption_mode"] == "simple" and timeline_fields:
             raise HarnessError(
                 "simple caption prompt must not contain {{FRAME_TIMESTAMPS}}"
+            )
+        if ingest["caption_mode"] == "hierarchical" and timeline_fields:
+            raise HarnessError(
+                "hierarchical builds its own frame timeline; prompt must not contain {{FRAME_TIMESTAMPS}}"
             )
         number(vlm["temperature"], "temperature", 0)
         positive_int(vlm["max_tokens"], "max_tokens")

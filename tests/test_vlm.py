@@ -9,6 +9,26 @@ from harness.common import HarnessError
 from harness.vlm import VLMClient
 
 
+def test_hierarchical_prompt_override_and_frame_limit(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"image")
+    seen = []
+    def request(req, timeout):
+        seen.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({"choices": [{"finish_reason": "stop", "message": {
+            "content": '{"terminal":true,"nodes":[]}'}}]}).encode())
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    client = VLMClient(cfg["ingest"]["vlm"])
+    client.caption([image] * 100, prompt_override="Hierarchy schema", correction="Fix partition")
+    parts = seen[0]["messages"][0]["content"]
+    assert len(parts) == 101
+    assert "Hierarchy schema" in parts[0]["text"] and "Fix partition" in parts[0]["text"]
+    with pytest.raises(HarnessError, match="at most 100"):
+        client.caption([image] * 101, prompt_override="Hierarchy schema")
+    assert len(seen) == 1
+
+
 def test_fixed_image_payload_and_caption(cfg, tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
     image = tmp_path / "frame.jpg"

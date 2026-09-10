@@ -5,22 +5,21 @@ dataset:
 # Relative paths are resolved against this config file, not the shell's cwd.
 paths:
   datasets: datasets
-  wiki: wiki
+  wiki: wiki-hierarchical  # New root; existing flat/frozen Wikis remain reusable with their old config.
   runs: runs
   results: results
   templates: templates
 
 ingest:
   sample_interval_sec: 1.0
-  # Dense mode returns validated temporal events; simple preserves plain captions.
-  caption_mode: dense
-  # One coordinate system per response. frame_index uses inclusive 0-based indices.
+  # Hierarchical is the new default; dense/simple remain available for legacy experiments.
+  caption_mode: hierarchical
+  # Legacy Dense coordinate system; hierarchical always uses absolute seconds.
   dense_timestamp_mode: absolute_seconds
-  # Number of sampled frames per VLM request, and sampled frames advanced per request.
-  # The default 5/1 gives each target region two earlier and later context frames.
+  # Legacy Simple/Dense window parameters; hierarchical uses hierarchy.max_frames.
   caption_window_frames: 5
   caption_stride_frames: 1
-  # Extra attempts allowed when a dense answer breaks the window contract; the
+  # Extra attempts allowed when a structured answer breaks its schema; the
   # rejection is sent back to the captioner. 0 fails the video immediately.
   caption_max_repairs: 2
   image_max_size: 768
@@ -32,49 +31,27 @@ ingest:
     api_key_env: OPENAI_API_KEY
     model: Qwen3-VL-8B-Instruct
     temperature: 0
-    max_tokens: 2048
+    max_tokens: 8192
     timeout_sec: 120
     max_retries: 3
     prompt: |-
-      You are generating dense temporal captions for Video Moment Retrieval.
-
-      You are given sampled video frames in chronological order. The images
-      correspond, in the same order, to exactly these timestamps in seconds:
-
-      {{FRAME_TIMESTAMPS}}
-
-      That list is the complete set of values you may use. The harness will
-      separately identify the centered target region and append the fixed
-      schema guardrails used for every configuration.
-
-      Analyze only the visible evidence in these sampled frames and divide the
-      relevant activity into meaningful visual segments.
-
-      For each segment:
-
-      - `start` and `end` must exactly match timestamps from the provided timeline;
-      - write one concise, factual caption;
-      - focus on actors, actions, object interactions, movement, spatial relations,
-        and visible state changes;
-      - prefer atomic events and split when the main visible action changes;
-      - do not infer actions before, after, or between the sampled frames;
-      - do not describe the same segment more than once;
-
-      Return exactly one JSON object with no Markdown or additional text. The
-      object must contain only an `events` array. Each event object must contain
-      exactly numeric `start`, numeric `end`, string `kind`, and string `caption`
-      fields.
-
-      Requirements:
-
-      - events must be in chronological order;
-      - `start <= end`;
-      - every `start` and `end` must copy one of the listed values exactly; never
-        round, interpolate, or extend past the last listed timestamp, even when
-        an action clearly continues;
-      - captions must be nonempty factual strings;
-      - do not merge clearly different actions;
-      - if no meaningful segment is visible, return {"events":[]}.
+      Describe observable activities at the requested semantic level. Use concise,
+      specific titles and summaries. Keep stable actor/object descriptions across
+      levels when supported by the images. Do not infer invisible details.
+  hierarchy:
+    max_frames: 100  # Hard upper bound per VLM request, including merge requests.
+    max_depth: 4     # Chapter -> Scene -> Event -> Action.
+    min_segment_sec: 2.0
+    min_sample_interval_sec: 0.25
+    overlap_ratio: 0.15  # Context overlap at each shared target boundary.
+    uniform_fraction: 0.6  # Remaining quota: scene-change neighborhoods and motion.
+    analysis_fps: 2.0
+    analysis_timeout_sec: 1800
+    scene_threshold: 0.3
+    max_children: 12
+    max_nodes: 2000
+    max_requests: 1000  # Logical split/merge requests, excluding repairs/retries.
+    merge_adjacent: true
 
 query:
   agent: codex

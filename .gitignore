@@ -6,7 +6,8 @@ __pycache__/
 datasets/
 videos/
 wiki/
+wiki-hierarchical/
+embeddings/
 runs/
 results/
 .env
-

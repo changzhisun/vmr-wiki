@@ -101,14 +101,17 @@ class VLMClient:
     def caption(self, images: Path | Sequence[Path], *,
                 timestamps: Sequence[float] | None = None,
                 target_timestamps: Sequence[float] | None = None,
-                correction: str | None = None) -> str:
+                correction: str | None = None,
+                prompt_override: str | None = None) -> str:
         cfg = self.config
         self._local.requests = []
         paths = [images] if isinstance(images, Path) else list(images)
         if not paths:
             raise HarnessError("VLM caption requires at least one image")
+        if prompt_override is not None and len(paths) > 100:
+            raise HarnessError("Hierarchical VLM requests accept at most 100 frames")
         suffix, extras = _request_extras(cfg["model"])
-        prompt = cfg["prompt"]
+        prompt = cfg["prompt"] if prompt_override is None else nonempty(prompt_override, "prompt_override")
         placeholder = "{{FRAME_TIMESTAMPS}}"
         if timestamps is not None:
             timeline = list(timestamps)

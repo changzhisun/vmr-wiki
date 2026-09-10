@@ -142,6 +142,15 @@ def ingest_content_hash(cfg: dict) -> str:
     """
     ingest = cfg["ingest"]
     vlm = ingest["vlm"]
+    if ingest.get("caption_mode") == "hierarchical":
+        from harness.hierarchy_config import HIERARCHY_VERSION, settings
+        return object_hash({
+            "caption_mode": "hierarchical",
+            "hierarchy_processing_version": ingest.get("hierarchy_processing_version", HIERARCHY_VERSION),
+            "hierarchy": settings(ingest),
+            **{key: ingest[key] for key in ("image_max_size", "jpeg_quality", "caption_max_repairs")},
+            "vlm": {key: vlm[key] for key in sorted(_VLM_CONTENT_KEYS)},
+        })
     return object_hash({
         **{key: _ingest_content_value(ingest, key) for key in sorted(_INGEST_CONTENT_KEYS)},
         "vlm": {key: vlm[key] for key in sorted(_VLM_CONTENT_KEYS)},
@@ -153,6 +162,13 @@ def ingest_content_diff(stored: dict, cfg: dict) -> list[str]:
     if ingest_content_hash({"ingest": stored}) == ingest_content_hash(cfg):
         return []
     diffs = []
+    if stored.get("caption_mode") == cfg["ingest"].get("caption_mode") == "hierarchical":
+        from harness.hierarchy_config import HIERARCHY_VERSION, settings
+        if settings(stored) != settings(cfg["ingest"]):
+            diffs.append("hierarchy settings differ")
+        if stored.get("hierarchy_processing_version", HIERARCHY_VERSION) != cfg["ingest"].get(
+                "hierarchy_processing_version", HIERARCHY_VERSION):
+            diffs.append("hierarchy_processing_version differs")
     for key in sorted(_INGEST_CONTENT_KEYS):
         left = _ingest_content_value(stored, key)
         right = _ingest_content_value(cfg["ingest"], key)

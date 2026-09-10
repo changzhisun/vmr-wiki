@@ -51,16 +51,17 @@ def test_sampling_edges():
             sample_times(10.0, interval)
 
 
-def test_default_config_uses_overlapping_multi_frame_captions():
+def test_default_config_uses_hierarchical_captions():
     config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
     ingest = config["ingest"]
     assert ingest["sample_interval_sec"] == 1.0
-    assert ingest["caption_mode"] == "dense"
+    assert ingest["caption_mode"] == "hierarchical"
     assert ingest["caption_window_frames"] == 5
     assert ingest["caption_stride_frames"] == 1
     assert ingest["caption_processing_version"] == 4
-    assert ingest["vlm"]["max_tokens"] == 2048
-    assert ingest["vlm"]["prompt"].count("{{FRAME_TIMESTAMPS}}") == 1
+    assert ingest["vlm"]["max_tokens"] == 8192
+    assert ingest["hierarchy"]["max_frames"] == 100
+    assert ingest["hierarchy_processing_version"] == 1
 
 
 def test_caption_mode_and_dense_prompt_template_are_validated(tmp_path):
@@ -78,6 +79,8 @@ def test_caption_mode_and_dense_prompt_template_are_validated(tmp_path):
     assert load_config(path)["ingest"]["caption_mode"] == "simple"
 
     raw = yaml.safe_load(source.read_text())
+    raw["ingest"]["caption_mode"] = "dense"
+    raw["ingest"]["vlm"]["prompt"] = "Timeline {{FRAME_TIMESTAMPS}}"
     raw["ingest"]["caption_stride_frames"] = 3
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(HarnessError, match="must not exceed half"):

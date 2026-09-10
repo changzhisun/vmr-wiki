@@ -66,7 +66,7 @@ def prepare(cfg: dict, output: Path, *, split: str, limit_videos: int = 10, seed
     write_jsonl(snapshot / "ground_truth.jsonl", truth)
     dense_prompt = cfg["ingest"]["vlm"]["prompt"]
     if "{{FRAME_TIMESTAMPS}}" not in dense_prompt:
-        dense_prompt = load_config(Path(__file__).resolve().parents[1] / "config.yaml")["ingest"]["vlm"]["prompt"]
+        dense_prompt = (Path(__file__).resolve().parents[1] / "templates/dense_prompt.md").read_text().strip()
     configs = {}
     for name, mode, window, stride in VARIANTS:
         variant = deepcopy(cfg)

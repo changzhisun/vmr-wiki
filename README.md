@@ -1,10 +1,10 @@
 # VMR Wiki
 
-将 QVHighlights 与 UCA-VMR 视频转换成固定的视觉时间线，再让每条 Query 在全新的 Codex / Claude Code 进程中完成 Video Moment Retrieval。实现范围对应 [PLAN.md](PLAN.md) 的六个 MVP milestones。
+将视频转换成与 Query 无关的层次化时间语义树，再让每条 Query 在全新的 Codex / Claude Code 进程中完成 Video Moment Retrieval。支持 QVHighlights、UCA-VMR 和 Monitor；旧版 Simple / Dense 视觉时间线仍可使用。
 
 ```text
 QVHighlights / UCA-VMR annotations → videos / queries / ground_truth manifests
-视频 → 固定采样 → VLM captions → Wiki → SHA256 Freeze
+视频 → 全局扫描 → 混合采样与递归细化 → 自底向上合并 → JSONL / Markdown → SHA256 Freeze
 选定 Split 的单 Query + 当前 Wiki → 独立容器 / 新进程 → prediction.json
 predictions → aggregate → mAP / R@K → metrics.json
 ```
@@ -44,11 +44,11 @@ docker build -f docker/Dockerfile \
 - `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
 - `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
 - `query.base_url`：可选地为每个 Agent 指定兼容 OpenAI / Anthropic 的网关 endpoint，`null` 表示使用官方默认地址。必须是 443 端口上的 https URL，且主机名同时出现在 `query.egress_allowed_hosts` 中，否则加载配置时即报错——代理只隧道 443 的 CONNECT，Agent 那一侧只会看到一个无 body 的 403。
-- `caption_mode`：`dense` 要求 VLM 返回带 `state` / `action` / `transition` 类型的严格时间段 JSON；`simple` 保留普通 Caption 格式。默认使用 `dense`。
-- `caption_window_frames`：每次 VLM 请求包含的连续采样帧数量；默认 `5`，为中心目标区间提供前后画面；设为 `1` 时是单图 Caption。
+- `caption_mode`：默认 `hierarchical`，生成 Chapter → Scene → Event → Action 语义树。`dense` 返回带 `state` / `action` / `transition` 类型的时间段 JSON；`simple` 保留普通 Caption 格式。
+- `caption_window_frames`：旧版 Simple / Dense 每次 VLM 请求包含的连续采样帧数量；默认 `5`，为中心目标区间提供前后画面；设为 `1` 时是单图 Caption。
 - `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；Dense 模式不能超过窗口大小的一半，以保证中心目标仍处于当前上下文中。
-- `caption_max_repairs`：Dense 答案违反窗口约束时允许的额外重问次数，默认 2；`0` 表示第一次违规就让该视频失败。它参与 `ingest_content_hash`，因为重问会改变最终存下来的 Caption。
-- `sample_interval_sec`、Caption 模式、窗口、stride、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
+- `caption_max_repairs`：Hierarchical / Dense 答案违反结构或时间约束时允许的额外重问次数，默认 2；`0` 表示第一次违规就让该视频失败。它参与 `ingest_content_hash`，因为重问会改变最终存下来的 Caption。
+- Hierarchical 使用 `ingest.hierarchy` 的采样、停止和预算参数；`sample_interval_sec`、`caption_window_frames`、`caption_stride_frames`、`dense_timestamp_mode` 只用于旧版格式。预处理尺寸、prompt、temperature、token 上限和 Query 的 `max_predictions` 仍是固定实验变量。
 
 通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。可以在配置中指定其他变量名。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
 
@@ -156,6 +156,70 @@ datasets/uca/
 `queries.jsonl` 只含 `query_id`、`video_id`、`query`、`split`；`ground_truth.jsonl` 保留全部 `gold_moments`。重复 ID、非法时间区间、同视频时长不一致、`path` 逃出 video root、`query.text` 缺失都会报错，已有输出目录不会被覆盖。UCA-VMR 的 test split GT 公开，因此 train / dev / test 均可转换。
 
 ## 2. Ingest 与 Freeze
+
+### 2.1 层次化 Wiki（默认）
+
+默认配置写入新的 `wiki-hierarchical/`，不会覆盖 `wiki/` 中的旧产物。填写 VLM endpoint、模型和认证环境变量后，沿用原入口：
+
+```bash
+python harness/ingest_all.py --config config.yaml --dataset monitor --split dev --freeze
+```
+
+处理流程：
+
+1. 全片均匀采样最多 100 帧，请 VLM 预测覆盖全视频的 Chapter。
+2. 对每个节点重新采样，按 Chapter → Scene → Event → Action 细化。每次图像输入最多 `max_frames`（硬上限 100）；短视频或低帧率视频会去重，少于 100 帧。
+3. 局部采样默认 60% 均匀帧，剩余配额平分给场景变化附近帧和高运动/视觉变化帧；无显著变化时补充均匀帧。FFmpeg 以默认 2 fps、64×36 灰度预扫描，用亮度直方图变化估计切镜、像素平均差估计运动/视觉变化，包括镜头运动；它不是光流或学习式场景检测器。分数写入 `sampling.jsonl`。
+4. 采样时刻对齐到主视频流的 presentation timestamps，避免 EOF 后抽帧并适配可变帧率。节点边界可使用区间内的浮点秒数，表达采样证据支持的估计范围，不声称逐帧精确。
+5. 相邻节点的图像上下文默认保留 15% 重叠，可设置 10%–20%。具体定义：每个共享边界的重叠长度为较短目标区间时长乘以比例，向两侧各延伸一半；上下文不超出父区间。主树中的兄弟节点仍是连续、不重叠的时间分区。
+6. 达到 `min_segment_sec`（默认 2 秒）、语义不可再分、Action 层或 `max_depth` 时停止。全局至少返回一个 Chapter；低信息或静态画面也应如实描述，不能让全片静默消失。
+7. 细化完成后，自底向上请求 VLM 将同层相邻、属于同一连续活动的节点分组。合并范围由程序取成员边界，子节点重新挂到合并节点；重复但独立的活动应保持分离。不会合并一个已展开节点和一个未展开叶子，避免产生缺失的子区间。原始原子观察及中间合并节点保留在独立 JSONL 中。
+
+主树是虚拟 Video 根下的 Chapter 列表，Chapter 的 `parent_id` 为 `null`。其余节点只允许紧邻层级的父子关系。每个节点包含用户语义字段和可追溯证据：
+
+```json
+{"node_id":"event_root_001_001_001","parent_id":"scene_root_001_001","level":"event","start":120.5,"end":138.2,"title":"加入西红柿","summary":"女子将切好的西红柿加入锅中。","actors":["女子"],"actions":["加入"],"objects":["西红柿","锅"],"state_before":"西红柿位于砧板上","state_after":"西红柿已经进入锅中","confidence":0.93,"evidence_frame_ids":["f_example"]}
+```
+
+上例只展示格式。ID、parent_id 和合并边界由程序生成；`confidence` 是模型自报值，未经概率校准。叶子另带 `stop_reason`，合并节点另带 `source_node_ids`。状态未知时是空字符串，实体未知时是空数组。
+
+```text
+wiki-hierarchical/<dataset>/videos/<video_id>/
+├── nodes.jsonl           # 主树，先父后子；所有推荐 Schema 字段
+├── observations.jsonl    # 原始/中间观察档案，供 source_node_ids 追溯
+├── wiki.md               # 章节索引和四层语义树
+├── frames.jsonl          # 去重帧索引：frame_id、timestamp、frame
+├── frames/               # 所有请求实际使用的图像
+├── sampling.jsonl        # 低分辨率变化分析分数
+├── caption_audit.jsonl   # split/merge 输入、原始响应、修复及 usage
+├── ingest.json
+└── frozen.json
+```
+
+`observations.jsonl` 是历史观察档案，父节点引用反映生成时关系，不应作为当前树遍历；最终关系以 `nodes.jsonl` 为准。Query Agent 可读取 nodes、observations、wiki、frames 索引和图像；不暴露 sampling、请求审计和源视频身份元数据。所有产物均参与冻结。
+
+默认每次最多 12 个子节点、最多生成 2,000 个节点（包括中间合并节点）、最多 1,000 个逻辑 split/merge 请求。超预算会明确失败并保留 checkpoint，不发布部分树。修复使用 `caption_max_repairs`，传输重试沿用 VLM 设置；两者不计入逻辑请求数，但计入调用审计。不同视频可由 `--jobs` 并发；单视频按树依赖顺序处理。
+
+图像、变化分析和每次 split/merge 成功响应均可断点恢复。更改层次化内容参数需要新 Wiki 根目录；规则版本为 `hierarchy_processing_version: 1`，进入内容哈希。层次化 Wiki 时长使用主视频流时长，容器时长单独保存在 `container_duration`。
+
+### 2.2 独立 Embedding（可选）
+
+不把向量写入节点 JSONL 或冻结 Wiki。使用支持 `/embeddings` 的模型，显式运行独立导出：
+
+```bash
+python harness/embed_wiki.py \
+  --wiki wiki-hierarchical/monitor/videos/VIDEO_ID \
+  --output embeddings/monitor/VIDEO_ID \
+  --model YOUR_EMBEDDING_MODEL \
+  --base-url https://YOUR_EMBEDDING_ENDPOINT/v1 \
+  --api-key-env OPENAI_API_KEY
+```
+
+输出 `vectors.npy`（L2 归一化 float32）、`index.jsonl`（行号 → node_id、时间范围、文本哈希）和 `manifest.json`（模型、源 Wiki 哈希、维度和文件哈希）。格式可直接由 NumPy 加载或导入 FAISS；导出器本身无需 NumPy。所有层级都参与向量化，embedding 文本由标题、摘要、实体、动作、前后状态组成。该步骤单独调用 Embedding API，不随 ingest 自动执行，也不会自动挂载到 Query 工作区。
+
+### 2.3 旧版 Simple / Dense
+
+下文的固定采样和窗口配置适用于旧版模式。切换为 `caption_mode: dense` 时，将 `templates/dense_prompt.md` 的内容写入 `ingest.vlm.prompt`；Simple 则使用无时间戳占位符的普通 Caption prompt。复用旧产物时使用其原始配置及 Wiki 根目录。
 
 单视频入口：
 
