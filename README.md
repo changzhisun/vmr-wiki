@@ -44,9 +44,9 @@ docker build -f docker/Dockerfile \
 - `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
 - `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
 - `query.base_url`：可选地为每个 Agent 指定兼容 OpenAI / Anthropic 的网关 endpoint，`null` 表示使用官方默认地址。必须是 443 端口上的 https URL，且主机名同时出现在 `query.egress_allowed_hosts` 中，否则加载配置时即报错——代理只隧道 443 的 CONNECT，Agent 那一侧只会看到一个无 body 的 403。
-- `caption_mode`：`dense` 要求 VLM 返回严格校验的时间事件 JSON；`simple` 保留旧的普通 Caption 格式。默认使用 `dense`。
-- `caption_window_frames`：每次 VLM 请求包含的连续采样帧数量；设为 `1` 时是单图 Caption。
-- `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；小于窗口时产生重叠窗口。
+- `caption_mode`：`dense` 要求 VLM 返回带 `state` / `action` / `transition` 类型的严格时间段 JSON；`simple` 保留普通 Caption 格式。默认使用 `dense`。
+- `caption_window_frames`：每次 VLM 请求包含的连续采样帧数量；默认 `5`，为中心目标区间提供前后画面；设为 `1` 时是单图 Caption。
+- `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；Dense 模式不能超过窗口大小的一半，以保证中心目标仍处于当前上下文中。
 - `caption_max_repairs`：Dense 答案违反窗口约束时允许的额外重问次数，默认 2；`0` 表示第一次违规就让该视频失败。它参与 `ingest_content_hash`，因为重问会改变最终存下来的 Caption。
 - `sample_interval_sec`、Caption 模式、窗口、stride、预处理尺寸、prompt、temperature、token 上限和 `max_predictions` 是固定实验变量。
 
@@ -178,9 +178,9 @@ python harness/ingest_all.py --dataset qvhighlights --split val --freeze
 python harness/freeze.py --dataset qvhighlights --split val
 ```
 
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt，最后的窗口可以少于配置帧数。默认 Dense 模式把窗口内的采样时间替换进 `{{FRAME_TIMESTAMPS}}`（只给时间值，不给帧文件名），要求 VLM 返回只使用这些时间点的有序事件 JSON。Simple 模式保留原来的普通 Caption。时间戳表示请求的采样时刻，解码器选取该时刻对应的可解码视频帧；它不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt。视频短于窗口时只生成一个短窗口；否则只生成完整窗口，必要时增加一个向视频末尾对齐的完整窗口，不再生成 3、2、1 帧的重复尾窗。该贴尾规则同时适用于 Simple 和 Dense；即使大 stride 有意留出空档，视频末尾仍至少被一个窗口覆盖。Simple 模式 Caption 整个窗口；Dense 模式把窗口内采样时间替换进 `{{FRAME_TIMESTAMPS}}`，并额外给出中心目标区间。模型应重点描述目标区间，其他帧只作为上下文；跨越目标边界的事件仍可使用窗口中的其他合法时间戳，解析器不会因此拒绝。默认 `5/1` 下，中间窗口 `[1,2,3,4,5]` 重点负责 `[3,4]`，首尾窗口延伸负责无法获得对称上下文的视频边界。时间戳表示请求的采样时刻，不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
 
-Dense 时间坐标必须显式选择，不能自动猜测：默认 `dense_timestamp_mode: absolute_seconds` 只接受当前窗口提供的秒数；`frame_index` 则向模型提供 `0..n-1` 的帧索引，要求 `start` / `end` 都为闭区间索引，再整体转换回秒数。两种模式均拒绝半开区间终点 `n`、非采样时刻及越界值。例如窗口 `[2,3,4,5]` 中的事件 `[0,2]` 在秒数模式下非法，在索引模式下转换为 `[2,4]`，不会混用两种解释。处理规则版本 `caption_processing_version: 2` 由代码维护，并与坐标模式一起进入 Dense 内容哈希；旧自动转换规则生成的 Dense Wiki 不能直接复用，需要新的 Wiki 根目录。
+Dense 时间坐标必须显式选择，不能自动猜测：默认 `dense_timestamp_mode: absolute_seconds` 只接受当前窗口提供的秒数；`frame_index` 则向模型提供 `0..n-1` 的帧索引，要求 `start` / `end` 都为闭区间索引，再整体转换回秒数。两种模式均拒绝半开区间终点 `n`、非采样时刻及越界值。例如窗口 `[2,3,4,5]` 中的事件 `[0,2]` 在秒数模式下非法，在索引模式下转换为 `[2,4]`，不会混用两种解释。处理规则版本 `caption_processing_version: 4` 由代码维护，并进入内容哈希；旧 Wiki 与 checkpoint 不能直接复用，需要新的 Wiki 根目录。
 
 每个视频输出：
 
@@ -196,7 +196,7 @@ wiki/qvhighlights/videos/<video_id>/
 
 `ingest.json` 记录媒体 SHA256、配置、FFmpeg 版本、处理规则版本、内容哈希和 `telemetry`。`caption_audit.jsonl` 保留每个窗口的原始响应、标准化事件、修复原因、请求状态、耗时和服务端提供的 token 用量。审计文件参与冻结，但不会复制进 Query Agent 工作区，Agent 仍只看到 `wiki.md`、`frames.jsonl` 和 `frames/`。`frozen.json` 覆盖 Markdown、JSONL、**每一张图像**及 Ingest 元数据。每个视频独立冻结，实验的 `experiment.json` 保存所选视频的哈希快照；不再使用阻止新增视频的数据集级 `freeze.json`。
 
-Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式；Simple 多图模式的每行包含窗口信息、`frames` 数组和一个窗口 Caption。Dense 模式的每行包含窗口信息、按时间排序的 `frames` 数组和经过校验的 `events` 数组，每个事件都包含来自当前窗口时间线的 `start`、`end` 及 Caption。`wiki.md` 按窗口列出 Dense 事件时间范围及对应图片。重叠窗口的原始事件会完整保留，不做语义合并。
+Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式；Simple 多图模式的每行包含窗口信息、`frames` 数组和一个窗口 Caption。Dense 每行另外记录 `target_start_timestamp` / `target_end_timestamp`，`events` 中每个段落包含窗口时间线上的 `start`、`end`、`kind` 和 Caption。原始窗口回答完整保留。Query 侧 `wiki.md` 按 30 秒分组，每个段落压缩成一行，不再重复列出窗口和帧路径；帧映射仍可从 `frames.jsonl` 查询。完全相同的时间范围、类型和规范化 Caption 仅显示一次，但不会将重复 Caption 的不同时间范围取并集。跨越 30 秒边界的段落会出现在每个相交分组中，但 `Number of displayed segments` 仍统计唯一段落。
 
 完整 Ingest 再次执行时只核验并复用，不重新 caption。处理中每个抽帧文件、已完成窗口和请求审计原子保存到 `wiki/<dataset>/.ingest-checkpoints/<video_id>/<identity_hash>/`。失败或正常 Ctrl-C 会清除发布用 staging，但保留 checkpoint；重新执行相同 Ingest 命令即可验证并复用已完成的帧和窗口。Checkpoint 身份包含源视频哈希、内容配置、媒体时长和 FFmpeg 版本，损坏记录会报错，身份不同的记录不会复用。成功发布后清理对应 checkpoint，其他身份的旧缓存保留。强制杀进程可能留下锁文件，必须确认没有活跃进程后才可手动移除该视频的锁；也可能重做尚未原子保存的调用，不保证 API 恰好调用一次。
 
@@ -408,7 +408,7 @@ python harness/ablation.py summarize --suite experiments/caption_dev
 
 `run` 的 Ingest 和 Query 阶段会实际调用配置中的模型并产生费用；`--stage all` 可以串行完成全部阶段。`--jobs` 只控制 Ingest 视频并发，Query 按顺序运行。每组沿用原有失败/续跑规则，不会为失败的 Agent Query 额外抽一次答案。
 
-四组分别是 Simple 1/1、Simple 4/1、Dense 4/1、Dense 8/4（window/stride）。它们使用相同的视频、Query、GT、采样间隔、模型、token 上限和 Query Agent 配置，但独立生成 Wiki；Simple 与 Dense 使用各自格式的固定 prompt。4/1 与 8/4 同时改变窗口和步长，只能判断组合效果，不能把差异单独归因于窗口大小。配置、数据快照、源视频、模板及代码哈希固定，Agent runtime 也必须一致；输入变化时要求重新准备 suite。
+四组分别是 Simple 1/1、Simple 5/1、Dense 5/1、Dense 9/4（window/stride）。它们使用相同的视频、Query、GT、采样间隔、模型、token 上限和 Query Agent 配置，但独立生成 Wiki；Simple 与 Dense 使用各自格式的固定 prompt。5/1 与 9/4 同时改变窗口和步长，只能判断组合效果，不能把差异单独归因于窗口大小。配置、数据快照、源视频、模板及代码哈希固定，Agent runtime 也必须一致；输入变化时要求重新准备 suite。
 
 `comparison.json` 汇总每组检索指标、失败情况、完成视频/Query 数、阶段累计 wall time、Caption 尝试数与耗时，以及可用时的 Caption token 总量。未完成组标为 `complete: false`，未开始的统计和不可用的 token 用量为 `null`。成本只覆盖已完成视频保留下来的工作（包括其历史失败 caption），不包含仍失败视频的 checkpoint 或 Query Agent token，不换算价格。真实模型的效果和提速幅度需运行后比较，离线模拟测试不代表模型效果。
 

@@ -19,8 +19,8 @@ from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_query_inputs, require_ground_truth
 
 
-VARIANTS = (("simple_1_1", "simple", 1, 1), ("simple_4_1", "simple", 4, 1),
-            ("dense_4_1", "dense", 4, 1), ("dense_8_4", "dense", 8, 4))
+VARIANTS = (("simple_1_1", "simple", 1, 1), ("simple_5_1", "simple", 5, 1),
+            ("dense_5_1", "dense", 5, 1), ("dense_9_4", "dense", 9, 4))
 SIMPLE_PROMPT = (
     "Describe the visible content in the provided sampled video frame or frames. "
     "State the people, objects, actions, spatial relations, and visible state changes. "

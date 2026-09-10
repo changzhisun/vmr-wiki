@@ -100,6 +100,7 @@ class VLMClient:
 
     def caption(self, images: Path | Sequence[Path], *,
                 timestamps: Sequence[float] | None = None,
+                target_timestamps: Sequence[float] | None = None,
                 correction: str | None = None) -> str:
         cfg = self.config
         self._local.requests = []
@@ -121,6 +122,24 @@ class VLMClient:
             prompt = prompt.replace(placeholder, ", ".join(
                 f"{timestamp}" for timestamp in timeline
             ))
+            if target_timestamps is not None:
+                targets = list(target_timestamps)
+                if not targets or any(target not in timeline for target in targets):
+                    raise HarnessError("VLM target timeline must be a nonempty subset of timestamps")
+                prompt += (
+                    "\n\nCentered target region: " + ", ".join(str(value) for value in targets) + ". "
+                    "Focus the answer on visible states, actions, and transitions in this target region. "
+                    "The other frames are temporal context; do not separately caption unrelated "
+                    "context-only content. An event may still use any listed window timestamp when "
+                    "it genuinely crosses a target boundary. Every event object must include kind, "
+                    "set to state, action, or transition. Use state for a stable visible condition, "
+                    "action for ongoing motion or interaction, and transition for an entry, exit, "
+                    "start, stop, or cut. Use person instead of guessing gender or identity when "
+                    "unclear. Ignore timestamps, channel labels, watermarks, and other overlay text "
+                    "unless a change in the video feed itself is meaningful. A segment with equal "
+                    "start and end is observed at one sampled instant; it is not known to have zero "
+                    "real-world duration."
+                )
             if self.timestamp_mode == "frame_index":
                 prompt += (
                     "\nBoundary coordinate contract: the listed values are zero-based "
@@ -128,6 +147,8 @@ class VLMClient:
                 )
         elif placeholder in prompt:
             raise HarnessError("VLM timestamp prompt requires frame timestamps")
+        elif target_timestamps is not None:
+            raise HarnessError("VLM target timestamps require frame timestamps")
         elif len(paths) > 1:
             prompt += (
                 "\nThe images are sampled video frames in chronological order. "

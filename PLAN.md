@@ -2,7 +2,7 @@
 
 当前版本包含通用 Dataset Split 支持；Split 是 Adapter 定义的 opaque string，Harness 仅验证、筛选和记录。旧的无 split manifest 必须重新运行 Adapter。
 
-增量实现：Dense 时间坐标改为显式秒数或闭区间帧索引，处理规则版本进入内容哈希；Ingest 支持带完整性校验的帧/窗口 checkpoint、私有 caption 审计、耗时和 token 遥测，以及有容量上限的图像编码缓存。新增固定子集的四组 caption 对照实验入口与 Python 3.10/3.12 CI。对照实验真实模型结果需另行运行；事件语义合并和批量 FFmpeg 解码尚未实现，原始重叠事件及逐点 seek 语义保持不变。
+增量实现：Dense 时间坐标使用显式秒数或闭区间帧索引；默认 5/1 窗口通过软约束重点描述中心目标区间，首尾覆盖视频边界，不再生成递减短尾窗。段落区分 state/action/transition，Query Wiki 使用 30 秒分组的紧凑单行时间线，仅去重完全相同的段落而不扩展时间范围；跨分组段落在每个相交分组中显示，原始窗口事件完整保留。处理规则版本进入内容哈希；Ingest 支持带完整性校验的 checkpoint、私有 caption 审计、耗时/token 遥测和有界图像编码缓存。另有固定子集对照实验入口与 Python 3.10/3.12 CI。语义相似事件合并和批量 FFmpeg 解码尚未实现。
 
 ## 1. 项目目标
 
@@ -388,6 +388,8 @@ python harness/ingest_all.py \
 生成 wiki.md
 ```
 
+视频不足一个 window 时只生成一个短窗口；否则只生成完整窗口，stride 不能恰好到达末尾时补一个向结尾对齐的完整窗口。该规则同时适用于 Simple 和 Dense。
+
 所有视频必须使用相同：
 
 - sampling interval；
@@ -429,15 +431,15 @@ Simple 多图模式下每一行表示一个时间窗口：
 {"window_id":"w000001","start_timestamp":0.0,"end_timestamp":10.0,"frames":[{"frame_id":"f000001","timestamp":0.0,"frame":"frames/000001.jpg"},{"frame_id":"f000002","timestamp":5.0,"frame":"frames/000002.jpg"},{"frame_id":"f000003","timestamp":10.0,"frame":"frames/000003.jpg"}],"caption":"A man approaches and opens a refrigerator."}
 ```
 
-最后一个窗口可以少于配置的 window 帧数；frames 始终按时间顺序排列。
+只有整个视频短于 window 时窗口才会少于配置帧数；其余尾部使用向结尾对齐的完整窗口。frames 始终按时间顺序排列。
 
 Dense 模式下每一行保存一个时间窗口及其中经过严格校验的原子事件：
 
 ```json
-{"window_id":"w000001","start_timestamp":0.0,"end_timestamp":3.0,"frames":[{"frame_id":"f000001","timestamp":0.0,"frame":"frames/000001.jpg"},{"frame_id":"f000002","timestamp":1.0,"frame":"frames/000002.jpg"},{"frame_id":"f000003","timestamp":2.0,"frame":"frames/000003.jpg"},{"frame_id":"f000004","timestamp":3.0,"frame":"frames/000004.jpg"}],"events":[{"start":0.0,"end":1.0,"caption":"A man approaches a refrigerator."},{"start":2.0,"end":3.0,"caption":"The man opens the refrigerator door."}]}
+{"window_id":"w000001","start_timestamp":0.0,"end_timestamp":4.0,"target_start_timestamp":0.0,"target_end_timestamp":3.0,"frames":[{"frame_id":"f000001","timestamp":0.0,"frame":"frames/000001.jpg"},{"frame_id":"f000002","timestamp":1.0,"frame":"frames/000002.jpg"},{"frame_id":"f000003","timestamp":2.0,"frame":"frames/000003.jpg"},{"frame_id":"f000004","timestamp":3.0,"frame":"frames/000004.jpg"},{"frame_id":"f000005","timestamp":4.0,"frame":"frames/000005.jpg"}],"events":[{"start":0.0,"end":1.0,"kind":"state","caption":"A person stands near a refrigerator."},{"start":2.0,"end":3.0,"kind":"transition","caption":"The person opens the refrigerator door."}]}
 ```
 
-事件时间必须来自当前窗口的 frame timeline，并按时间顺序排列；重叠窗口的原始事件不做语义合并。
+事件时间必须来自当前窗口的 frame timeline，并按时间顺序排列；中心 target 是 Prompt 侧重点而非解析边界。重叠窗口的原始事件不做语义合并。
 
 ### 7.2 wiki.md
 
@@ -483,6 +485,19 @@ MVP 不要求构造：
 
 Wiki 就是一个固定格式的 timestamped visual timeline。
 
+Dense 模式的 Query Wiki 使用更紧凑的分组时间线；窗口与帧路径仍在 `frames.jsonl`：
+
+```markdown
+## Timeline
+
+### Segments overlapping 0s–30s
+
+- `0.0s–1.0s` **state** — A person stands near a refrigerator.
+- `2.0s–3.0s` **transition** — The person opens the refrigerator door.
+```
+
+完全相同的时间范围、类型和规范化 Caption 仅显示一次，不将相邻重复 Caption 的时间范围取并集。跨越 30 秒边界的段落会在每个相交分组中重复显示。
+
 ---
 
 ## 8. Wiki Freeze
@@ -493,6 +508,7 @@ Wiki 的物理布局固定为：
 wiki/<dataset>/videos/<video_id>/
 ├── wiki.md
 ├── frames.jsonl
+├── caption_audit.jsonl
 ├── frames/
 ├── ingest.json
 └── frozen.json

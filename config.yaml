@@ -17,8 +17,8 @@ ingest:
   # One coordinate system per response. frame_index uses inclusive 0-based indices.
   dense_timestamp_mode: absolute_seconds
   # Number of sampled frames per VLM request, and sampled frames advanced per request.
-  # The default 4/1 gives each sampled second a four-frame overlapping context window.
-  caption_window_frames: 4
+  # The default 5/1 gives each target region two earlier and later context frames.
+  caption_window_frames: 5
   caption_stride_frames: 1
   # Extra attempts allowed when a dense answer breaks the window contract; the
   # rejection is sent back to the captioner. 0 fails the video immediately.
@@ -43,13 +43,14 @@ ingest:
 
       {{FRAME_TIMESTAMPS}}
 
-      That list is the complete set of values you may use. This window ends at
-      the last listed timestamp; later frames belong to other windows.
+      That list is the complete set of values you may use. The harness will
+      separately identify the centered target region and append the fixed
+      schema guardrails used for every configuration.
 
       Analyze only the visible evidence in these sampled frames and divide the
-      window into meaningful visual events.
+      relevant activity into meaningful visual segments.
 
-      For each event:
+      For each segment:
 
       - `start` and `end` must exactly match timestamps from the provided timeline;
       - write one concise, factual caption;
@@ -57,11 +58,12 @@ ingest:
         and visible state changes;
       - prefer atomic events and split when the main visible action changes;
       - do not infer actions before, after, or between the sampled frames;
-      - do not describe the same event more than once.
+      - do not describe the same segment more than once;
 
       Return exactly one JSON object with no Markdown or additional text. The
       object must contain only an `events` array. Each event object must contain
-      exactly numeric `start`, numeric `end`, and string `caption` fields.
+      exactly numeric `start`, numeric `end`, string `kind`, and string `caption`
+      fields.
 
       Requirements:
 
@@ -72,7 +74,7 @@ ingest:
         an action clearly continues;
       - captions must be nonempty factual strings;
       - do not merge clearly different actions;
-      - if no meaningful event is visible, return {"events":[]}.
+      - if no meaningful segment is visible, return {"events":[]}.
 
 query:
   agent: codex

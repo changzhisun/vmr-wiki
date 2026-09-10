@@ -126,7 +126,7 @@ _VLM_CONTENT_KEYS = frozenset({"model", "prompt", "temperature", "max_tokens"})
 
 
 def _ingest_content_value(ingest: dict, key: str):
-    if key in ("dense_timestamp_mode", "caption_processing_version") and ingest.get("caption_mode", "simple") == "simple":
+    if key == "dense_timestamp_mode" and ingest.get("caption_mode", "simple") == "simple":
         return None
     if key in _INGEST_CONTENT_DEFAULTS:
         return ingest.get(key, _INGEST_CONTENT_DEFAULTS[key])

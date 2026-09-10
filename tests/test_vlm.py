@@ -74,6 +74,40 @@ def test_dense_prompt_injects_frame_timestamps(cfg, tmp_path, monkeypatch):
         client.caption(images, timestamps=[0.0])
 
 
+def test_dense_prompt_marks_soft_center_target_and_schema(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    default_prompt = cfg["ingest"]["vlm"]["prompt"]
+    assert "guessing gender" not in default_prompt
+    assert "watermarks" not in default_prompt
+    assert "zero real-world duration" not in default_prompt
+    cfg["ingest"]["vlm"]["prompt"] = "Timeline: {{FRAME_TIMESTAMPS}}"
+    images = [tmp_path / f"{index}.jpg" for index in range(5)]
+    for image in images:
+        image.write_bytes(b"image")
+    seen = []
+
+    def request(req, timeout):
+        seen.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"events":[]}'}}]
+        }).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", request)
+    client = VLMClient(cfg["ingest"]["vlm"])
+    client.caption(images, timestamps=[0, 1, 2, 3, 4], target_timestamps=[2, 3])
+    prompt = seen[0]["messages"][0]["content"][0]["text"]
+    assert "Centered target region: 2, 3" in prompt
+    assert "may still use any listed window timestamp" in prompt
+    assert "state, action, or transition" in prompt
+    assert "Use state for a stable visible condition" in prompt
+    assert "instead of guessing gender" in prompt
+    assert "overlay text" in prompt
+    with pytest.raises(HarnessError, match="nonempty subset"):
+        client.caption(images, timestamps=[0, 1, 2, 3, 4], target_timestamps=[])
+    with pytest.raises(HarnessError, match="requires frame timestamps"):
+        client.caption(images, target_timestamps=[2])
+
+
 def test_rejection_is_fed_back_to_the_captioner(cfg, tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
     cfg["ingest"]["vlm"]["prompt"] = "Timeline:\n{{FRAME_TIMESTAMPS}}\nReturn JSON."

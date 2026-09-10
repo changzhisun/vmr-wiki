@@ -31,12 +31,12 @@ class Captioner:
         self.calls = []
         self.fail_at = fail_at
 
-    def caption(self, images, *, timestamps, correction=None):
+    def caption(self, images, *, timestamps, target_timestamps=None, correction=None):
         self.calls.append(timestamps)
         if timestamps[0] == self.fail_at:
             raise HarnessError("temporary server failure")
         return json.dumps({"events": [{"start": timestamps[0], "end": timestamps[-1],
-                                      "caption": "A person walks."}]})
+                                      "kind": "action", "caption": "A person walks."}]})
 
 
 def test_resume_reuses_frames_and_completed_windows_and_preserves_audit(recovery):
@@ -47,11 +47,11 @@ def test_resume_reuses_frames_and_completed_windows_and_preserves_audit(recovery
     assert extracted == [0.0, 1.0, 2.0]
     resumed = Captioner()
     metadata = ingest_video(video, "clip", output, cfg, captioner=resumed)
-    assert resumed.calls == [[1.0, 2.0], [2.0]]
+    assert resumed.calls == [[1.0, 2.0]]
     assert extracted == [0.0, 1.0, 2.0]
     assert metadata["telemetry"]["reused_windows"] == 1
     assert metadata["telemetry"]["reused_frames"] == 3
-    assert metadata["telemetry"]["caption_attempts"] == 4
+    assert metadata["telemetry"]["caption_attempts"] == 3
     assert metadata["telemetry"]["rejected_attempts"] == 1
     audit = read_jsonl(output / "caption_audit.jsonl")
     assert len(audit[1]["attempts"]) == 2
@@ -73,7 +73,7 @@ def test_checkpoint_identity_prevents_stale_reuse(recovery, change):
         cfg["ingest"]["vlm"]["prompt"] += " Extra instruction."
     resumed = Captioner()
     ingest_video(video, "clip", output, cfg, captioner=resumed)
-    assert len(resumed.calls) == 3
+    assert len(resumed.calls) == 2
     assert len(extracted) == 6
 
 
@@ -129,7 +129,7 @@ def test_resume_after_interrupted_or_unexpected_caption_error(recovery, mode, er
     assert not output.exists()
     metadata = ingest_video(video, "clip", output, cfg, captioner=ResumedCaptioner())
     assert metadata["telemetry"]["rejected_attempts"] == 1
-    assert metadata["telemetry"]["caption_attempts"] == 4
+    assert metadata["telemetry"]["caption_attempts"] == 3
     assert metadata["telemetry"]["reused_frames"] == 3
     assert extracted == [0.0, 1.0, 2.0]
     attempt = read_jsonl(output / "caption_audit.jsonl")[0]["attempts"][0]
@@ -152,7 +152,7 @@ def test_frame_index_mode_records_conversion(recovery):
     cfg["ingest"]["dense_timestamp_mode"] = "frame_index"
     captioner = Captioner()
     ingest_video(video, "clip", output, cfg, captioner=captioner)
-    assert captioner.calls == [[0, 1], [0, 1], [0]]
+    assert captioner.calls == [[0, 1], [0, 1]]
     rows = read_jsonl(output / "frames.jsonl")
     assert rows[1]["events"][0]["start"] == 1.0
     assert rows[1]["events"][0]["end"] == 2.0

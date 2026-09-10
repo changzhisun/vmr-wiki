@@ -89,12 +89,53 @@ def sample_times(duration: float, interval: float) -> list[float]:
 def caption_windows(frames: list[dict], window_frames: int, stride_frames: int) -> list[list[dict]]:
     """Group sampled frames into chronological, possibly overlapping windows.
 
-    The final window may contain fewer frames than ``window_frames``. A stride
-    larger than the window intentionally leaves unsampled gaps.
+    Emit one short window only when the whole video is shorter than the
+    configured size. Otherwise use full windows and, when necessary, add one
+    full window anchored at the end so no redundant shrinking tail is sent to
+    the captioner. A stride larger than the window intentionally leaves gaps.
     """
     window = positive_int(window_frames, "caption_window_frames")
     stride = positive_int(stride_frames, "caption_stride_frames")
-    return [frames[start:start + window] for start in range(0, len(frames), stride)]
+    if not frames:
+        return []
+    if len(frames) <= window:
+        return [frames]
+    last_start = len(frames) - window
+    starts = list(range(0, last_start + 1, stride))
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    return [frames[start:start + window] for start in starts]
+
+
+def dense_target_timestamps(windows: list[list[dict]]) -> list[list[float]]:
+    """Assign every dense window a central, non-repeated target region.
+
+    Adjacent regions share only their boundary sample so an action can span
+    the transition. The first and last windows also own the video boundaries,
+    where symmetric context cannot exist.
+    """
+    if not windows:
+        return []
+    if all(len(window) == 1 for window in windows):
+        return [[window[0]["timestamp"]] for window in windows]
+    centers = [(len(window) - 1) // 2 for window in windows]
+    targets = []
+    for index, (window, center) in enumerate(zip(windows, centers)):
+        start = 0 if index == 0 else center
+        if index + 1 == len(windows):
+            end = len(window) - 1
+        else:
+            next_timestamp = windows[index + 1][centers[index + 1]]["timestamp"]
+            matches = [i for i, frame in enumerate(window)
+                       if frame["timestamp"] == next_timestamp]
+            if not matches:
+                raise HarnessError(
+                    "Dense stride is too large for centered target regions; "
+                    "use a smaller stride or larger caption window"
+                )
+            end = matches[0]
+        targets.append([frame["timestamp"] for frame in window[start:end + 1]])
+    return targets
 
 
 # Whole-response Markdown fence only. Prose around a fence, or a fence in the
@@ -163,7 +204,8 @@ def parse_dense_events(text: str, timestamps: list[float],
     the sampled frames. A surrounding Markdown code fence is discarded.
     Extra top-level keys and a bare events list are accepted. Frame-index mode
     uses zero-based inclusive indices for both boundaries. No exclusive ends
-    or mixed coordinate systems are inferred.
+    or mixed coordinate systems are inferred. Centered targets are a prompt
+    focus, not a parser restriction: an event may span context timestamps.
     """
     payload = parse_json(unwrap_markdown_json_fence(text))
     events = _dense_events_payload(payload)
@@ -172,9 +214,9 @@ def parse_dense_events(text: str, timestamps: list[float],
     normalized = []
     previous_start: float | None = None
     for index, event in enumerate(events, 1):
-        if not isinstance(event, dict) or set(event) != {"start", "end", "caption"}:
+        if not isinstance(event, dict) or set(event) != {"start", "end", "kind", "caption"}:
             raise HarnessError(
-                f"Dense caption event {index} must contain only start, end, and caption"
+                f"Dense caption event {index} must contain only start, end, kind, and caption"
             )
         start = resolve_window_timestamp(
             number(event["start"], f"dense event {index} start"), timestamps, timestamp_mode
@@ -192,9 +234,16 @@ def parse_dense_events(text: str, timestamps: list[float],
         if previous_start is not None and start < previous_start:
             raise HarnessError("Dense caption events must be in chronological order")
         previous_start = start
+        raw_kind = event["kind"]
+        kind = raw_kind.strip().lower() if isinstance(raw_kind, str) else None
+        if kind not in ("state", "action", "transition"):
+            raise HarnessError(
+                f"Dense caption event {index} kind must be state, action, or transition"
+            )
         normalized.append({
             "start": start,
             "end": end,
+            "kind": kind,
             "caption": nonempty(event["caption"], f"dense event {index} caption").strip(),
         })
     return normalized
@@ -202,7 +251,8 @@ def parse_dense_events(text: str, timestamps: list[float],
 
 def dense_events(client, images: list[Path], timestamps: list[float], max_repairs: int,
                  *, cancel_event: threading.Event | None = None,
-                 timestamp_mode: str = "absolute_seconds", record=None) -> list[dict]:
+                 timestamp_mode: str = "absolute_seconds",
+                 target_timestamps: list[float] | None = None, record=None) -> list[dict]:
     """Caption one window, re-asking a bounded number of times on a violation.
 
     A rejected dense answer is usually the captioner ignoring the window
@@ -217,10 +267,15 @@ def dense_events(client, images: list[Path], timestamps: list[float], max_repair
         repair = {} if correction is None else {"correction": correction}
         # The model sees only values from the selected coordinate system.
         timeline = list(range(len(timestamps))) if timestamp_mode == "frame_index" else timestamps
+        targets = target_timestamps if target_timestamps is not None else timestamps
+        target_timeline = ([timestamps.index(stamp) for stamp in targets]
+                           if timestamp_mode == "frame_index" else targets)
         started = time.monotonic()
-        attempt = {"correction": correction, "timestamp_mode": timestamp_mode}
+        attempt = {"correction": correction, "timestamp_mode": timestamp_mode,
+                   "target_timestamps": targets}
         try:
-            response = client.caption(images, timestamps=timeline, **repair)
+            response = client.caption(images, timestamps=timeline,
+                                      target_timestamps=target_timeline, **repair)
             attempt["raw_response"] = response
             events = parse_dense_events(response, timestamps, timestamp_mode)
             attempt.update(status="success", normalized_events=events)
@@ -260,6 +315,30 @@ def extract_frame(video: Path, timestamp: float, output: Path, cfg: dict) -> Non
         raise HarnessError(f"No frame decoded at {timestamp}s")
 
 
+def compact_dense_events(entries: list[dict]) -> list[dict]:
+    """Remove exact duplicate dense segments for the query-facing Wiki.
+
+    Raw window answers remain untouched in frames.jsonl and caption_audit.jsonl.
+    Never union event ranges: even repeated captions in overlapping windows may
+    describe separate observations, and widening them would reduce retrieval
+    precision. Caption comparison ignores only case and whitespace.
+    """
+    unique = {}
+    for entry in entries:
+        for event in entry["events"]:
+            current = dict(event)
+            key = (current["start"], current["end"], current["kind"],
+                   " ".join(current["caption"].lower().split()))
+            unique.setdefault(key, current)
+    return sorted(unique.values(), key=lambda event: (
+        event["start"], event["end"], event["kind"], event["caption"]
+    ))
+
+
+def _time_range(start: float, end: float) -> str:
+    return f"{start}s" if start == end else f"{start}s–{end}s"
+
+
 def render_wiki(duration: float, interval: float, entries: list[dict], *,
                 sampled_frame_count: int | None = None, window_frames: int = 1,
                 stride_frames: int = 1, caption_mode: str = "simple") -> str:
@@ -268,13 +347,17 @@ def render_wiki(duration: float, interval: float, entries: list[dict], *,
     lines = ["# Video", "", "## Metadata", "",
              f"- Duration: {duration} seconds", f"- Sampling interval: {interval} seconds"]
     if caption_mode == "dense":
+        compact_events = compact_dense_events(entries)
         lines += [
             "- Caption mode: dense",
             f"- Number of sampled frames: {sampled_frame_count}",
             f"- Number of caption windows: {len(entries)}",
             f"- Number of dense events: {sum(len(entry['events']) for entry in entries)}",
+            f"- Number of displayed segments: {len(compact_events)}",
             f"- Caption window: {window_frames} sampled frames",
             f"- Caption stride: {stride_frames} sampled frames",
+            "- Event boundaries are sampled observations, not exact action boundaries.",
+            "- Detailed context windows and frame paths: `frames.jsonl`.",
         ]
     elif window_frames == 1:
         lines += [f"- Number of frames: {len(entries)}"]
@@ -286,27 +369,27 @@ def render_wiki(duration: float, interval: float, entries: list[dict], *,
             f"- Caption stride: {stride_frames} sampled frames",
         ]
     lines += ["", "## Timeline", ""]
-    for entry in entries:
-        if caption_mode == "dense":
-            start, end = entry["start_timestamp"], entry["end_timestamp"]
-            window_range = f"{start}s" if start == end else f"{start}s–{end}s"
-            lines += [f"### Window {window_range}", ""]
-            if entry["events"]:
-                for event in entry["events"]:
-                    event_start, event_end = event["start"], event["end"]
-                    event_range = (
-                        f"{event_start}s" if event_start == event_end
-                        else f"{event_start}s–{event_end}s"
-                    )
-                    lines += [f"#### Event {event_range}", "", event["caption"], ""]
-            else:
-                lines += ["No meaningful visual event.", ""]
-            lines.append("Frames:")
+    if caption_mode == "dense":
+        buckets = {}
+        for event in compact_events:
+            first_bucket = int(event["start"] // 30) * 30
+            last_bucket = int(event["end"] // 30) * 30
+            for bucket in range(first_bucket, last_bucket + 1, 30):
+                buckets.setdefault(bucket, []).append(event)
+        for bucket, events in sorted(buckets.items()):
             lines += [
-                f"- {frame['timestamp']}s: `{frame['frame']}`" for frame in entry["frames"]
+                f"### Segments overlapping {bucket}s–{min(bucket + 30, duration)}s", "",
             ]
-            lines.append("")
-            continue
+            for event in events:
+                lines.append(
+                    f"- `{_time_range(event['start'], event['end'])}` "
+                    f"**{event['kind']}** — {event['caption']}"
+                )
+        if not buckets:
+            lines.append("No meaningful visual segment was identified.")
+        lines.append("")
+        return "\n".join(lines)
+    for entry in entries:
         if "frames" not in entry:
             lines += [f"### {entry['timestamp']}s", "", entry["caption"], "",
                       f"Frame: `{entry['frame']}`", ""]
@@ -358,7 +441,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         duration, video_stream_duration = probe_durations(video)
         ffmpeg_version = media_command(["ffmpeg", "-version"]).splitlines()[0]
         checkpoint = IngestCheckpoint(output, {
-            "version": 2, "output": str(output.resolve()), "video_id": video_id,
+            "version": 4, "output": str(output.resolve()), "video_id": video_id,
             "source_sha256": source_hash, "content_hash": content_hash,
             "ffmpeg_version": ffmpeg_version,
             "duration": duration, "video_stream_duration": video_stream_duration,
@@ -380,6 +463,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         stride_frames = cfg["ingest"]["caption_stride_frames"]
         caption_mode = cfg["ingest"]["caption_mode"]
         windows = caption_windows(sampled_frames, window_frames, stride_frames)
+        targets = dense_target_timestamps(windows) if caption_mode == "dense" else [None] * len(windows)
         used_ids = {frame["frame_id"] for window in windows for frame in window}
         extraction_sec = 0.0
         extraction_total_sec = 0.0
@@ -404,7 +488,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
 
         entries = []
         audit = []
-        for window_index, window in enumerate(windows, 1):
+        for window_index, (window, target_timestamps) in enumerate(zip(windows, targets), 1):
             _check_cancelled(cancel_event)
             window_id = f"w{window_index:06d}"
             checkpoint_name = f"windows/{window_id}.json"
@@ -432,6 +516,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
                     client, images, timestamps, cfg["ingest"]["caption_max_repairs"],
                     cancel_event=cancel_event,
                     timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"),
+                    target_timestamps=target_timestamps,
                     record=record,
                 )
                 _check_cancelled(cancel_event)
@@ -439,6 +524,8 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
                     "window_id": f"w{window_index:06d}",
                     "start_timestamp": window[0]["timestamp"],
                     "end_timestamp": window[-1]["timestamp"],
+                    "target_start_timestamp": target_timestamps[0],
+                    "target_end_timestamp": target_timestamps[-1],
                     "frames": window,
                     "events": events,
                 })
@@ -487,7 +574,7 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
                     # auth, timeouts, and retries remain provenance metadata.
                     "ingest_config_hash": content_hash, "created_at": now(),
                     "ffmpeg_version": ffmpeg_version,
-                    "caption_processing_version": cfg["ingest"].get("caption_processing_version", 2),
+                    "caption_processing_version": cfg["ingest"].get("caption_processing_version", 4),
                     "telemetry": {"extraction_sec_this_run": extraction_sec,
                                   "extraction_sec": extraction_total_sec,
                                   "caption_sec": sum(a["elapsed_sec"] for a in attempts),
