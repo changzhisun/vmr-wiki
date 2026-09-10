@@ -448,7 +448,8 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
         })
         _check_cancelled(cancel_event)
         client = captioner if captioner is not None else VLMClient(
-            cfg["ingest"]["vlm"], timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"))
+            cfg["ingest"]["vlm"], timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"),
+            cancel_event=cancel_event)
         staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
         (staging / "frames").mkdir()
         if cfg["ingest"]["caption_mode"] == "bidirectional":

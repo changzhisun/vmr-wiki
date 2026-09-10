@@ -179,6 +179,12 @@ wiki.md frames.jsonl frames/ ingest.json frozen.json
 
 节点使用 `granularity` 与 `type`，type 可以是 `chapter`、`scene`、`event`、`action`、`state_change`、`transition`、`dialogue` 或 `other`。`confidence` 是分别记录 semantic、boundary、hierarchy 的 high/medium/low 标签；旧版数字 confidence 只作为 legacy 信息，不转换成 high。节点允许 overlap/gap，主 parent 关系无环；一个 observation 可以支持多个节点。
 
+异常处理分三层：网络错误、空响应及损坏的 API JSON 最多按 `vlm.max_retries` 重试；回答内的 JSON 语法错误交给同一 VLM 纯文本修复；字段类型、时间区间、关系等不合要求时，回传原因重新生成。双向流程对 token 截断也会要求重新返回完整且简洁的结构，不接受截断片段。每个逻辑请求最多 `1 + caption_max_repairs` 次生成及 `caption_max_repairs` 次格式修复，传输层重试另计。401/403/404、模型拒绝及耗尽传输重试不会再触发语义层重试。重试、修复、失败和 usage 均保留审计；仍不合法时保留 checkpoint，禁止发布不完整 Wiki。语义不确定但结构合法的内容沿用 unresolved 证据候选。
+
+`--jobs` 控制并行视频数，`ingest.vlm.max_concurrent_requests`（默认 4）独立限制同一进程内、同一 endpoint 的在途 API 请求，覆盖图像、纯文本、修复和重试。429/503 触发共享冷却，重试采用指数退避与随机抖动，并解析数值或日期形式的 `Retry-After`。共享冷却最多持续当前客户端的 `max_retry_delay_sec`，超长值保留在错误与审计中；当前请求放弃自动重试，其他客户端只等待有上限的冷却。等待超过 `queue_timeout_sec`（默认 300 秒），或服务端要求的重试延迟超过 `max_retry_delay_sec`（默认 60 秒），会明确失败，供稍后恢复；等待配额和退避期间响应取消信号。在途 HTTP 调用仍受 `timeout_sec` 约束。多进程或多机器运行时需自行分配各进程并发配额，该限制不覆盖其他进程。
+
+串行和并行批处理会继续处理偶发失败后的其他视频，最后汇总失败并返回非零状态。缺少认证配置、保留的占位模型名以及 HTTP 401/403/404 会立即熔断；其他错误达到 `ingest.consecutive_failure_limit`（默认连续 3 个失败视频）时也停止批处理，成功的视频会重置该计数。并行模式最多提交 `--jobs` 个待处理任务，熔断后停止提交、取消尚未开始的任务并等待运行中的任务退出；已完成产物可在下次运行时复用。失败清单写入 Wiki 数据集目录的 `.ingest-failures/<video_id>.json`，成功重跑后移除；正常取消不会新增失败记录，已有失败记录保留，它不进入 Query 工作区。重跑相同命令复用已完成窗口，空 observation 数组只有通过当前角色的校验才算成功；失败窗口不会标为 seen，也不会自动替换为空结果。
+
 ### 2.2 旧版层次化 Wiki
 
 1. 全片均匀采样最多 100 帧，请 VLM 预测覆盖全视频的 Chapter。
@@ -278,7 +284,7 @@ Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`�
 
 完整 Ingest 再次执行时只核验并复用，不重新 caption。处理中每个抽帧文件、已完成窗口和请求审计原子保存到 `wiki/<dataset>/.ingest-checkpoints/<video_id>/<identity_hash>/`。失败或正常 Ctrl-C 会清除发布用 staging，但保留 checkpoint；重新执行相同 Ingest 命令即可验证并复用已完成的帧和窗口。Checkpoint 身份包含源视频哈希、内容配置、媒体时长和 FFmpeg 版本，损坏记录会报错，身份不同的记录不会复用。成功发布后清理对应 checkpoint，其他身份的旧缓存保留。强制杀进程可能留下锁文件，必须确认没有活跃进程后才可手动移除该视频的锁；也可能重做尚未原子保存的调用，不保证 API 恰好调用一次。
 
-API 仅对临时网络错误、限流和服务端错误做有限重试，达到 token 上限的截断响应会直接失败。Dense 响应可以包在 Markdown JSON 围栏里，也兼容顶层事件数组和多余字段；事件字段不符、无序、时间越界、非采样时间点或围栏外有其它文字时，会回传拒绝原因，最多按 `caption_max_repairs` 重问当前窗口，仍不合法则失败。该修复预算按本次运行的窗口调用计算，历史失败审计保留。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
+API 对临时网络错误、限流、服务端错误、空响应及损坏的 API JSON 做有限重试。旧版 Simple / Dense / Hierarchical 对 token 截断直接失败；双向模式的修复策略见 2.1。Dense 响应可以包在 Markdown JSON 围栏里，也兼容顶层事件数组和多余字段；事件字段不符、无序、时间越界、非采样时间点或围栏外有其它文字时，会回传拒绝原因，最多按 `caption_max_repairs` 重问当前窗口，仍不合法则失败。该修复预算按本次运行的窗口调用计算，历史失败审计保留。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
 
 重叠窗口使用每个 VLM client 上限 32 MiB 的图像 Base64 LRU 缓存，减少重复读图和编码；不会减少模型实际接收的图像或 API token。FFmpeg 仍逐采样点 seek，暂不改变抽帧语义。`telemetry.extraction_sec` 汇总保留的成功抽帧耗时，`extraction_sec_this_run` 仅为本次新抽帧耗时；`caption_sec` 包括历史保留的 caption 尝试和重试等待，`reused_frames` / `reused_windows` 显示本次复用量。服务端不返回 usage 时无法推算 token，汇总报告显示 `null`。
 

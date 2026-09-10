@@ -11,6 +11,7 @@ paths:
   templates: templates
 
 ingest:
+  consecutive_failure_limit: 3  # Abort batch after this many consecutive failures; auth/config errors abort immediately.
   sample_interval_sec: 1.0
   # Bidirectional is the new default; simple/dense/hierarchical remain available for legacy experiments.
   caption_mode: bidirectional
@@ -34,6 +35,9 @@ ingest:
     max_tokens: 8192
     timeout_sec: 120
     max_retries: 3
+    max_concurrent_requests: 4  # Shared across videos, roles and retries in this process.
+    max_retry_delay_sec: 60     # Longer Retry-After fails safely for later resume.
+    queue_timeout_sec: 300     # Bounded wait for an API slot; cancellation-aware.
     prompt: |-
       Describe observable activities at the requested semantic level. Use concise,
       specific titles and summaries. Keep stable actor/object descriptions across

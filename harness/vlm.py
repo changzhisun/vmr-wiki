@@ -7,13 +7,15 @@ import os
 import re
 import time
 import threading
+import http.client
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from collections import OrderedDict
 from pathlib import Path
 
-from harness.common import HarnessError, nonempty
+from harness.common import HarnessError, nonempty, positive_int, number
+from harness.vlm_transport import FatalVLMError, ResponseRejected, check_cancelled, endpoint_gate, pause, retry_delay
 
 # OpenAI-compatible servers use "stop". Some Qwen/vLLM builds use eos/end_turn
 # or omit the field when the message is already complete.
@@ -36,14 +38,16 @@ def _visible_caption(text: str) -> str:
 
 
 def _choice_text(choice: dict) -> str:
+    if not isinstance(choice, dict):
+        raise TypeError("VLM choice")
     message = choice.get("message")
     if not isinstance(message, dict):
         raise TypeError("VLM message")
     content = message.get("content")
     if isinstance(content, list):
-        content = "".join(
-            part.get("text", "") if isinstance(part, dict) else str(part) for part in content
-        )
+        content = "".join(part["text"] for part in content
+                          if isinstance(part, dict) and isinstance(part.get("text"), str)
+                          and part.get("type") not in ("reasoning", "reasoning_content", "thinking"))
     if not isinstance(content, str):
         raise TypeError("VLM caption")
     return _visible_caption(content)
@@ -63,18 +67,23 @@ def _request_extras(model: str) -> tuple[str, dict]:
 
 
 class VLMClient:
-    def __init__(self, config: dict, *, timestamp_mode: str = "absolute_seconds"):
+    def __init__(self, config: dict, *, timestamp_mode: str = "absolute_seconds", cancel_event=None):
         self.config = config
         self.timestamp_mode = timestamp_mode
+        self.cancel_event = cancel_event
+        self.gate = endpoint_gate(config["base_url"], positive_int(config.get("max_concurrent_requests", 4),
+                                                                 "max_concurrent_requests"))
+        self.max_retry_delay = number(config.get("max_retry_delay_sec", 60), "max_retry_delay_sec", 0.001)
+        self.queue_timeout = number(config.get("queue_timeout_sec", 300), "queue_timeout_sec", 0.001)
         self._local = threading.local()
         self._images = OrderedDict()
         self._image_bytes = 0
         self._cache_lock = threading.Lock()
         self.key = os.environ.get(config["api_key_env"])
         if not self.key:
-            raise HarnessError(f"Set {config['api_key_env']} before ingest")
+            raise FatalVLMError(f"Set {config['api_key_env']} before ingest")
         if config["model"].startswith("REPLACE_"):
-            raise HarnessError("Configure an explicit VLM model before ingest")
+            raise FatalVLMError("Configure an explicit VLM model before ingest")
 
     @property
     def last_requests(self) -> list[dict]:
@@ -180,6 +189,8 @@ class VLMClient:
                 "image_url": {"url": image_url, "detail": "high"},
             })
         for attempt in range(cfg["max_retries"] + 1):
+            check_cancelled(self.cancel_event)
+            delay = retry_delay(attempt, self.max_retry_delay)
             payload = {
                 "model": cfg["model"], "temperature": cfg["temperature"],
                 "max_tokens": cfg["max_tokens"],
@@ -194,40 +205,68 @@ class VLMClient:
             started = time.monotonic()
             trace = {"attempt": attempt + 1, "image_count": len(paths)}
             try:
-                with urllib.request.urlopen(request, timeout=cfg["timeout_sec"]) as response:
-                    result = json.load(response)
+                with self.gate.slot(self.cancel_event, self.queue_timeout) as waited:
+                    trace["queue_wait_sec"] = waited
+                    try:
+                        with urllib.request.urlopen(request, timeout=cfg["timeout_sec"]) as response:
+                            result = json.load(response)
+                    except urllib.error.HTTPError as exc:
+                        if exc.code in (429, 503):
+                            delay = retry_delay(attempt, self.max_retry_delay, exc.headers.get("Retry-After") if exc.headers else None)
+                            trace["server_retry_delay_sec"] = delay
+                            trace["shared_cooldown_sec"] = self.gate.defer(delay, self.max_retry_delay)
+                        raise
+                if not isinstance(result, dict):
+                    raise TypeError("VLM response")
                 choice = result["choices"][0]
+                if not isinstance(choice, dict):
+                    raise TypeError("VLM choice")
                 finish_reason = choice.get("finish_reason")
-                text = _choice_text(choice)
-                trace.update(finish_reason=finish_reason, raw_response=text,
-                             status="success")
+                if finish_reason is not None and not isinstance(finish_reason, str):
+                    raise TypeError("VLM finish_reason")
+                trace["finish_reason"] = finish_reason
                 usage = result.get("usage")
                 trace["usage"] = {
                     key: value for key, value in (usage.items() if isinstance(usage, dict) else [])
                     if key in ("prompt_tokens", "completion_tokens", "total_tokens")
                     and type(value) is int and value >= 0
                 }
-                if finish_reason in _REFUSAL_REASONS or finish_reason == "length":
-                    raise HarnessError(
-                        f"VLM caption was truncated or refused (finish_reason={finish_reason!r})"
+                if finish_reason in _REFUSAL_REASONS:
+                    raise HarnessError(f"VLM caption was refused (finish_reason={finish_reason!r})")
+                if finish_reason == "length":
+                    message = choice.get("message")
+                    trace["raw_response"] = message.get("content") if isinstance(message, dict) else None
+                    raise ResponseRejected(
+                        f"VLM caption was truncated (finish_reason={finish_reason!r})"
                     )
                 if finish_reason not in _COMPLETE_REASONS:
                     raise HarnessError(
                         f"VLM caption did not complete (finish_reason={finish_reason!r})"
                     )
-                return nonempty(text, "VLM caption")
+                text = _choice_text(choice)
+                trace.update(raw_response=text, status="success")
+                if not text.strip():
+                    raise TypeError("Empty VLM answer")
+                return text
             except urllib.error.HTTPError as exc:
                 trace.update(status="http_error", http_status=exc.code)
+                exc.close()
                 # Do not log response bodies, request headers, or credentials.
+                if exc.code in (401, 403, 404):
+                    raise FatalVLMError(f"VLM request failed with HTTP {exc.code}; check shared credentials, endpoint and model") from None
+                if delay > self.max_retry_delay:
+                    raise HarnessError(f"Server Retry-After exceeds max_retry_delay_sec: requested {delay:g}s, "
+                                       f"limit {self.max_retry_delay:g}s; resume later") from None
                 if exc.code not in (408, 429, 500, 502, 503, 504) or attempt == cfg["max_retries"]:
                     raise HarnessError(f"VLM request failed with HTTP {exc.code}") from None
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
                 trace["status"] = "connection_error"
                 if attempt == cfg["max_retries"]:
                     raise HarnessError("VLM request failed: connection error or timeout") from None
-            except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            except (KeyError, IndexError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 trace["status"] = "invalid_response"
-                raise HarnessError("VLM returned an invalid caption response") from exc
+                if attempt == cfg["max_retries"]:
+                    raise HarnessError("VLM returned an invalid caption response after bounded retries") from exc
             except HarnessError:
                 trace["status"] = "rejected_response"
                 raise
@@ -236,5 +275,6 @@ class VLMClient:
                 self._local.requests.append(trace)
             if attempt == cfg["max_retries"]:
                 break
-            time.sleep(min(2 ** attempt, 10))
+            trace["retry_delay_sec"] = delay
+            pause(delay, self.cancel_event)
         raise AssertionError("Unreachable")

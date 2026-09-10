@@ -238,3 +238,107 @@ def test_legacy_confidence_is_not_promoted():
     assert adapted["granularity"] == 2 and adapted["type"] == "event"
     assert adapted["legacy_confidence"] == .99 and adapted["confidence"]["semantic"] == "low"
     assert old == {"level": "event", "confidence": .99}
+
+
+@pytest.mark.parametrize("broken", [
+    {"nodes": [{"start": 0, "end": 0}]},
+    {"nodes": [node(evidence=None)]},
+    {"nodes": [node(confidence={"semantic": [], "boundary": "low", "hierarchy": "low"})]},
+    {"nodes": [node(history=None)]},
+    {"nodes": [node(parent_id=[])]},
+])
+def test_schema_reask_recovers_bad_model_fields(prepared, broken):
+    cfg, _ = prepared
+    config(cfg)
+    class BadFields(BidirectionalVLM):
+        def __init__(self):
+            super().__init__()
+            self.bad_sent = False
+            self.corrected = False
+        def complete(self, prompt, images=()):
+            if not self.bad_sent:
+                self.bad_sent = True
+                return json.dumps(broken)
+            if "Your structured answer was rejected" in prompt:
+                self.corrected = True
+                prompt = prompt.split("\nYour structured answer was rejected", 1)[0]
+            return super().complete(prompt, images)
+    client = BadFields()
+    video, output = locations(cfg)
+    ingest_video(video, "video", output, cfg, captioner=client)
+    assert client.corrected
+    audits = read_jsonl(output / "caption_audit.jsonl")
+    assert any(a["kind"] == "schema_rejection" for row in audits for a in row["attempts"])
+
+
+def test_truncation_reasks_concisely_without_accepting_partial_json(prepared):
+    from harness.vlm_transport import ResponseRejected
+    cfg, _ = prepared
+    config(cfg)
+    class Truncated(BidirectionalVLM):
+        first = True
+        def complete(self, prompt, images=()):
+            if self.first:
+                self.first = False
+                raise ResponseRejected("finish_reason='length'")
+            if "Your structured answer was rejected" in prompt:
+                assert "complete concise JSON" in prompt
+                prompt = prompt.split("\nYour structured answer was rejected", 1)[0]
+            return super().complete(prompt, images)
+    video, output = locations(cfg)
+    ingest_video(video, "video", output, cfg, captioner=Truncated())
+    assert output.exists()
+
+
+def test_permanent_invalid_json_is_bounded_and_resumable(prepared):
+    cfg, _ = prepared
+    config(cfg)
+    class AlwaysBroken:
+        calls = 0
+        def complete(self, prompt, images=()):
+            self.calls += 1
+            return 'not JSON'
+    client = AlwaysBroken()
+    video, output = locations(cfg)
+    with pytest.raises(HarnessError, match="repair budget exhausted"):
+        ingest_video(video, "video", output, cfg, captioner=client)
+    repairs = cfg["ingest"]["caption_max_repairs"]
+    assert client.calls == 1 + 2 * repairs
+    assert not output.exists()
+    checkpoint_root = output.parent.parent / ".ingest-checkpoints"
+    assert list(checkpoint_root.rglob("*.json"))
+    ingest_video(video, "video", output, cfg, captioner=BidirectionalVLM())
+    assert output.exists()
+
+
+def test_format_repair_transport_failure_has_no_extra_semantic_retries(prepared):
+    cfg, _ = prepared
+    config(cfg)
+    class BrokenRepair:
+        calls = 0
+        def complete(self, prompt, images=()):
+            self.calls += 1
+            if self.calls == 1:
+                return 'broken JSON'
+            raise HarnessError("VLM request failed with HTTP 401")
+    client = BrokenRepair()
+    video, output = locations(cfg)
+    with pytest.raises(HarnessError, match="HTTP 401"):
+        ingest_video(video, "video", output, cfg, captioner=client)
+    assert client.calls == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize('bug', [AttributeError, IndexError])
+def test_parser_programming_errors_are_not_model_repairs(prepared, monkeypatch, bug):
+    cfg, _ = prepared
+    config(cfg)
+    def broken_parser(*args, **kwargs):
+        raise bug('parser bug')
+    monkeypatch.setattr('harness.bidirectional.BidirectionalBuilder.parse_nodes', broken_parser)
+    video, output = locations(cfg)
+    vlm = BidirectionalVLM()
+    with pytest.raises(bug, match='parser bug'):
+        ingest_video(video, 'video', output, cfg, captioner=vlm)
+    assert len(vlm.calls) == 1
+    assert not output.exists()

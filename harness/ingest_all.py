@@ -10,15 +10,16 @@ import argparse
 import logging
 import signal
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from harness.common import HarnessError, cli, identifier
+from harness.common import HarnessError, cli, identifier, now, positive_int, write_json
 from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_videos
 from harness.freeze import freeze_dataset
 from harness.ingest import ingest_video
 from harness.progress import ProgressBar
+from harness.vlm_transport import FatalVLMError, check_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,29 @@ def _setup_logging(bar: ProgressBar, verbose: bool = False) -> None:
     logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
+class _FailureCircuit:
+    def __init__(self, cfg):
+        self.limit = positive_int(cfg.get("ingest", {}).get("consecutive_failure_limit", 3),
+                                  "consecutive_failure_limit")
+        self.consecutive = 0
+
+    def success(self):
+        self.consecutive = 0
+
+    def failure(self, exc):
+        self.consecutive += 1
+        # RequestFailed preserves the transport cause through the repair layer.
+        cause, visited = exc, set()
+        while cause is not None and id(cause) not in visited:
+            visited.add(id(cause))
+            if isinstance(cause, FatalVLMError):
+                return f"Shared VLM configuration failure: {cause}"
+            cause = cause.__cause__
+        if self.consecutive >= self.limit:
+            return f"{self.consecutive} consecutive videos failed; last error: {exc}"
+        return None
+
+
 def _ingest_one(
     vid: str,
     video: dict,
@@ -73,14 +97,28 @@ def _ingest_one(
     Returns ``(metadata, was_existing)``. Raises ``HarnessError`` on failure;
     any partial output is cleaned up inside ``ingest_video``.
     """
+    check_cancelled(cancel_event)
     was_existing = output.exists()
     if was_existing:
         logger.info("%s: verifying existing ingest", vid)
     else:
         logger.info("%s: ingesting new video (%.1fs)", vid, video["duration"])
 
-    metadata = ingest_video(video_path, vid, output, cfg, captioner=captioner,
-                            cancel_event=cancel_event)
+    failure_path = output.parent.parent / ".ingest-failures" / f"{vid}.json"
+    try:
+        metadata = ingest_video(video_path, vid, output, cfg, captioner=captioner,
+                                cancel_event=cancel_event)
+    except (HarnessError, OSError) as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise  # An interrupted video is unfinished, not a new failure.
+        try:
+            write_json(failure_path, {"video_id": vid, "status": "failed", "error": str(exc),
+                                      "updated_at": now(), "output": str(output),
+                                      "checkpoint_policy": "completed requests retained; rerun the same configuration"})
+        except OSError:
+            logger.error("%s: could not persist failure report", vid)
+        raise
+    failure_path.unlink(missing_ok=True)
 
     if was_existing:
         logger.info("%s: verified OK (%.1fs)", vid, metadata["duration"])
@@ -97,11 +135,28 @@ def _run_sequential(
     cancel_event: threading.Event,
 ) -> list[dict]:
     results: list[dict] = []
+    failures = []
+    circuit = _FailureCircuit(cfg)
     for vid, video, path, output in tasks:
-        metadata, _ = _ingest_one(vid, video, path, output, cfg, captioner=captioner,
-                                  cancel_event=cancel_event)
-        results.append(metadata)
+        if cancel_event.is_set():
+            raise HarnessError("Ingest cancelled")
+        try:
+            metadata, _ = _ingest_one(vid, video, path, output, cfg, captioner=captioner,
+                                      cancel_event=cancel_event)
+            results.append(metadata)
+            circuit.success()
+        except (HarnessError, OSError) as exc:
+            failures.append((vid, str(exc)))
+            logger.error("%s: FAILED - %s", vid, exc)
+            reason = circuit.failure(exc)
+            if reason:
+                cancel_event.set()
+                _report_failures(failures, len(tasks))
+                raise HarnessError(f"Ingest circuit opened: {reason}; remaining videos not started") from exc
         bar.update()
+    if failures:
+        _report_failures(failures, len(tasks))
+        raise HarnessError(f"{len(failures)} of {len(tasks)} video(s) failed to ingest; first error: {failures[0][1]}")
     return results
 
 
@@ -117,36 +172,53 @@ def _run_parallel(
     failures: list[tuple[str, str]] = []
     recaptioned = 0
     verified = 0
+    circuit = _FailureCircuit(cfg)
 
     executor = ThreadPoolExecutor(max_workers=jobs)
     shut_down = False
     try:
-        # Results are written back by index so the return order matches the input
-        # order (same contract as the sequential path), regardless of completion order.
-        future_to_idx = {
-            executor.submit(_ingest_one, vid, video, path, output, cfg,
-                            captioner=captioner, cancel_event=cancel_event): idx
-            for idx, (vid, video, path, output) in enumerate(tasks)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            vid = tasks[idx][0]
-            try:
-                metadata, was_existing = future.result()
-                results[idx] = metadata
-                if was_existing:
-                    verified += 1
-                else:
-                    recaptioned += 1
-            except HarnessError as exc:
-                failures.append((vid, str(exc)))
-                logger.error("%s: FAILED - %s", vid, exc)
-            bar.update()
+        # Submit only one wave of at most jobs tasks. A fatal result must be
+        # observed before submitting more videos, rather than queueing the split.
+        future_to_idx, next_index = {}, 0
+        while future_to_idx or next_index < len(tasks):
+            check_cancelled(cancel_event)
+            while next_index < len(tasks) and len(future_to_idx) < jobs:
+                vid, video, path, output = tasks[next_index]
+                future = executor.submit(_ingest_one, vid, video, path, output, cfg,
+                                         captioner=captioner, cancel_event=cancel_event)
+                future_to_idx[future] = next_index
+                next_index += 1
+            completed, _ = wait(future_to_idx, return_when=FIRST_COMPLETED)
+            for future in completed:
+                idx = future_to_idx.pop(future)
+                vid = tasks[idx][0]
+                try:
+                    metadata, was_existing = future.result()
+                    results[idx] = metadata
+                    circuit.success()
+                    if was_existing:
+                        verified += 1
+                    else:
+                        recaptioned += 1
+                except (HarnessError, OSError) as exc:
+                    failures.append((vid, str(exc)))
+                    logger.error("%s: FAILED - %s", vid, exc)
+                    reason = circuit.failure(exc)
+                    if reason:
+                        cancel_event.set()
+                        _report_failures(failures, len(tasks))
+                        raise HarnessError(f"Ingest circuit opened: {reason}; remaining videos not started") from exc
+                bar.update()
     except KeyboardInterrupt:
         logger.warning("Interrupted by user; cancelling remaining work")
         cancel_event.set()
         # Queued futures are cancelled immediately. Running workers observe the
         # event between frame extraction/API calls and clean their staging dirs.
+        executor.shutdown(wait=True, cancel_futures=True)
+        shut_down = True
+        raise
+    except BaseException:
+        cancel_event.set()
         executor.shutdown(wait=True, cancel_futures=True)
         shut_down = True
         raise
@@ -197,9 +269,9 @@ def ingest_all(
 
     ``jobs`` controls how many videos are ingested concurrently. With more than
     one worker, per-video failures are collected and reported in a final
-    summary instead of aborting the whole run; a single ``HarnessError`` is
-    raised at the end if any video failed. With ``jobs=1``, the original
-    sequential, fail-fast behavior is preserved.
+    summary instead of aborting on an isolated video error. Sequential runs
+    use the same policy. Shared configuration errors or the configured streak
+    of failures open the circuit, stop new work and raise immediately.
 
     The optional ``captioner`` is shared across worker threads and therefore
     must be thread-safe.
@@ -263,7 +335,7 @@ def main() -> None:
         "--jobs",
         type=int,
         default=4,
-        help="Concurrent videos to ingest (default: 4). Use 1 for the original sequential, fail-fast behavior.",
+        help="Concurrent videos (default: 4); API concurrency is separately capped by vlm.max_concurrent_requests.",
     )
     parser.add_argument(
         "-v",

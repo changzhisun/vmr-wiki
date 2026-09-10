@@ -12,3 +12,4 @@ embeddings/
 runs/
 results/
 .env
+/tmp.yaml

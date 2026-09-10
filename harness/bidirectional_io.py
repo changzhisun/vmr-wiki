@@ -13,8 +13,13 @@ import time
 
 from harness.common import HarnessError, canonical, file_hash, object_hash, parse_json, read_json, write_json
 from harness.bidirectional_config import PIPELINE_VERSION
+from harness.vlm_transport import ResponseRejected
 
 LOG = logging.getLogger(__name__)
+
+
+class RequestFailed(HarnessError):
+    """Transport/refusal failure whose retry budget is owned by the client."""
 
 
 def windows(duration, length, overlap=0.0):
@@ -185,6 +190,15 @@ class RequestJournal:
 
     def request(self, role, payload, instruction, parser, *, frames=(), replicate=None):
         from harness.ingest import unwrap_markdown_json_fence
+        def validate(value):
+            try:
+                return parser(value)
+            except HarnessError:
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+                # Model-shaped field errors should re-enter the structured
+                # repair loop; I/O, SQLite and programming failures still fail.
+                raise HarnessError(f"Malformed structured response ({type(exc).__name__}): {exc}") from exc
         self.ensure_budget()
         self.check()
         self.count += 1
@@ -218,7 +232,7 @@ class RequestJournal:
         if saved is not None:
             if saved["identity"] != identity:
                 raise HarnessError("Request checkpoint identity changed")
-            result = parser(parse_json(saved["response"]))
+            result = validate(parse_json(saved["response"]))
             self.reused += 1
             self.shared += shared_hit
             if shared_hit:
@@ -239,34 +253,50 @@ class RequestJournal:
                     return raw
                 except BaseException as exc:
                     audit.update(status="failed", error=str(exc) if isinstance(exc, HarnessError) else type(exc).__name__)
+                    if isinstance(exc, HarnessError) and not isinstance(exc, ResponseRejected):
+                        raise RequestFailed(str(exc)) from exc
                     raise
                 finally:
                     audit.update(elapsed_sec=time.monotonic() - started,
                                  requests=getattr(self.client, "last_requests", []))
                     self.checkpoint.record_attempt(attempt_id, audit)
 
+            format_repairs = 0
             for attempt in range(repairs + 1):
-                raw = invoke(prompt + correction, [self.checkpoint.root / f["frame"] for f in frames],
-                             "initial" if attempt == 0 else "schema_reask")
-                for repair in range(repairs + 1):
-                    try:
-                        decoded = parse_json(unwrap_markdown_json_fence(raw))
-                        break
-                    except HarnessError:
-                        if repair == repairs:
-                            raise
-                        raw = invoke("Repair only JSON syntax in the following original answer. Preserve all "
-                                     "semantic claims, values and structure; add no facts. Return JSON only.\n" + raw,
-                                     [], "format_repair")
+                raw = ""
                 try:
-                    result = parser(decoded)
+                    raw = invoke(prompt + correction, [self.checkpoint.root / f["frame"] for f in frames],
+                                 "initial" if attempt == 0 else "schema_reask")
+                    while True:
+                        try:
+                            decoded = parse_json(unwrap_markdown_json_fence(raw))
+                            break
+                        except HarnessError as exc:
+                            self.checkpoint.record_attempt(attempt_id, {
+                                "kind": "format_rejection", "status": "failed", "error": str(exc),
+                                "elapsed_sec": 0, "requests": []})
+                            if format_repairs >= repairs:
+                                raise
+                            format_repairs += 1
+                            raw = invoke("Repair only JSON syntax in the following original answer. Preserve all "
+                                         "semantic claims, values and structure; add no facts. Return JSON only.\n" + raw,
+                                         [], "format_repair")
+                    result = validate(decoded)
                     break
+                except RequestFailed:
+                    raise
                 except HarnessError as exc:
+                    # Transport/auth/refusal errors must not receive a second
+                    # multiplicative retry budget in the semantic layer.
+                    if not raw and not isinstance(exc, ResponseRejected):
+                        raise
                     self.checkpoint.record_attempt(attempt_id, {"kind": "schema_rejection", "status": "failed",
                                                                "error": str(exc), "elapsed_sec": 0, "requests": []})
                     if attempt == repairs:
-                        raise
-                    correction = "\nYour structured answer was rejected: " + str(exc) + "\nCorrect the response."
+                        raise HarnessError(f"{role}: response repair budget exhausted; checkpoint retained: {exc}") from exc
+                    correction = ("\nYour structured answer was rejected: " + str(exc) +
+                                  "\nReturn a complete concise JSON object satisfying the schema; no prose. "
+                                  "Do not omit supported events or invent missing values.")
             saved = {"identity": identity, "response": canonical(decoded).decode()}
             self.checkpoint.write(name, saved)
             if shared_path is not None:

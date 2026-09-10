@@ -61,6 +61,8 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         for name in ("datasets", "wiki", "runs", "results", "templates"):
             cfg["paths"][name] = str((path.parent / nonempty(cfg["paths"][name], name)).resolve())
         ingest = cfg["ingest"]
+        ingest.setdefault("consecutive_failure_limit", 3)
+        positive_int(ingest["consecutive_failure_limit"], "ingest.consecutive_failure_limit")
         if number(ingest["sample_interval_sec"], "sample_interval_sec") <= 0:
             raise HarnessError("sample_interval_sec must be positive")
         ingest.setdefault("caption_mode", "simple")
@@ -105,6 +107,12 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         if not 2 <= positive_int(ingest["jpeg_quality"], "jpeg_quality") <= 31:
             raise HarnessError("jpeg_quality must be in [2, 31]")
         vlm = ingest["vlm"]
+        vlm.setdefault("max_concurrent_requests", 4)
+        vlm.setdefault("max_retry_delay_sec", 60)
+        vlm.setdefault("queue_timeout_sec", 300)
+        positive_int(vlm["max_concurrent_requests"], "vlm.max_concurrent_requests")
+        for key in ("max_retry_delay_sec", "queue_timeout_sec"):
+            number(vlm[key], "vlm." + key, 0.001)
         if vlm["provider"] != "openai-compatible":
             raise HarnessError("Supported VLM provider: openai-compatible")
         for key in ("model", "prompt", "base_url", "api_key_env"):

@@ -608,3 +608,95 @@ def test_parallel_interrupt_propagates_cancellation_and_joins_workers(monkeypatc
         _run_parallel(tasks, {}, None, 2, InterruptingBar(), cancelled)
     assert cancelled.is_set()
     assert worker_stopped.is_set()
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_batch_video_failure_does_not_skip_healthy_videos(cfg, tmp_path, monkeypatch, jobs):
+    from harness.ingest_all import _run_sequential
+    from harness.common import read_json
+    parent = tmp_path / "batch" / "videos"
+    tasks = [(vid, {"duration": 3}, tmp_path / f"{vid}.mp4", parent / vid) for vid in ("bad", "good")]
+    done = []
+    class Bar:
+        def update(self):
+            pass
+    def fake_ingest(path, vid, output, config, **kwargs):
+        if vid == "bad":
+            raise HarnessError("Invalid model response")
+        done.append(vid)
+        return {"duration": 3}
+    monkeypatch.setattr("harness.ingest_all.ingest_video", fake_ingest)
+    with pytest.raises(HarnessError, match="1 of 2 video"):
+        if jobs == 1:
+            _run_sequential(tasks, cfg, None, Bar(), threading.Event())
+        else:
+            _run_parallel(tasks, cfg, None, jobs, Bar(), threading.Event())
+    assert done == ["good"]
+    report = read_json(parent.parent / ".ingest-failures/bad.json")
+    assert report["status"] == "failed" and report["error"] == "Invalid model response"
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_fatal_configuration_stops_batch_before_more_submissions(cfg, tmp_path, monkeypatch, jobs):
+    from harness.ingest_all import _run_sequential
+    from harness.bidirectional_io import RequestFailed
+    from harness.vlm_transport import FatalVLMError
+    calls = []
+    stopped = threading.Event()
+    tasks = [(str(i), {"duration": 3}, tmp_path / f"{i}.mp4", tmp_path / f"out/{i}") for i in range(20)]
+    class Bar:
+        def update(self):
+            pass
+    def fake_ingest(path, vid, output, config, **kwargs):
+        calls.append(vid)
+        if vid != '0':
+            assert kwargs['cancel_event'].wait(2)
+            stopped.set()
+            raise HarnessError("VLM request cancelled")
+        try:
+            raise FatalVLMError("VLM request failed with HTTP 401")
+        except FatalVLMError as exc:
+            raise RequestFailed(str(exc)) from exc
+    monkeypatch.setattr("harness.ingest_all.ingest_video", fake_ingest)
+    cancel = threading.Event()
+    with pytest.raises(HarnessError, match="circuit opened.*HTTP 401"):
+        if jobs == 1:
+            _run_sequential(tasks, cfg, None, Bar(), cancel)
+        else:
+            _run_parallel(tasks, cfg, None, jobs, Bar(), cancel)
+    assert cancel.is_set() and len(calls) <= jobs
+    if len(calls) > 1:
+        assert stopped.is_set()
+    reports = list((tmp_path / '.ingest-failures').glob('*.json'))
+    assert [p.name for p in reports] == ['0.json']
+
+
+def test_consecutive_failure_circuit_resets_after_success(cfg, tmp_path, monkeypatch):
+    from harness.ingest_all import _run_sequential
+    cfg['ingest']['consecutive_failure_limit'] = 2
+    calls = []
+    tasks = [(str(i), {}, tmp_path / str(i), tmp_path / f"out/{i}") for i in range(10)]
+    class Bar:
+        def update(self):
+            pass
+    def fake_one(vid, *args, **kwargs):
+        calls.append(vid)
+        if vid != '1':
+            raise HarnessError("malformed response")
+        return {}, False
+    monkeypatch.setattr("harness.ingest_all._ingest_one", fake_one)
+    with pytest.raises(HarnessError, match="2 consecutive videos failed"):
+        _run_sequential(tasks, cfg, None, Bar(), threading.Event())
+    assert calls == ['0', '1', '2', '3']
+
+
+def test_cancelled_video_does_not_create_failure_report(cfg, tmp_path, monkeypatch):
+    from harness.ingest_all import _ingest_one
+    cancelled = threading.Event()
+    def fake_ingest(*args, **kwargs):
+        cancelled.set()
+        raise HarnessError("VLM request cancelled")
+    monkeypatch.setattr("harness.ingest_all.ingest_video", fake_ingest)
+    with pytest.raises(HarnessError, match="cancelled"):
+        _ingest_one("v", {"duration": 3}, tmp_path / 'v.mp4', tmp_path / 'videos/v', cfg, cancel_event=cancelled)
+    assert not (tmp_path / '.ingest-failures/v.json').exists()

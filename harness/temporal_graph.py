@@ -72,6 +72,8 @@ def normalize_node(raw, duration):
             raise HarnessError("Invalid semantic_complexity")
         row["retrieval_text"] = strings(row.get("retrieval_text", [row["summary"]]), "retrieval_text")
         row.setdefault("parent_id", None)
+        if row["parent_id"] is not None:
+            nonempty(row["parent_id"], "parent_id")
         row.setdefault("relations", [])
         if not isinstance(row["relations"], list):
             raise HarnessError("relations must be a list")
@@ -81,7 +83,11 @@ def normalize_node(raw, duration):
                 raise HarnessError("Invalid relation")
             nonempty(relation["target_id"], "relation target")
         row.setdefault("history", [])
+        if not isinstance(row["history"], list) or any(not isinstance(item, dict) for item in row["history"]):
+            raise HarnessError("history must be a list of records")
         row.setdefault("evidence", {"pass": [], "observation_ids": [], "frame_ids": [], "frame_timestamps": []})
+        if not isinstance(row["evidence"], dict):
+            raise HarnessError("evidence must be an object")
         for key in ("pass", "observation_ids", "frame_ids"):
             row["evidence"][key] = strings(row["evidence"].get(key, []), "evidence." + key)
         row["evidence"]["frame_timestamps"] = sorted(set(
