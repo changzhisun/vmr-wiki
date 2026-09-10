@@ -204,7 +204,7 @@ API 仅对临时网络错误、限流和服务端错误做有限重试，达到 
 
 重叠窗口使用每个 VLM client 上限 32 MiB 的图像 Base64 LRU 缓存，减少重复读图和编码；不会减少模型实际接收的图像或 API token。FFmpeg 仍逐采样点 seek，暂不改变抽帧语义。`telemetry.extraction_sec` 汇总保留的成功抽帧耗时，`extraction_sec_this_run` 仅为本次新抽帧耗时；`caption_sec` 包括历史保留的 caption 尝试和重试等待，`reused_frames` / `reused_windows` 显示本次复用量。服务端不返回 usage 时无法推算 token，汇总报告显示 `null`。
 
-批量 Ingest 保留 `--jobs`（默认 4）和 `--verbose`。`--jobs 1` 顺序执行；多个 worker 并发处理当前 split 的不同视频，不会对共享 video_id 重复提交任务。Ingest 与批量 Query 的进度条都会显示已完成数量、平均处理速度和预计剩余时间，结束时显示总耗时。收到 Ctrl-C 时，尚未开始的任务立即取消，运行中的 worker 在当前 FFmpeg/VLM 调用结束后的下一个检查点退出并清理 staging 目录；主进程等待 worker 收敛，不会让后台线程继续发布 Wiki。
+批量 Ingest 保留 `--jobs`（默认 4）和 `--verbose`。`--jobs 1` 顺序执行；多个 worker 并发处理当前 split 的不同视频，不会对共享 video_id 重复提交任务。Ingest 与批量 Query 的进度条都会显示已完成数量、平均处理速度和预计剩余时间，结束时显示总耗时。Freeze 也使用相同进度条，分别显示配置预检、冻结/校验两个阶段；每完成一个视频更新一次，已冻结视频的完整性校验同样计入进度。非交互输出只打印各阶段的结束摘要，失败或中断时保留实际完成数量。收到 Ctrl-C 时，尚未开始的 Ingest 任务立即取消，运行中的 worker 在当前 FFmpeg/VLM 调用结束后的下一个检查点退出并清理 staging 目录；主进程等待 worker 收敛，不会让后台线程继续发布 Wiki。
 
 ## 3. 单 Query / 批量 Query
 

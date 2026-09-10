@@ -3,6 +3,18 @@ import io
 import pytest
 
 from harness.progress import ProgressBar
+from harness.common import HarnessError
+from harness.freeze import freeze_dataset
+
+
+@pytest.fixture
+def freeze_inputs(cfg, tmp_path, monkeypatch):
+    monkeypatch.setattr("harness.freeze.dataset_context", lambda *args: (tmp_path, {}, "train"))
+    monkeypatch.setattr("harness.freeze.load_videos", lambda *args: {"first": {}, "second": {}})
+    monkeypatch.setattr("harness.freeze.wiki_readiness", lambda *args: ([], []))
+    monkeypatch.setattr("harness.freeze.read_json", lambda path: {
+        "video_id": path.parent.name, "ingest_config": cfg["ingest"]})
+    return cfg
 
 
 class TTYBuffer(io.StringIO):
@@ -101,3 +113,51 @@ def test_progress_bar_finish_from_interrupted_render_does_not_deadlock(monkeypat
 
     assert interrupted
     assert "elapsed 00:00:01" in stdout.getvalue()
+
+
+@pytest.mark.parametrize("tty", [True, False])
+def test_freeze_progress_reports_both_stages(freeze_inputs, monkeypatch, tty):
+    stdout = TTYBuffer() if tty else io.StringIO()
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("harness.freeze.freeze_wiki", lambda path: {"wiki_hash": path.name})
+    manifest = freeze_dataset(freeze_inputs)
+    assert manifest["videos"] == {"first": "first", "second": "second"}
+    text = stdout.getvalue()
+    for desc in ("Checking freeze settings", "Freezing/verifying videos"):
+        assert desc in text
+    assert text.count("2/2 (100%)") >= 2
+    assert "videos/s" in text and text.count("elapsed") == 2
+    assert ("ETA" in text) == tty
+    if not tty:
+        assert len(text.splitlines()) == 2
+
+
+def test_freeze_preflight_error_closes_bar_before_freezing(freeze_inputs, monkeypatch):
+    stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdout", stdout)
+    calls = iter([[], ["fixture mismatch"]])
+    monkeypatch.setattr("harness.freeze.ingest_content_diff", lambda *args: next(calls))
+    monkeypatch.setattr("harness.freeze.freeze_wiki", lambda *args: pytest.fail("freeze before preflight"))
+    with pytest.raises(HarnessError, match="fixture mismatch"):
+        freeze_dataset(freeze_inputs)
+    text = stdout.getvalue()
+    assert "1/2 (50%)" in text and text.endswith("\n")
+    assert "Freezing/verifying" not in text
+
+
+@pytest.mark.parametrize("error", [HarnessError, KeyboardInterrupt])
+def test_freeze_error_or_interrupt_closes_partial_bar(freeze_inputs, monkeypatch, error):
+    stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdout", stdout)
+
+    def freeze(path):
+        if path.name == "second":
+            raise error("fixture")
+        return {"wiki_hash": path.name}
+
+    monkeypatch.setattr("harness.freeze.freeze_wiki", freeze)
+    with pytest.raises(error):
+        freeze_dataset(freeze_inputs)
+    final = stdout.getvalue().splitlines()[-1]
+    assert "Freezing/verifying videos" in final
+    assert "1/2 (50%)" in final and "elapsed" in final

@@ -13,6 +13,7 @@ from harness.common import (HarnessError, cli, file_hash, ingest_content_diff,
                             ingest_content_hash, object_hash, read_json, write_json)
 from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_videos
+from harness.progress import ProgressBar
 
 
 def tree_hashes(root: Path, exclude: tuple[str, ...] = ()) -> dict[str, str]:
@@ -127,16 +128,30 @@ def freeze_dataset(cfg: dict, *, split: str | None = None) -> dict:
             f"{len(missing)} video(s) have no ingest and cannot be frozen: {_format_ids(missing)}"
         )
     # Preflight every video before applying any read-only permissions.
-    for vid in videos:
-        metadata = read_json(root / vid / "ingest.json")
-        if metadata["video_id"] != vid:
-            raise HarnessError(f"{vid}: ingest.json video_id is {metadata['video_id']!r}")
-        diffs = ingest_content_diff(metadata["ingest_config"], cfg)
-        if diffs:
-            raise HarnessError(
-                f"{vid}: ingest settings do not match current config ({'; '.join(diffs)})"
-            )
-    seals = {vid: freeze_wiki(root / vid) for vid in videos}
+    preflight = ProgressBar(len(videos), desc="Checking freeze settings", unit="videos")
+    try:
+        preflight.start()
+        for vid in videos:
+            metadata = read_json(root / vid / "ingest.json")
+            if metadata["video_id"] != vid:
+                raise HarnessError(f"{vid}: ingest.json video_id is {metadata['video_id']!r}")
+            diffs = ingest_content_diff(metadata["ingest_config"], cfg)
+            if diffs:
+                raise HarnessError(
+                    f"{vid}: ingest settings do not match current config ({'; '.join(diffs)})"
+                )
+            preflight.update()
+    finally:
+        preflight.finish()
+    seals = {}
+    bar = ProgressBar(len(videos), desc="Freezing/verifying videos", unit="videos")
+    try:
+        bar.start()
+        for vid in videos:
+            seals[vid] = freeze_wiki(root / vid)
+            bar.update()
+    finally:
+        bar.finish()
     manifest = {"version": 2, "dataset": cfg["dataset"]["name"], "split": split,
                 "ingest_config_hash": ingest_content_hash(cfg),
                 "videos": {vid: seal["wiki_hash"] for vid, seal in seals.items()}}
