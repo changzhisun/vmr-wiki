@@ -355,11 +355,13 @@ python harness/run_all_queries.py \
   --experiment claude_wiki_val
 ```
 
-批量 Query 的 `--jobs` 默认为 1；大于 1 时，每个 worker 同时运行一条独立 Query，
+批量 Query 的 `--jobs` 默认为 1、最大为 16；大于 1 时，每个 worker 同时运行一条独立 Query，
 并各自创建 Agent 容器、出网代理、workspace、metadata、stdout/stderr 和 trace。
 实现只维持最多一波 `jobs` 个在途任务；遇到 Harness/基础设施错误后不再提交新 Query，
 已启动的容器完成清理后退出。Agent 自身的 timeout、invalid output 等作为该次运行的失败结果，
-不会阻止其他 Query，并会在下次运行同一实验时重试。并发数应同时受宿主 CPU/内存和模型 endpoint 容量约束。
+不会阻止其他 Query，并会在下次运行同一实验时重试。收到 Ctrl-C 或 Harness 错误后会通过共享取消信号
+终止在途 Agent，并等待容器、代理和网络清理完成；清理期间再次按 Ctrl-C 不会跳过清理。
+并发数应同时受宿主 CPU/内存和模型 endpoint 容量约束。
 
 Ingest/Freeze/Query 使用显式 `--split`，也可设置 `dataset.split`；这些阶段不会使用 `default_eval_split` 猜测子集。每个实验只运行所选 split，且不要求其他 split 已 Ingest。
 
@@ -373,6 +375,10 @@ wiki/frames.jsonl
 wiki/frames/
 output/
 ```
+
+当 endpoint 只支持文本时，设置 `query.text_only: true`。此时 workspace 不复制 `wiki/frames/`，
+只保留 Wiki、结构化 JSONL 和 `frames.jsonl` 中的已有文字与 timestamp，并使用独立的纯文本 AGENTS/prompt
+模板；模板中不会同时出现要求查看图片的冲突指令。
 
 ### 不透明标识符
 
@@ -419,7 +425,7 @@ Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Q
 
 Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到 `query.egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放 `Bash,Read,Write,Edit,Glob,Grep` 六个内置工具，不启用额外 MCP；`WebSearch`、`WebFetch`、`Agent`、`Task*`、`Cron*` 等工具不会声明给模型。配置了 `query.base_url` 时，endpoint 以 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 传入容器，并作为 `runtime.api_base_url` 记入每次运行的 provenance。修改 allowlist 或 endpoint 会改变实验配置哈希，应使用新实验名。
 
-Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。若 Agent 的 `end_sec` 超过 `task.json.duration`，Harness 会统一将它截断到权威上限，并在 `run_metadata.output_adjustments` 和 CLI `[adjusted]` 状态中记录原值、新值和差值。若 `start_sec >= duration`，截断后无法形成正长区间，仍会按时间越界失败。
+Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。若 Agent 的 `end_sec` 因尾点精度仅比 `task.json.duration` 大 0.05 秒以内，Harness 会将它截断到权威上限，并在 `run_metadata.output_adjustments` 和 CLI `[adjusted]` 状态中记录有意义的修正；浮点 ULP 噪声会静默归一化。更大的越界以及截断后无法形成正长区间的预测仍按 `invalid_output` 失败。
 
 JSON 缺失、解析失败、字段多余/缺失、错误 ID、布尔值冒充数字、NaN、其他时间越界、分数越界、排序错误、预测数量超限、额外输出文件等均记录为 `invalid_output`；本次批处理不会原地自动修复，但再次运行同一实验时会重新调用 Agent。`moments: []` 是成功的 abstention。
 
@@ -448,14 +454,15 @@ results/<experiment>/
 └── config.yaml
 ```
 
-每个 Query 默认保存 `trace.jsonl` 原始 CLI 事件流；`stdout.log` 仍只保留便于阅读的最终回答。超时时已写入的事件也会保留。
+每个 Query 默认保存 `trace.jsonl` 原始 CLI 事件流；`stdout.log` 流式扫描 trace，只保留最后一条最终回答。
+若超时前没有最终事件，则保留最后一条 assistant 文本，或至少写入最后事件类型的诊断，不会留下无说明的空文件。
 元数据包含 dataset、split、agent、时间、exit code、失败原因、轨迹路径、Wiki/config/template/source/manifest 哈希、镜像 ID 和 Git commit；目录不是 Git 仓库时 commit 为 `null`，代码仍有内容哈希。
 
 若宿主进程被 `SIGKILL` 或机器断电，正常的 `finally` 清理无法执行。确认没有相关进程/容器继续运行后，可人工移除对应 `.experiment.lock`、`.ingest.lock` 和残留临时目录；不要删除已记录的 Query 结果来假装首次执行。
 
 ## 4. 聚合与评测
 
-批量运行因部分 Query 的 **Agent 侧**失败而返回非零 exit code 时，应继续聚合与评测——这些失败是有效的零分。但若批量运行是因 Harness 侧失败而**中止**（输出中带 `harness failure after N of M queries`），应先修好原因重跑，否则评测会拒绝这批结果。
+批量运行因部分 Query 的 **Agent 侧**失败而返回非零 exit code 时，应继续聚合与评测——这些失败是有效的零分。但若批量运行是因 Harness 侧失败而**中止**（输出中带 `harness/interrupted query failure`），应先修好原因重跑，否则评测会拒绝这批结果。
 
 ```bash
 python harness/aggregate.py \
@@ -534,12 +541,14 @@ python harness/ablation.py prepare \
   --limit-videos 10 --seed 0 --output experiments/caption_dev
 
 python harness/ablation.py run --suite experiments/caption_dev --stage ingest --jobs 4
-python harness/ablation.py run --suite experiments/caption_dev --stage query
+python harness/ablation.py run --suite experiments/caption_dev --stage query --jobs 4
 python harness/ablation.py run --suite experiments/caption_dev --stage evaluate
 python harness/ablation.py summarize --suite experiments/caption_dev
 ```
 
-`run` 的 Ingest 和 Query 阶段会实际调用配置中的模型并产生费用；`--stage all` 可以串行完成全部阶段。`--jobs` 只控制 Ingest 视频并发，Query 按顺序运行。每组沿用原有失败/续跑规则，不会为失败的 Agent Query 额外抽一次答案。
+`run` 的 Ingest 和 Query 阶段会实际调用配置中的模型并产生费用；`--stage all` 可以依次完成全部阶段。
+`--jobs` 同时控制 Ingest 视频并发和 Query Agent 并发。Query 阶段复用与普通批处理相同的成功跳过、失败重跑和取消规则；
+重跑失败 Query 会产生新的 API 花费，并在该 Query 的 `attempts` / `superseded_failures` 中标记。
 
 四组分别是 Simple 1/1、Simple 5/1、Dense 5/1、Dense 9/4（window/stride）。它们使用相同的视频、Query、GT、采样间隔、模型、token 上限和 Query Agent 配置，但独立生成 Wiki；Simple 与 Dense 使用各自格式的固定 prompt。5/1 与 9/4 同时改变窗口和步长，只能判断组合效果，不能把差异单独归因于窗口大小。配置、数据快照、源视频、模板及代码哈希固定，Agent runtime 也必须一致；输入变化时要求重新准备 suite。
 

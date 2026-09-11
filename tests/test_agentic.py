@@ -92,7 +92,7 @@ class FixtureIngestRunner:
         self.behavior = behavior
         self.jobs, self.tasks, self.videos, self.scratches = [], [], [], []
 
-    def run(self, job, prompt, stdout, stderr, *, video, scratch):
+    def run(self, job, prompt, stdout, stderr, *, video, scratch, cancel_event=None):
         self.jobs.append(Path(job))
         self.videos.append(Path(video))
         self.scratches.append(Path(scratch))

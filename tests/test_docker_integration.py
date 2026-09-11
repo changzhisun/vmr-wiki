@@ -1,11 +1,12 @@
 """No model API calls. Opt in with VMR_TEST_DOCKER=1 after building the image."""
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
 
-from agents.runner import DockerRunner, trace_path
+from agents.runner import AgentCancelled, DockerRunner, trace_path
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("VMR_TEST_DOCKER") != "1", reason="Docker integration is opt-in")
@@ -102,3 +103,37 @@ def test_actual_timeout_removes_container(cfg, tmp_path, monkeypatch):
     probe = subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^/{names[0]}$"],
                            check=True, capture_output=True, text=True, timeout=10)
     assert probe.stdout.strip() == ""
+
+
+def test_actual_cooperative_cancel_removes_container_proxy_and_network(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_API_KEY", "fake-key-no-api-call")
+    cfg["query"]["timeout_sec"] = 60
+    (tmp_path / "output").mkdir()
+    runner = ContainerProbeRunner(cfg)
+    monkeypatch.setattr(runner, "agent_command",
+                        lambda: ["python3", "-c", "import time; time.sleep(90)"])
+    names = []
+    original_command = runner.docker_command
+
+    def tracked_command(workspace, name, network):
+        names.append(name)
+        return original_command(workspace, name, network)
+
+    monkeypatch.setattr(runner, "docker_command", tracked_command)
+    cancel_event = threading.Event()
+    timer = threading.Timer(0.5, cancel_event.set)
+    timer.start()
+    try:
+        with pytest.raises(AgentCancelled):
+            runner.run(tmp_path, "", tmp_path / "stdout", tmp_path / "stderr",
+                       cancel_event=cancel_event)
+    finally:
+        timer.cancel()
+    name = names[0]
+    for container in (name, f"{name}-proxy"):
+        probe = subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^/{container}$"],
+                               check=True, capture_output=True, text=True, timeout=10)
+        assert probe.stdout.strip() == ""
+    network = subprocess.run(["docker", "network", "inspect", f"{name}-internal"],
+                             capture_output=True, text=True, timeout=10)
+    assert network.returncode != 0

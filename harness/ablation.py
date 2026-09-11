@@ -81,6 +81,9 @@ def prepare(cfg: dict, output: Path, *, split: str, limit_videos: int = 10, seed
         atomic_text(path, yaml.safe_dump(variant, sort_keys=False, allow_unicode=True))
         load_config(path)
         configs[name] = file_hash(path)
+    template_names = (("AGENTS_text_only.md", "query_prompt_text_only.md")
+                      if cfg["query"].get("text_only", False)
+                      else ("AGENTS.md", "query_prompt.md"))
     manifest = {"version": 1, "dataset": metadata["name"], "split": split,
                 "source_hash": source_hash(),
                 "video_hashes": {row["video_id"]: file_hash(Path(row["video_path"])) for row in subset_rows},
@@ -88,7 +91,7 @@ def prepare(cfg: dict, output: Path, *, split: str, limit_videos: int = 10, seed
                 "num_queries": len(subset_queries), "configs": configs,
                 "dataset_files": {p.name: file_hash(p) for p in snapshot.iterdir()},
                 "templates": {p: file_hash(Path(cfg["paths"]["templates"]) / p)
-                              for p in ("AGENTS.md", "query_prompt.md")}}
+                              for p in template_names}}
     write_json(output / "suite.json", manifest)
     return manifest
 
@@ -123,11 +126,15 @@ def run(root: Path, stage: str, jobs: int):
     from harness.evaluate import evaluate
     from harness.freeze import freeze_dataset
     from harness.ingest_all import ingest_all
-    from harness.run_query import Experiment, run_status
+    from harness.progress import ProgressBar
+    from harness.run_all_queries import run_queries, validate_jobs
+    from harness.run_query import Experiment
 
     if stage not in ("all", "ingest", "query", "evaluate"):
         raise HarnessError(f"Invalid ablation stage: {stage}")
     positive_int(jobs, "jobs")
+    if stage in ("all", "query"):
+        validate_jobs(jobs)
     manifest, configs = load_suite(root)
     for name, cfg in configs.items():
         measurement = root / "measurements" / f"{name}.json"
@@ -147,8 +154,13 @@ def run(root: Path, stage: str, jobs: int):
                         if runtime_path.exists() and read_json(runtime_path) != experiment.runner.provenance:
                             raise HarnessError("Ablation agent runtime changed; prepare a new suite")
                         write_json(runtime_path, experiment.runner.provenance)
-                        for query in experiment.queries:
-                            print(run_status(experiment.run(query), experiment.root))
+                        bar = ProgressBar(len(experiment.queries), desc=f"Querying {name}",
+                                          unit="queries", log_stream="stdout")
+                        bar.start()
+                        try:
+                            run_queries(experiment, jobs, bar)
+                        finally:
+                            bar.finish()
                 else:
                     prediction = result_root / "predictions.jsonl"
                     aggregate(result_root / "predictions", prediction)

@@ -1,12 +1,14 @@
 import copy
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 import yaml
 
-from agents.runner import AgentResult, DockerRunner, readable_trace, trace_path
+from agents.runner import AgentCancelled, AgentResult, DockerRunner, readable_trace, trace_path
 from harness.aggregate import aggregate
 from harness.common import HarnessError, read_json, write_json
 from harness.config import load_config
@@ -26,7 +28,7 @@ class ProcessFixtureRunner:
         self.workspaces = []
         self.pids = []
 
-    def run(self, workspace, prompt, stdout, stderr):
+    def run(self, workspace, prompt, stdout, stderr, **kwargs):
         self.workspaces.append(workspace)
         assert set(p.name for p in workspace.iterdir()) == {"AGENTS.md", "task.json", "wiki", "output"}
         assert set(p.name for p in (workspace / "wiki").iterdir()) == {"wiki.md", "frames.jsonl", "frames"}
@@ -79,24 +81,101 @@ def test_structured_trace_keeps_readable_final_answers(tmp_path):
     ])
     assert readable_trace("claude_code", claude) == b"claude final\n"
 
+    claude_timeout = b'\n'.join([
+        b'{"type":"harness.input","prompt":"secret task"}',
+        b'{"type":"assistant","message":{"content":[{"type":"text","text":"best partial diagnosis"}]}}',
+        b'{"type":"tool_result","content":"large omitted payload"}',
+    ])
+    assert readable_trace("claude_code", claude_timeout) == b"best partial diagnosis\n"
+    assert readable_trace("claude_code", b'{"type":"tool_result"}\n') == (
+        b"[no final answer event; last agent event: tool_result]\n")
+
     codex = b'\n'.join([
         b'{"type":"item.completed","item":{"type":"command_execution","command":"pwd"}}',
+        b'{"type":"item.completed","item":{"type":"agent_message","text":"codex interim"}}',
         b'{"type":"item.completed","item":{"type":"agent_message","text":"codex final"}}',
     ])
     assert readable_trace("codex", codex) == b"codex final\n"
     assert readable_trace("claude_code", b"legacy plain output\n") == b"legacy plain output\n"
+    trace = tmp_path / "stream.trace.jsonl"
+    trace.write_bytes(codex)
+    assert readable_trace("codex", trace) == b"codex final\n"
+
+
+def test_readable_stdout_is_written_even_when_container_cleanup_fails(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_API_KEY", "test-secret")
+    monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
+    runner = DockerRunner(cfg)
+    monkeypatch.setattr(runner, "_docker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_start_egress_proxy", lambda *args: None)
+    event = ('{"type":"item.completed","item":'
+             '{"type":"agent_message","text":"finished answer"}}')
+    monkeypatch.setattr(
+        runner, "docker_command",
+        lambda *args, **kwargs: [sys.executable, "-c", f"print({event!r})"])
+    removals = []
+
+    def remove(name):
+        removals.append(name)
+        if len(removals) == 1:
+            raise HarnessError("cleanup failed")
+
+    monkeypatch.setattr(runner, "_remove_container", remove)
+    monkeypatch.setattr("agents.runner.subprocess.run", lambda *args, **kwargs:
+                        subprocess.CompletedProcess(args[0], 0, "", ""))
+    with pytest.raises(HarnessError, match="cleanup failed"):
+        runner.run(tmp_path, "prompt", tmp_path / "stdout", tmp_path / "stderr")
+    assert (tmp_path / "stdout").read_text() == "finished answer\n"
+
+
+def test_trace_and_stdout_exist_when_agent_setup_fails(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_API_KEY", "test-secret")
+    monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
+    runner = DockerRunner(cfg)
+    monkeypatch.setattr(runner, "_docker", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(HarnessError("network failed")))
+    monkeypatch.setattr(runner, "_remove_container", lambda *args: None)
+    with pytest.raises(HarnessError, match="network failed"):
+        runner.run(tmp_path, "prompt", tmp_path / "stdout", tmp_path / "stderr")
+    assert trace_path(tmp_path / "stdout").exists()
+    assert (tmp_path / "stderr").exists()
+    assert (tmp_path / "stdout").read_text() == "[no agent events were emitted]\n"
+
+
+def test_container_runner_wait_observes_cooperative_cancellation(cfg, monkeypatch):
+    monkeypatch.setenv("CODEX_API_KEY", "test-secret")
+    monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
+    runner = DockerRunner(cfg)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.PIPE)
+    cancelled = threading.Event()
+    timer = threading.Timer(0.1, cancelled.set)
+    started = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(AgentCancelled):
+            runner._wait_for_agent(process, "prompt", cancelled)
+    finally:
+        timer.cancel()
+        process.kill()
+        process.wait(timeout=2)
+    assert time.monotonic() - started < 2
 
 
 def test_all_prediction_ends_over_duration_are_clamped():
     prediction = {"moments": [
         {"start_sec": 41.0, "end_sec": 43.933333, "score": 0.9},
-        {"start_sec": 10.0, "end_sec": 44.0, "score": 0.8},
-        {"start_sec": 43.931, "end_sec": 43.932, "score": 0.7},
+        {"start_sec": 10.0, "end_sec": 43.94, "score": 0.8},
+        {"start_sec": 43.929, "end_sec": 43.932, "score": 0.7},
+        {"start_sec": 43.0, "end_sec": 43.93000000000001, "score": 0.6},
+        {"start_sec": 10.0, "end_sec": 44.0, "score": 0.5},
     ]}
     adjustments = clamp_prediction_ends(prediction, duration=43.93)
     assert prediction["moments"][0]["end_sec"] == 43.93
     assert prediction["moments"][1]["end_sec"] == 43.93
     assert prediction["moments"][2]["end_sec"] == 43.93
+    assert prediction["moments"][3]["end_sec"] == 43.93
+    assert prediction["moments"][4]["end_sec"] == 44.0
     assert adjustments[0] == {
         "kind": "clamp_end_to_effective_duration",
         "moment_index": 0,
@@ -109,6 +188,25 @@ def test_all_prediction_ends_over_duration_are_clamped():
     status = run_status({"query_id": "q1", "status": "success",
                          "output_adjustments": adjustments}, Path("results/test"))
     assert "success [adjusted]" in status
+
+
+def test_endpoint_clamp_that_collapses_interval_is_invalid_output(frozen):
+    cfg, _ = frozen
+
+    class CollapsedRunner(ProcessFixtureRunner):
+        def run(self, workspace, prompt, stdout, stderr, **kwargs):
+            result = super().run(workspace, prompt, stdout, stderr, **kwargs)
+            prediction = read_json(workspace / "output/prediction.json")
+            prediction["moments"] = [
+                {"start_sec": 3.001, "end_sec": 3.002, "score": 0.9}
+            ]
+            write_json(workspace / "output/prediction.json", prediction)
+            return result
+
+    with Experiment(cfg, "collapsed", runner=CollapsedRunner()) as experiment:
+        result = experiment.run(experiment.queries[0])
+    assert result["failure_kind"] == "invalid_output"
+    assert result["output_adjustments"] == []
 
 
 def test_end_to_end_fresh_processes_cleanup_and_no_gt_reads(frozen):
@@ -153,7 +251,10 @@ def test_text_only_query_omits_frames_and_records_effective_instructions(frozen)
             assert not (workspace / "wiki" / "frames").exists()
             assert "本次不提供图片" in prompt
             assert "wiki/frames/" in prompt
-            assert "本次输入模式：纯文本" in (workspace / "AGENTS.md").read_text()
+            instructions = (workspace / "AGENTS.md").read_text()
+            assert "纯文本 Video Moment Retrieval" in instructions
+            assert "最多读取 24 张" not in instructions
+            assert "读取 `task.json`、`wiki/wiki.md`、`wiki/frames.jsonl` 和 `wiki/frames/`" not in instructions
             seen.append(workspace)
 
             task = read_json(workspace / "task.json")
@@ -171,7 +272,7 @@ def test_text_only_query_omits_frames_and_records_effective_instructions(frozen)
         assert result["status"] == "success"
         saved_agents = (experiment.root / "templates" / "AGENTS.md").read_text()
         saved_prompt = (experiment.root / "templates" / "query_prompt.md").read_text()
-        assert "本次输入模式：纯文本" in saved_agents
+        assert "纯文本 Video Moment Retrieval" in saved_agents
         assert "本次不提供图片" in saved_prompt
     assert len(seen) == 1 and not seen[0].exists()
 
@@ -338,6 +439,39 @@ def test_agent_failures_are_classified_by_cause(frozen, behavior, kind):
         result = experiment.run(experiment.queries[0])
         assert (result["status"], result["failure_kind"]) == ("failed", kind)
         assert result["attempts"] == 1
+
+
+def test_internal_prediction_processing_error_stays_a_harness_failure(frozen, monkeypatch):
+    cfg, _ = frozen
+    monkeypatch.setattr("harness.run_query.clamp_prediction_ends", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(HarnessError("internal clamp invariant")))
+    with Experiment(cfg, "internal-error", runner=ProcessFixtureRunner()) as experiment:
+        query = experiment.queries[0]
+        with pytest.raises(HarnessError, match="internal clamp invariant"):
+            experiment.run(query)
+        metadata = read_json(experiment.root / "run_metadata" / f"{query['query_id']}.json")
+    assert metadata["failure_kind"] == "harness_error"
+
+
+def test_discarded_tampered_prediction_does_not_claim_adjustments(frozen):
+    cfg, _ = frozen
+
+    class OverrunAndTamperRunner(ProcessFixtureRunner):
+        def run(self, workspace, prompt, stdout, stderr, **kwargs):
+            result = super().run(workspace, prompt, stdout, stderr, **kwargs)
+            path = workspace / "output/prediction.json"
+            prediction = read_json(path)
+            prediction["moments"][1]["end_sec"] = 3.01
+            write_json(path, prediction)
+            wiki = workspace / "wiki/wiki.md"
+            wiki.chmod(0o644)
+            wiki.write_text("changed")
+            return result
+
+    with Experiment(cfg, "tampered-adjustment", runner=OverrunAndTamperRunner()) as experiment:
+        result = experiment.run(experiment.queries[0])
+    assert result["failure_kind"] == "tampered"
+    assert result["output_adjustments"] == []
 
 
 def test_harness_failure_is_recorded_raised_and_retried(frozen):

@@ -456,7 +456,8 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
             return publish_agentic(
                 video, video_id, output, staging, checkpoint, None, cfg,
                 duration, video_stream_duration, source_hash, content_hash, ffmpeg_version,
-                lambda: _check_cancelled(cancel_event), runner=runner)
+                lambda: _check_cancelled(cancel_event), runner=runner,
+                cancel_event=cancel_event)
         client = captioner if captioner is not None else VLMClient(
             cfg["ingest"]["vlm"], timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"),
             cancel_event=cancel_event)

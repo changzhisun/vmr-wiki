@@ -94,7 +94,7 @@ def _publish_files(output: Path, staging: Path, rows: list[dict]) -> None:
 
 def publish_agentic(video, video_id, output, staging, checkpoint, client, cfg,
                     duration, video_stream_duration, source_hash, content_hash,
-                    ffmpeg_version, check, *, runner=None):
+                    ffmpeg_version, check, *, runner=None, cancel_event=None):
     if runner is None:
         from agents.runner import AgentIngestRunner
         runner = AgentIngestRunner(cfg)
@@ -124,7 +124,7 @@ def publish_agentic(video, video_id, output, staging, checkpoint, client, cfg,
         check()
         started = time.monotonic()
         result = runner.run(job, prompt, logs / "agent.stdout.log", logs / "agent.stderr.log",
-                            video=video, scratch=scratch)
+                            video=video, scratch=scratch, cancel_event=cancel_event)
         elapsed = time.monotonic() - started
         check()
         if result.timed_out:
