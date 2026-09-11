@@ -141,6 +141,16 @@ def ingest_content_hash(cfg: dict) -> str:
     rather than the requested caption content.
     """
     ingest = cfg["ingest"]
+    if ingest.get("caption_mode") == "agentic":
+        # No VLM settings participate: the coding agent brings its own model,
+        # and the instruction templates are the prompt.
+        from harness.agentic_config import AGENTIC_VERSION, content_settings
+        return object_hash({
+            "caption_mode": "agentic",
+            "agentic_version": ingest.get("agentic_version", AGENTIC_VERSION),
+            "agentic": content_settings(ingest),
+            **{key: ingest[key] for key in ("image_max_size", "jpeg_quality")},
+        })
     vlm = ingest["vlm"]
     if ingest.get("caption_mode") == "bidirectional":
         from harness.bidirectional_config import PIPELINE_VERSION, content_settings
@@ -169,6 +179,23 @@ def ingest_content_diff(stored: dict, cfg: dict) -> list[str]:
     if ingest_content_hash({"ingest": stored}) == ingest_content_hash(cfg):
         return []
     diffs = []
+    if "agentic" in (stored.get("caption_mode"), cfg["ingest"].get("caption_mode")):
+        if stored.get("caption_mode") != cfg["ingest"].get("caption_mode"):
+            return [f"caption_mode {stored.get('caption_mode')!r} vs "
+                    f"{cfg['ingest'].get('caption_mode')!r}"]
+        from harness.agentic_config import AGENTIC_VERSION, content_settings
+        left, right = content_settings(stored), content_settings(cfg["ingest"])
+        for key in sorted(left.keys() | right.keys()):
+            if left.get(key) != right.get(key):
+                diffs.append("agentic instruction templates differ" if key == "templates_hash"
+                             else f"agentic.{key} {left.get(key)!r} vs {right.get(key)!r}")
+        if stored.get("agentic_version", AGENTIC_VERSION) != cfg["ingest"].get(
+                "agentic_version", AGENTIC_VERSION):
+            diffs.append("agentic_version differs")
+        for key in ("image_max_size", "jpeg_quality"):
+            if stored.get(key) != cfg["ingest"].get(key):
+                diffs.append(f"{key} {stored.get(key)!r} vs {cfg['ingest'].get(key)!r}")
+        return diffs or ["ingest content hash"]
     if stored.get("caption_mode") == cfg["ingest"].get("caption_mode") == "bidirectional":
         from harness.bidirectional_config import PIPELINE_VERSION, content_settings
         if content_settings(stored) != content_settings(cfg["ingest"]):

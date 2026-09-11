@@ -20,8 +20,13 @@ from harness.freeze import freeze_dataset
 from harness.ingest import ingest_video
 from harness.progress import ProgressBar
 from harness.vlm_transport import FatalVLMError, check_cancelled
+from agents.runner import FatalAgentError
 
 logger = logging.getLogger(__name__)
+
+# A shared credential, image or endpoint failure repeats identically for every
+# video, so it opens the circuit immediately instead of after a streak.
+FATAL_ERRORS = (FatalVLMError, FatalAgentError)
 
 # Module-level handle so an interrupt can close the progress bar cleanly.
 _active_bar: "ProgressBar | None" = None
@@ -75,8 +80,8 @@ class _FailureCircuit:
         cause, visited = exc, set()
         while cause is not None and id(cause) not in visited:
             visited.add(id(cause))
-            if isinstance(cause, FatalVLMError):
-                return f"Shared VLM configuration failure: {cause}"
+            if isinstance(cause, FATAL_ERRORS):
+                return f"Shared agent/VLM configuration failure: {cause}"
             cause = cause.__cause__
         if self.consecutive >= self.limit:
             return f"{self.consecutive} consecutive videos failed; last error: {exc}"
@@ -90,6 +95,7 @@ def _ingest_one(
     output: Path,
     cfg: dict,
     captioner=None,
+    runner=None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[dict, bool]:
     """Ingest a single video.
@@ -107,7 +113,7 @@ def _ingest_one(
     failure_path = output.parent.parent / ".ingest-failures" / f"{vid}.json"
     try:
         metadata = ingest_video(video_path, vid, output, cfg, captioner=captioner,
-                                cancel_event=cancel_event)
+                                runner=runner, cancel_event=cancel_event)
     except (HarnessError, OSError) as exc:
         if cancel_event is not None and cancel_event.is_set():
             raise  # An interrupted video is unfinished, not a new failure.
@@ -133,6 +139,7 @@ def _run_sequential(
     captioner,
     bar: ProgressBar,
     cancel_event: threading.Event,
+    runner=None,
 ) -> list[dict]:
     results: list[dict] = []
     failures = []
@@ -142,7 +149,7 @@ def _run_sequential(
             raise HarnessError("Ingest cancelled")
         try:
             metadata, _ = _ingest_one(vid, video, path, output, cfg, captioner=captioner,
-                                      cancel_event=cancel_event)
+                                      runner=runner, cancel_event=cancel_event)
             results.append(metadata)
             circuit.success()
         except (HarnessError, OSError) as exc:
@@ -167,6 +174,7 @@ def _run_parallel(
     jobs: int,
     bar: ProgressBar,
     cancel_event: threading.Event,
+    runner=None,
 ) -> list[dict]:
     results: list[dict] = [None] * len(tasks)  # type: ignore[list-item]
     failures: list[tuple[str, str]] = []
@@ -185,7 +193,8 @@ def _run_parallel(
             while next_index < len(tasks) and len(future_to_idx) < jobs:
                 vid, video, path, output = tasks[next_index]
                 future = executor.submit(_ingest_one, vid, video, path, output, cfg,
-                                         captioner=captioner, cancel_event=cancel_event)
+                                         captioner=captioner, runner=runner,
+                                         cancel_event=cancel_event)
                 future_to_idx[future] = next_index
                 next_index += 1
             completed, _ = wait(future_to_idx, return_when=FIRST_COMPLETED)
@@ -262,6 +271,7 @@ def ingest_all(
     *,
     split: str | None = None,
     captioner=None,
+    runner=None,
     jobs: int = 4,
     verbose: bool = False,
 ) -> list[dict]:
@@ -273,11 +283,17 @@ def ingest_all(
     use the same policy. Shared configuration errors or the configured streak
     of failures open the circuit, stop new work and raise immediately.
 
-    The optional ``captioner`` is shared across worker threads and therefore
-    must be thread-safe.
+    The optional ``captioner`` and ``runner`` are shared across worker threads
+    and therefore must be thread-safe.
     """
     if jobs < 1:
         raise HarnessError("--jobs must be at least 1")
+
+    if runner is None and cfg["ingest"]["caption_mode"] == "agentic":
+        # Built once for the whole batch: the pinned image ID is provenance for
+        # every video, and a missing credential or image fails before any work.
+        from agents.runner import AgentIngestRunner
+        runner = AgentIngestRunner(cfg)
 
     dataset, metadata, split = dataset_context(cfg, split)
     videos = load_videos(dataset, metadata, split)
@@ -311,9 +327,11 @@ def ingest_all(
 
     try:
         if jobs == 1:
-            results = _run_sequential(tasks, cfg, captioner, _active_bar, cancel_event)
+            results = _run_sequential(tasks, cfg, captioner, _active_bar, cancel_event,
+                                      runner=runner)
         else:
-            results = _run_parallel(tasks, cfg, captioner, jobs, _active_bar, cancel_event)
+            results = _run_parallel(tasks, cfg, captioner, jobs, _active_bar, cancel_event,
+                                    runner=runner)
     finally:
         if old_handler is not None:
             signal.signal(signal.SIGINT, old_handler)

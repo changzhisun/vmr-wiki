@@ -408,7 +408,7 @@ def _check_cancelled(cancel_event: threading.Event | None) -> None:
 
 
 def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, captioner=None,
-                 cancel_event: threading.Event | None = None) -> dict:
+                 runner=None, cancel_event: threading.Event | None = None) -> dict:
     """No query or GT argument is accepted. Existing completed ingest is never recaptioned."""
     identifier(video_id, "video_id")
     video = video.resolve()
@@ -447,11 +447,19 @@ def ingest_video(video: Path, video_id: str, output: Path, cfg: dict, *, caption
             "duration": duration, "video_stream_duration": video_stream_duration,
         })
         _check_cancelled(cancel_event)
+        staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
+        (staging / "frames").mkdir()
+        if cfg["ingest"]["caption_mode"] == "agentic":
+            # A coding agent brings its own model, so no VLM client is created
+            # and no VLM credentials are required for this wiki root.
+            from harness.agentic import publish_agentic
+            return publish_agentic(
+                video, video_id, output, staging, checkpoint, None, cfg,
+                duration, video_stream_duration, source_hash, content_hash, ffmpeg_version,
+                lambda: _check_cancelled(cancel_event), runner=runner)
         client = captioner if captioner is not None else VLMClient(
             cfg["ingest"]["vlm"], timestamp_mode=cfg["ingest"].get("dense_timestamp_mode", "absolute_seconds"),
             cancel_event=cancel_event)
-        staging = Path(tempfile.mkdtemp(prefix=f".{video_id}.", dir=output.parent))
-        (staging / "frames").mkdir()
         if cfg["ingest"]["caption_mode"] == "bidirectional":
             from harness.bidirectional import publish_bidirectional
             return publish_bidirectional(

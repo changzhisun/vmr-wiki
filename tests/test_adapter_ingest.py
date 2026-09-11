@@ -587,7 +587,7 @@ def test_parallel_interrupt_propagates_cancellation_and_joins_workers(monkeypatc
     worker_started = threading.Event()
     worker_stopped = threading.Event()
 
-    def fake_ingest(vid, video, path, output, cfg, *, captioner, cancel_event):
+    def fake_ingest(vid, video, path, output, cfg, *, captioner, runner, cancel_event):
         if vid == "slow":
             worker_started.set()
             cancel_event.wait(2)

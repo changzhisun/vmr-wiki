@@ -17,27 +17,32 @@ class AgentResult:
     timed_out: bool = False
 
 
-class DockerRunner:
-    """The host repository, credentials directory, and Docker socket are never mounted."""
+class FatalAgentError(HarnessError):
+    """Shared credential, image or endpoint failure, not one video's fault."""
 
-    def __init__(self, cfg: dict):
-        self.cfg = cfg
-        self.agent = cfg["query"]["agent"]
-        key_env = cfg["query"]["api_key_env"][self.agent]
+
+class _ContainerRunner:
+    """Shared Docker lifecycle: the host repository, credentials directory, and
+    Docker socket are never mounted, and the agent gets no direct network route."""
+
+    DESTINATION_KEY = {"codex": "CODEX_API_KEY", "claude_code": "ANTHROPIC_API_KEY"}
+    BASE_URL_KEY = {"codex": "OPENAI_BASE_URL", "claude_code": "ANTHROPIC_BASE_URL"}
+
+    def _configure(self, *, agent: str, key_env: str, model: str, image: str,
+                   allowed_hosts, base_url, timeout_sec: float) -> None:
+        self.agent = agent
+        self.model = model
         key = os.environ.get(key_env)
         if not key:
-            raise HarnessError(f"Set {key_env} before running queries")
-        if cfg["query"]["model"].startswith("REPLACE_"):
-            raise HarnessError("Configure an explicit query model")
-        # Pin an image ID for the whole experiment; tag changes cannot affect later queries.
-        self.image = self._inspect(cfg["query"]["container_image"])
-        destination = "CODEX_API_KEY" if self.agent == "codex" else "ANTHROPIC_API_KEY"
-        self.env = {**os.environ, destination: key}
-        self.destination_key = destination
-        self.allowed_hosts = tuple(cfg["query"]["egress_allowed_hosts"][self.agent])
-        # An OpenAI/Anthropic compatible gateway instead of the vendor default.
-        self.base_url_key = "OPENAI_BASE_URL" if self.agent == "codex" else "ANTHROPIC_BASE_URL"
-        self.base_url = cfg["query"]["base_url"][self.agent]
+            raise FatalAgentError(f"Set {key_env} before running the {agent} agent")
+        # Pin an image ID for the whole batch; tag changes cannot affect later work.
+        self.image = self._inspect(image)
+        self.destination_key = self.DESTINATION_KEY[agent]
+        self.base_url_key = self.BASE_URL_KEY[agent]
+        self.env = {**os.environ, self.destination_key: key}
+        self.allowed_hosts = tuple(allowed_hosts)
+        self.base_url = base_url
+        self.timeout_sec = timeout_sec
         self.provenance = {"runtime": "docker", "image_id": self.image,
                            "agent_command": self.agent_command(),
                            "api_base_url": self.base_url,
@@ -49,21 +54,24 @@ class DockerRunner:
             result = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],
                                     capture_output=True, text=True, check=True, timeout=30)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise HarnessError("Docker/image unavailable. Start Docker and build the agent image; see README.") from exc
+            raise FatalAgentError("Docker/image unavailable. Start Docker and build the agent image; see README.") from exc
         digest = result.stdout.strip()
         if not digest.startswith("sha256:"):
-            raise HarnessError("Docker did not return an immutable image ID")
+            raise FatalAgentError("Docker did not return an immutable image ID")
         return digest
 
     def agent_command(self) -> list[str]:
         adapter = codex if self.agent == "codex" else claude_code
-        return adapter.command(self.cfg["query"]["model"])
+        return adapter.command(self.model)
 
-    def docker_command(self, workspace: Path, name: str, network: str) -> list[str]:
-        # A read-only root mount plus a nested writable output mount is a filesystem
-        # boundary, unlike chmod or an agent's workspace-write sandbox alone.
-        if "," in str(workspace):
+    @staticmethod
+    def _bind(source: Path, destination: str, *, readonly: bool = False) -> list[str]:
+        if "," in str(source):
             raise HarnessError("Docker bind paths must not contain commas")
+        spec = f"type=bind,src={source},dst={destination}"
+        return ["--mount", (spec + ",readonly") if readonly else spec]
+
+    def _shared_options(self, name: str, network: str) -> list[str]:
         proxy = "http://egress-proxy:8080"
         # The endpoint is provenance, not a credential, so it is passed inline.
         endpoint = ["--env", f"{self.base_url_key}={self.base_url}"] if self.base_url else []
@@ -73,16 +81,11 @@ class DockerRunner:
                 # give its embedded resolver no usable external upstream.
                 "--dns", "127.0.0.1",
                 "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-                "--user", "1000:1000", "--pids-limit", "256", "--memory", "4g", "--cpus", "2",
-                "--tmpfs", "/tmp:rw,nosuid,size=512m,mode=1777",
-                "--tmpfs", "/home/node:rw,nosuid,size=256m,uid=1000,gid=1000,mode=700",
-                "--mount", f"type=bind,src={workspace},dst=/workspace,readonly",
-                "--mount", f"type=bind,src={workspace / 'output'},dst=/workspace/output",
-                "--workdir", "/workspace", "--env", self.destination_key, *endpoint,
+                "--user", "1000:1000", *endpoint,
+                "--env", self.destination_key,
                 "--env", f"HTTPS_PROXY={proxy}", "--env", f"HTTP_PROXY={proxy}",
                 "--env", f"ALL_PROXY={proxy}", "--env", "NO_PROXY=",
-                "--env", "DISABLE_AUTOUPDATER=1", "--env", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-                self.image, *self.agent_command()]
+                "--env", "DISABLE_AUTOUPDATER=1", "--env", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"]
 
     @staticmethod
     def _docker(command: list[str], message: str, *, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -119,7 +122,7 @@ class DockerRunner:
         if removed.returncode and "No such container" not in removed.stderr:
             raise HarnessError(f"Could not confirm cleanup of container {name}")
 
-    def run(self, workspace: Path, prompt: str, stdout: Path, stderr: Path) -> AgentResult:
+    def run(self, workspace: Path, prompt: str, stdout: Path, stderr: Path, **extra) -> AgentResult:
         name = f"vmr-{uuid.uuid4().hex}"
         network = f"{name}-internal"
         proxy_name = f"{name}-proxy"
@@ -130,12 +133,12 @@ class DockerRunner:
                          "Could not create an isolated agent network")
             network_created = True
             self._start_egress_proxy(network, proxy_name)
-            command = self.docker_command(workspace, name, network)
+            command = self.docker_command(workspace, name, network, **extra)
             with stdout.open("wb") as out, stderr.open("wb") as err:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
                                            env=self.env, start_new_session=True)
                 try:
-                    process.communicate(prompt.encode("utf-8"), timeout=self.cfg["query"]["timeout_sec"])
+                    process.communicate(prompt.encode("utf-8"), timeout=self.timeout_sec)
                     return AgentResult(process.returncode)
                 except subprocess.TimeoutExpired:
                     return AgentResult(None, timed_out=True)
@@ -162,3 +165,65 @@ class DockerRunner:
                                                  capture_output=True, text=True, timeout=30)
                         if removed.returncode and "not found" not in removed.stderr.lower():
                             raise HarnessError(f"Could not remove isolated network {network}")
+
+
+class DockerRunner(_ContainerRunner):
+    """Query agent: one frozen wiki in, one prediction out."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        agent = cfg["query"]["agent"]
+        if cfg["query"]["model"].startswith("REPLACE_"):
+            raise HarnessError("Configure an explicit query model")
+        self._configure(agent=agent, key_env=cfg["query"]["api_key_env"][agent],
+                        model=cfg["query"]["model"], image=cfg["query"]["container_image"],
+                        allowed_hosts=cfg["query"]["egress_allowed_hosts"][agent],
+                        base_url=cfg["query"]["base_url"][agent],
+                        timeout_sec=cfg["query"]["timeout_sec"])
+
+    def docker_command(self, workspace: Path, name: str, network: str) -> list[str]:
+        # A read-only root mount plus a nested writable output mount is a filesystem
+        # boundary, unlike chmod or an agent's workspace-write sandbox alone.
+        return [*self._shared_options(name, network),
+                "--pids-limit", "256", "--memory", "4g", "--cpus", "2",
+                "--tmpfs", "/tmp:rw,nosuid,size=512m,mode=1777",
+                "--tmpfs", "/home/node:rw,nosuid,size=256m,uid=1000,gid=1000,mode=700",
+                *self._bind(workspace, "/workspace", readonly=True),
+                *self._bind(workspace / "output", "/workspace/output"),
+                "--workdir", "/workspace", self.image, *self.agent_command()]
+
+
+class AgentIngestRunner(_ContainerRunner):
+    """Agentic ingest: one read-only video in, one wiki out.
+
+    The video is the only data mounted, so the container holds no query, no
+    ground truth and no public dataset identifier to recognize.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        options = cfg["ingest"]["agentic"]
+        self.options = options
+        agent = options["agent"]
+        self._configure(agent=agent, key_env=options["api_key_env"][agent],
+                        model=options["model"], image=options["container_image"],
+                        allowed_hosts=options["egress_allowed_hosts"][agent],
+                        base_url=options["base_url"][agent],
+                        timeout_sec=options["timeout_sec"])
+        self.provenance = {**self.provenance, "role": "agentic_ingest"}
+
+    def docker_command(self, workspace: Path, name: str, network: str, *,
+                       video: Path, scratch: Path) -> list[str]:
+        options = self.options
+        # Frame extraction needs real disk, so scratch is a host bind rather
+        # than a tmpfs that would count against the container memory limit.
+        return [*self._shared_options(name, network),
+                "--pids-limit", str(options["pids_limit"]),
+                "--memory", f"{options['memory_gb']}g", "--cpus", str(options["cpus"]),
+                "--tmpfs", "/tmp:rw,nosuid,size=512m,mode=1777",
+                "--tmpfs", "/home/node:rw,nosuid,size=256m,uid=1000,gid=1000,mode=700",
+                *self._bind(workspace, "/workspace", readonly=True),
+                *self._bind(workspace / "output", "/workspace/output"),
+                *self._bind(video, "/input/video.mp4", readonly=True),
+                *self._bind(scratch, "/scratch"),
+                "--workdir", "/workspace", self.image, *self.agent_command()]

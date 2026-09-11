@@ -73,6 +73,44 @@ ingest:
       max_requests: null
       max_nodes: null
     shared_cache_dir: null
+  # Only read when caption_mode is agentic. A Coding Agent compiles the Wiki
+  # itself inside an isolated container, so no VLM settings above are used.
+  agentic:
+    agent: claude_code  # codex | claude_code
+    model: REPLACE_WITH_AGENT_MODEL
+    # The same image as query.container_image: one build keeps both agents on
+    # identical CLI versions, and it already carries ffmpeg.
+    container_image: vmr-wiki-agents:local
+    timeout_sec: 3600
+    # Advertised writable scratch budget for candidate frames; host-backed.
+    scratch_size_gb: 8
+    memory_gb: 8
+    cpus: 4
+    pids_limit: 512
+    max_frames: 500          # Upper bound on published evidence frames.
+    max_wiki_bytes: 4194304  # Host-side publication guards, not content.
+    max_frame_bytes: 4194304
+    frame_extraction:
+      strategy: adaptive     # adaptive | uniform
+      initial_interval_sec: 5.0
+      min_interval_sec: 0.25
+    wiki:
+      levels: [chapter, event, moment]
+      include_entities: true
+      include_objects: true
+      include_locations: true
+      include_temporal_relations: true
+      include_retrieval_aliases: true
+    api_key_env:
+      codex: CODEX_API_KEY
+      claude_code: ANTHROPIC_API_KEY
+    base_url:
+      codex: null
+      claude_code: null
+    # Replace these reserved example hosts with the endpoints the agent uses.
+    egress_allowed_hosts:
+      codex: [api.example.com, chat.example.com]
+      claude_code: [api.example.net]
 
 query:
   agent: codex

@@ -20,6 +20,15 @@ Bidirectional Wiki 使用可变 granularity 的时间语义图；`nodes.jsonl` �
 相邻上下文有重叠，但主树中兄弟节点的时间范围连续且不重叠。
 节点的时间边界由采样证据估计，confidence 是模型自报值；不能直接当作预测分数或真实概率。
 根据 Query 选择合适的层级，可以跨连续子节点定位完整活动，不能将重复出现的独立活动混为一个片段。
+Agentic Wiki 由 Coding Agent 自主编译，`wiki.md` 使用 Chapter → Event → Moment 三级层级；
+Moment 是检索意义上最小的语义单元，可以跨多个镜头。`frames.jsonl` 每行是
+frame_id、timestamp、frame、reason、description，`reason` 说明该帧为何被保留
+（均匀采样、场景/事件/动作边界、边界细化或语义证据），可用于判断边界估计的可靠程度。
+Moment 中的 `Observed` 是画面可见内容，`Inferred / retrieval semantics` 是模型推断，
+**推断不是 Ground Truth，不能单独当作证据**，必须回到对应 evidence frame 核对。
+`Retrieval aliases` 只是同义改写，用于提升召回，不代表画面里出现了新的信息。
+Temporal Relations 给出 BEFORE / AFTER / DURING / OVERLAPS / PART_OF / RESPONDS_TO / FOLLOWED_BY，
+可用于组合式 Query；重复出现的独立活动保持为多个单元，不要合并成一个长片段。
 Dense `wiki.md` 是紧凑时间线：`state` 表示稳定可见状态，`action` 表示进行中的动作，
 `transition` 表示进入、离开、开始、停止或画面切换。完全相同的段落会去重，
 但重复 Caption 的不同时间范围不会扩展合并。跨越 30 秒分组边界的段落会在相交分组中重复显示；

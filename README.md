@@ -32,7 +32,7 @@ docker build -f docker/Dockerfile \
   -t vmr-wiki-agents:local .
 ```
 
-镜像中只安装 CLI 和基本文件工具，不包含仓库、数据集或认证文件。CLI 版本可以调整，但必须支持相应 adapter 使用的参数，并为变更后的运行创建新实验。
+镜像中只安装 CLI 和基本文件工具（含 `ffmpeg`/`jq`，供 agentic ingest 自行抽帧），不包含仓库、数据集或认证文件。Ingest 与 Query 共用这一个镜像。CLI 版本可以调整，但必须支持相应 adapter 使用的参数，并为变更后的运行创建新实验。
 
 ## 配置
 
@@ -44,13 +44,14 @@ docker build -f docker/Dockerfile \
 - `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
 - `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
 - `query.base_url`：可选地为每个 Agent 指定兼容 OpenAI / Anthropic 的网关 endpoint，`null` 表示使用官方默认地址。必须是 443 端口上的 https URL，且主机名同时出现在 `query.egress_allowed_hosts` 中，否则加载配置时即报错——代理只隧道 443 的 CONNECT，Agent 那一侧只会看到一个无 body 的 403。
-- `caption_mode`：默认 `bidirectional`，执行 Top-down、独立 Bottom-up、reconciliation、边界复查和 coverage review。`hierarchical`、`dense`、`simple` 保留兼容入口。
+- `caption_mode`：默认 `bidirectional`，执行 Top-down、独立 Bottom-up、reconciliation、边界复查和 coverage review。`agentic` 由 Coding Agent 在容器内自主编译 Wiki（见 2.4）；`hierarchical`、`dense`、`simple` 保留兼容入口。
 - `caption_window_frames`：旧版 Simple / Dense 每次 VLM 请求包含的连续采样帧数量；默认 `5`，为中心目标区间提供前后画面；设为 `1` 时是单图 Caption。
 - `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；Dense 模式不能超过窗口大小的一半，以保证中心目标仍处于当前上下文中。
 - `caption_max_repairs`：Hierarchical / Dense 答案违反结构或时间约束时允许的额外重问次数，默认 2；`0` 表示第一次违规就让该视频失败。它参与 `ingest_content_hash`，因为重问会改变最终存下来的 Caption。
+- `ingest.agentic`：仅在 `caption_mode: agentic` 时读取。`agent` 选择 `codex` 或 `claude_code`，`model` 必须明确指定，`container_image` 指向带 ffmpeg 的 Ingest 镜像，`egress_allowed_hosts` / `base_url` 的规则与 `query` 侧相同。`frame_extraction`、`wiki`、`max_frames`、`agent`、`model` 以及指令模板哈希参与 `ingest_content_hash`；`container_image`、`timeout_sec`、`memory_gb`、`cpus`、`pids_limit`、`max_wiki_bytes`、`max_frame_bytes` 和出网配置属于 provenance，改动不会让已有 Wiki 失配。
 - Hierarchical 使用 `ingest.hierarchy` 的采样、停止和预算参数；`sample_interval_sec`、`caption_window_frames`、`caption_stride_frames`、`dense_timestamp_mode` 只用于旧版格式。预处理尺寸、prompt、temperature、token 上限和 Query 的 `max_predictions` 仍是固定实验变量。
 
-通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。可以在配置中指定其他变量名。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
+通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。可以在配置中指定其他变量名。`caption_mode: agentic` 不使用 `ingest.vlm`，因此不要求配置或校验 VLM endpoint，只需要所选 Coding Agent 的凭据。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
 
 配置中的相对目录均相对于配置文件所在目录解析。保存到实验中的配置使用完整路径，不包含环境变量的值。Query 模型仍需填写；值为 `REPLACE_...` 占位符时不会发起请求。
 
@@ -237,7 +238,36 @@ python harness/embed_wiki.py \
 
 输出 `vectors.npy`（L2 归一化 float32）、`index.jsonl`（行号 → node_id、时间范围、文本哈希）和 `manifest.json`（模型、源 Wiki 哈希、维度和文件哈希）。格式可直接由 NumPy 加载或导入 FAISS；导出器本身无需 NumPy。所有层级都参与向量化，embedding 文本由标题、摘要、实体、动作、前后状态组成。该步骤单独调用 Embedding API，不随 ingest 自动执行，也不会自动挂载到 Query 工作区。
 
-### 2.4 旧版 Simple / Dense
+### 2.4 Agentic Wiki（Coding Agent 自主编译）
+
+`caption_mode: agentic` 不调用 VLM，而是把每个视频交给一个隔离容器里的 Coding Agent（Codex 或 Claude Code），由它自己决定如何抽帧、如何细化边界、如何组织语义，最终产出与其他模式相同的 Wiki 目录。
+
+方法本身写在 [templates/wiki_agents.md](templates/wiki_agents.md)（HOW）里，逐视频配置由 `task.json`（WHAT）承载，两者的哈希都参与 `ingest_content_hash`：**改动指令模板等于换了一种方法，旧 Wiki 会失配**。
+
+使用与 Query 相同的 `vmr-wiki-agents:local` 镜像（见安装一节），无需单独构建：镜像里的 `ffmpeg` 供 Agent 自行抽帧，而 Query Agent 用不到它——Query 工作区只有冻结后的 Wiki，源视频从不挂载进去，"不能重新抽帧"由挂载边界保证而非镜像内容。共用一个镜像也保证两侧 CLI 版本永远一致。
+
+配置 `ingest.agentic` 的 `agent`、`model`、`egress_allowed_hosts` 后，沿用常规入口即可：
+
+```bash
+python harness/ingest_all.py --dataset qvhighlights --split train --jobs 2
+python harness/freeze.py --dataset qvhighlights --split train
+```
+
+容器挂载：workspace（`AGENTS.md`、`task.json`）只读，`/input/video.mp4` 只读，`/workspace/output` 可写，`/scratch` 可写。`--read-only` 根文件系统、`--cap-drop=ALL`、`--security-opt=no-new-privileges`、非特权 UID、内部网络加白名单出网代理与 Query 侧完全一致；资源上限由 `ingest.agentic` 的 `memory_gb`、`cpus`、`pids_limit` 控制（抽帧需要比 Query 更大的额度）。
+
+`task.json` 刻意不包含 video_id、split 或任何 Query：Wiki 必须 query-independent，而公开 benchmark 的标识符是模型可能已记住的精确查找键。宿主临时目录名也不使用 video_id，因为容器能通过 `/proc` 读到自己 bind mount 的源路径。
+
+产物契约是 `output/` 下**恰好** `wiki.md`、`frames.jsonl`、`frames/` 三样。`frames.jsonl` 沿用仓库约定的 `frame_id`（`^f[0-9]{6}$`）、`timestamp`（秒）、`frame`（`frames/NNNNNN.jpg`），并新增 `reason`（`periodic_sample`、`scene_boundary`、`event_boundary`、`action_boundary`、`boundary_refinement`、`semantic_evidence`）和 `description`，可选 `entities`、`objects`、`location`、`shot_id`。`wiki.md` 使用 Chapter → Event → Moment 三级层级，把 Observed 与 Inferred 显式分开，并给出 retrieval aliases 和时间关系。
+
+Agent 自己会在退出前自校验，但**自检不是证据**：[harness/agentic_validate.py](harness/agentic_validate.py) 在宿主端独立重跑一遍等价校验，任何一项不通过该视频即失败，不发布。校验覆盖文件集合严格相等、无符号链接与大小上限、JSONL schema 与字段白名单、`frame_id` 唯一、注册路径与磁盘图片双向 1:1（不允许孤儿图片）、timestamp 严格递增且落在视频流时长内、`wiki.md` 引用的每张图都已注册、无绝对路径与路径穿越、首行必须是 `# Video`，以及 wiki 与注册表都不泄漏视频身份。Agent 篡改自己的 `AGENTS.md` 或 `task.json` 同样判失败。
+
+Agent 的 stdout/stderr 写在 `wiki/<dataset>/.ingest-logs/<video_id>/`，位于 Wiki 目录之外，不进 `content_hashes`，不参与冻结。
+
+Agentic 模式不做视频内断点续传：一次编译是一个不透明的长容器调用，失败即整个视频重来，`ingest_all.py` 的连续失败熔断与 `.ingest-failures` 报告照常生效。缺少凭据或镜像属于共享配置失败，在批次开始前就抛出，不会记到任何一个视频头上。
+
+**不可复现性**：Agent 自主决定抽哪些帧，同一配置两次 ingest 的产物并不相同。`ingest_content_hash` 标识的是**配置**而非产物，`frozen.json` 仍然锁死具体产物。因此 Agentic Wiki 的对照实验必须复用同一份冻结产物，不能靠重跑复现。
+
+### 2.5 旧版 Simple / Dense
 
 下文的固定采样和窗口配置适用于旧版模式。切换为 `caption_mode: dense` 时，将 `templates/dense_prompt.md` 的内容写入 `ingest.vlm.prompt`；Simple 则使用无时间戳占位符的普通 Caption prompt。复用旧产物时使用其原始配置及 Wiki 根目录。
 
@@ -514,6 +544,8 @@ Split 测试覆盖任意名称、unknown split、严格布尔类型、默认 eva
 
 测试通过 FFmpeg 生成三秒视频，使用明确的测试 captioner 与短生命周期子进程模拟模型输出。覆盖完整链路、Query/GT 不被 Ingest 读取、GT 不被 Query 读取、隔离输入结构、篡改检测、失败不重跑、超时/非法输出、AP 匹配和排名语义。没有 FFmpeg 时媒体集成测试会明确跳过。模拟 runner 只存在于测试，不是正式实验选项。
 
+Agentic 模式由 [tests/test_agentic.py](tests/test_agentic.py) 用一个不联网的 fixture runner 扮演 Coding Agent，覆盖 ingest → freeze → query 完整链路、`task.json` 不含 Query/Split/视频身份、已完成 Wiki 只核验不重编译、十七种契约违规逐项拒绝、身份泄漏检测的长度下界、指令模板与模型属于内容身份而容器预算不是，以及只读视频挂载与凭据不进命令行。
+
 新增测试覆盖显式 Dense 时间坐标、窗口续跑与缓存损坏、内容版本隔离、编码缓存和请求遥测，以及四组对照实验的离线完整链路。GitHub Actions 在 Python 3.10 / 3.12 上安装 FFmpeg，运行聚焦错误级别的 Ruff 检查和 pytest。Query 失败日志直接显示失败类别、简短原因及 metadata/stdout/stderr 文件路径。
 
 构建镜像后可执行真实容器检查，测试不调用模型 API：
@@ -536,6 +568,7 @@ VMR_OFFICIAL_ROOT=/path/to/moment_detr \
 | Split / Dataset metadata | `harness/dataset.py`、`harness/results.py` |
 | Dataset Adapter | `adapters/base.py`、`adapters/qvhighlights.py`、`adapters/uca.py` |
 | Ingest | `harness/ingest.py`、`harness/ingest_all.py`、`harness/vlm.py` |
+| Agentic Ingest | `harness/agentic.py`、`harness/agentic_config.py`、`harness/agentic_validate.py`、`templates/wiki_agents.md` |
 | Freeze | `harness/freeze.py` |
 | Query | `harness/run_query.py`、`harness/run_all_queries.py`、`harness/workspace.py` |
 | Agent | `agents/codex.py`、`agents/claude_code.py`、`agents/runner.py` |

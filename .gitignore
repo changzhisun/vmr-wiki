@@ -8,8 +8,10 @@ videos/
 wiki/
 wiki-hierarchical/
 wiki-bidirectional/
+wiki-agentic/
 embeddings/
 runs/
 results/
 .env
 /tmp.yaml
+/new.yaml

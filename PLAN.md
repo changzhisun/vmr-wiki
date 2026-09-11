@@ -220,6 +220,9 @@ vmr-wiki/
 ├── harness/
 │   ├── ingest.py
 │   ├── ingest_all.py
+│   ├── agentic.py
+│   ├── agentic_config.py
+│   ├── agentic_validate.py
 │   ├── run_query.py
 │   ├── run_all_queries.py
 │   ├── workspace.py
@@ -237,7 +240,9 @@ vmr-wiki/
 │
 ├── templates/
 │   ├── AGENTS.md
-│   └── query_prompt.md
+│   ├── query_prompt.md
+│   ├── wiki_agents.md
+│   └── wiki_prompt.md
 │
 ├── datasets/
 │   └── <dataset_name>/
@@ -401,6 +406,37 @@ python harness/ingest_all.py \
 - temperature；
 - max tokens；
 - output schema。
+
+### 6.3 Agentic Ingest（caption_mode: agentic）
+
+第四种 caption 后端：不调用 VLM，而是把视频交给隔离容器里的 Coding Agent（Codex 或 Claude Code），由它自主决定抽帧与语义组织。它不是一条平行管线，而是 `ingest_video()` 的一个分派分支，因此 `ingest_all.py` 的并发调度与失败熔断、`freeze.py`、`run_all_queries.py`、`evaluate.py` 全部沿用。
+
+```text
+读取 task.json（无 video_id / 无 Query / 无 split）
+        ↓
+Agent 自主 ffprobe、粗采样、语义检查、局部细化
+        ↓
+Agent 选定证据帧并自校验
+        ↓
+宿主端独立重跑确定性校验（自检不是证据）
+        ↓
+拷入 staging → 写 ingest.json → 原子发布
+```
+
+责任划分刻意分开：
+
+```text
+templates/wiki_agents.md  = HOW
+task.json                 = WHAT
+/input/video.mp4          = DATA
+output/                   = RESULT
+```
+
+Agent 后端可替换：Codex、Claude Code 或未来的 Coding Agent 都遵守同一套输入/输出契约，产物 schema 不依赖具体 Agent。
+
+`ingest_content_hash` 覆盖 `agent`、`model`、`frame_extraction`、`wiki`、`max_frames` 和指令模板哈希——AGENTS.md 就是方法本身。容器镜像、超时、资源上限和出网配置属于 provenance。
+
+Agentic 模式不做视频内断点续传：一次编译是一个不透明的长容器调用。Agent 自主决定抽哪些帧，同配置两次 ingest 产物不同；内容哈希标识配置而非产物，对照实验必须复用同一份冻结产物。
 
 ---
 

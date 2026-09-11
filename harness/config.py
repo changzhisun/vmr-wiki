@@ -66,8 +66,9 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         if number(ingest["sample_interval_sec"], "sample_interval_sec") <= 0:
             raise HarnessError("sample_interval_sec must be positive")
         ingest.setdefault("caption_mode", "simple")
-        if ingest["caption_mode"] not in ("simple", "dense", "hierarchical", "bidirectional"):
-            raise HarnessError("caption_mode must be simple, dense, hierarchical, or bidirectional")
+        if ingest["caption_mode"] not in ("simple", "dense", "hierarchical", "bidirectional", "agentic"):
+            raise HarnessError(
+                "caption_mode must be simple, dense, hierarchical, bidirectional, or agentic")
         if ingest["caption_mode"] == "bidirectional":
             from harness.bidirectional_config import PIPELINE_VERSION, settings
             if ingest.get("pipeline_version", PIPELINE_VERSION) != PIPELINE_VERSION:
@@ -83,6 +84,31 @@ def load_config(path: str | Path = "config.yaml") -> dict:
                 raise HarnessError("Unsupported hierarchy_processing_version; use a new wiki root")
             ingest["hierarchy_processing_version"] = HIERARCHY_VERSION
             ingest["hierarchy"] = settings(ingest)
+        if ingest["caption_mode"] == "agentic":
+            from harness.agentic_config import AGENTIC_VERSION, settings
+            if ingest.get("agentic_version", AGENTIC_VERSION) != AGENTIC_VERSION:
+                raise HarnessError("Unsupported agentic_version; use a new wiki root")
+            ingest["agentic_version"] = AGENTIC_VERSION
+            ingest["agentic"] = settings(ingest, Path(cfg["paths"]["templates"]))
+            agentic = ingest["agentic"]
+            agent = agentic["agent"]
+            hosts = agentic["egress_allowed_hosts"].get(agent)
+            if not isinstance(hosts, list) or not hosts:
+                raise HarnessError(
+                    f"ingest.agentic.egress_allowed_hosts.{agent} must be a nonempty list")
+            normalized = [hostname(host, f"ingest.agentic.egress_allowed_hosts.{agent}")
+                          for host in hosts]
+            if len(set(normalized)) != len(normalized):
+                raise HarnessError(f"ingest.agentic.egress_allowed_hosts.{agent} contains duplicates")
+            agentic["egress_allowed_hosts"] = {agent: normalized}
+            agentic["base_url"] = {agent: agentic["base_url"].get(agent)}
+            agentic["api_key_env"] = {agent: agentic["api_key_env"][agent]}
+            if agentic["base_url"][agent] is not None:
+                host = endpoint_host(agentic["base_url"][agent], f"ingest.agentic.base_url.{agent}")
+                if host not in normalized:
+                    raise HarnessError(
+                        f"ingest.agentic.base_url.{agent} host {host!r} is not in "
+                        f"ingest.agentic.egress_allowed_hosts.{agent}; the agent could not reach it")
         ingest.setdefault("dense_timestamp_mode", "absolute_seconds")
         if ingest["dense_timestamp_mode"] not in ("absolute_seconds", "frame_index"):
             raise HarnessError("dense_timestamp_mode must be absolute_seconds or frame_index")
@@ -106,36 +132,39 @@ def load_config(path: str | Path = "config.yaml") -> dict:
         positive_int(ingest["image_max_size"], "image_max_size")
         if not 2 <= positive_int(ingest["jpeg_quality"], "jpeg_quality") <= 31:
             raise HarnessError("jpeg_quality must be in [2, 31]")
-        vlm = ingest["vlm"]
-        vlm.setdefault("max_concurrent_requests", 4)
-        vlm.setdefault("max_retry_delay_sec", 60)
-        vlm.setdefault("queue_timeout_sec", 300)
-        positive_int(vlm["max_concurrent_requests"], "vlm.max_concurrent_requests")
-        for key in ("max_retry_delay_sec", "queue_timeout_sec"):
-            number(vlm[key], "vlm." + key, 0.001)
-        if vlm["provider"] != "openai-compatible":
-            raise HarnessError("Supported VLM provider: openai-compatible")
-        for key in ("model", "prompt", "base_url", "api_key_env"):
-            nonempty(vlm[key], f"vlm.{key}")
-        timeline_fields = vlm["prompt"].count("{{FRAME_TIMESTAMPS}}")
-        if ingest["caption_mode"] == "dense" and timeline_fields != 1:
-            raise HarnessError(
-                "dense caption prompt must contain exactly one {{FRAME_TIMESTAMPS}} placeholder"
-            )
-        if ingest["caption_mode"] == "simple" and timeline_fields:
-            raise HarnessError(
-                "simple caption prompt must not contain {{FRAME_TIMESTAMPS}}"
-            )
-        if ingest["caption_mode"] in ("hierarchical", "bidirectional") and timeline_fields:
-            raise HarnessError(
-                "hierarchical builds its own frame timeline; prompt must not contain {{FRAME_TIMESTAMPS}}"
-            )
-        number(vlm["temperature"], "temperature", 0)
-        positive_int(vlm["max_tokens"], "max_tokens")
-        if number(vlm["timeout_sec"], "vlm.timeout_sec") <= 0:
-            raise HarnessError("vlm.timeout_sec must be positive")
-        if type(vlm["max_retries"]) is not int or vlm["max_retries"] < 0:
-            raise HarnessError("max_retries must be a nonnegative integer")
+        # A coding agent brings its own model and endpoint, so an agentic wiki
+        # root must not require a VLM deployment it never calls.
+        if ingest["caption_mode"] != "agentic":
+            vlm = ingest["vlm"]
+            vlm.setdefault("max_concurrent_requests", 4)
+            vlm.setdefault("max_retry_delay_sec", 60)
+            vlm.setdefault("queue_timeout_sec", 300)
+            positive_int(vlm["max_concurrent_requests"], "vlm.max_concurrent_requests")
+            for key in ("max_retry_delay_sec", "queue_timeout_sec"):
+                number(vlm[key], "vlm." + key, 0.001)
+            if vlm["provider"] != "openai-compatible":
+                raise HarnessError("Supported VLM provider: openai-compatible")
+            for key in ("model", "prompt", "base_url", "api_key_env"):
+                nonempty(vlm[key], f"vlm.{key}")
+            timeline_fields = vlm["prompt"].count("{{FRAME_TIMESTAMPS}}")
+            if ingest["caption_mode"] == "dense" and timeline_fields != 1:
+                raise HarnessError(
+                    "dense caption prompt must contain exactly one {{FRAME_TIMESTAMPS}} placeholder"
+                )
+            if ingest["caption_mode"] == "simple" and timeline_fields:
+                raise HarnessError(
+                    "simple caption prompt must not contain {{FRAME_TIMESTAMPS}}"
+                )
+            if ingest["caption_mode"] in ("hierarchical", "bidirectional") and timeline_fields:
+                raise HarnessError(
+                    "hierarchical builds its own frame timeline; prompt must not contain {{FRAME_TIMESTAMPS}}"
+                )
+            number(vlm["temperature"], "temperature", 0)
+            positive_int(vlm["max_tokens"], "max_tokens")
+            if number(vlm["timeout_sec"], "vlm.timeout_sec") <= 0:
+                raise HarnessError("vlm.timeout_sec must be positive")
+            if type(vlm["max_retries"]) is not int or vlm["max_retries"] < 0:
+                raise HarnessError("max_retries must be a nonnegative integer")
         query = cfg["query"]
         if query["agent"] not in ("codex", "claude_code"):
             raise HarnessError("query.agent must be codex or claude_code")
