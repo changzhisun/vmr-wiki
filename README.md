@@ -258,6 +258,8 @@ python harness/freeze.py --dataset qvhighlights --split train
 
 Agent 自己会在退出前自校验，但**自检不是证据**：[harness/agentic_validate.py](harness/agentic_validate.py) 在宿主端独立重跑一遍等价校验，任何一项不通过该视频即失败，不发布。校验覆盖文件集合严格相等、无符号链接与大小上限、JSONL schema 与字段白名单、`frame_id` 唯一、注册路径与磁盘图片双向 1:1（不允许孤儿图片）、timestamp 严格递增且落在视频流时长内、`wiki.md` 引用的每张图都已注册、无绝对路径与路径穿越、首行必须是 `# Video`，以及 wiki 与注册表都不泄漏视频身份。Agent 篡改自己的 `AGENTS.md` 或 `task.json` 同样判失败。
 
+如果 Agent 正常退出但缺少 `wiki.md`、`frames.jsonl` 或 `frames/`，Harness 会在原 workspace 和 scratch 上追加一次定向修复；修复与首次运行共享同一个 `wiki.method_config.timeout_sec` 总预算，且每次调用的剩余 timeout 独立传入，不会在 `--jobs>1` 时影响其他视频。修复日志单独保存为 `agent.repair.stdout.log` / `agent.repair.stderr.log`，次数记录在 `telemetry.artifact_repairs`。格式错误、额外文件和校验失败不会无限重试。
+
 Agent 的可读 stdout、stderr 和完整 CLI 事件流分别写在
 `wiki/<dataset>/.ingest-logs/<video_id>/agent.stdout.log`、`agent.stderr.log` 和
 `agent.trace.jsonl`，位于 Wiki 目录之外，不进 `content_hashes`，不参与冻结。事件流默认启用：

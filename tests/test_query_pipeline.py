@@ -162,6 +162,24 @@ def test_container_runner_wait_observes_cooperative_cancellation(cfg, monkeypatc
     assert time.monotonic() - started < 2
 
 
+def test_container_runner_timeout_override_is_per_call(cfg, monkeypatch):
+    monkeypatch.setenv("CODEX_API_KEY", "test-secret")
+    monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))
+    runner = DockerRunner(cfg)
+    configured_timeout = runner.timeout_sec
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.PIPE)
+    started = time.monotonic()
+    try:
+        result = runner._wait_for_agent(process, "prompt", None, timeout_sec=0.05)
+    finally:
+        process.kill()
+        process.wait(timeout=2)
+    assert result.timed_out
+    assert time.monotonic() - started < 2
+    assert runner.timeout_sec == configured_timeout
+
+
 def test_all_prediction_ends_over_duration_are_clamped():
     prediction = {"moments": [
         {"start_sec": 41.0, "end_sec": 43.933333, "score": 0.9},

@@ -102,11 +102,15 @@ class FixtureIngestRunner:
     def __init__(self, behavior="valid"):
         self.behavior = behavior
         self.jobs, self.tasks, self.videos, self.scratches = [], [], [], []
+        self.prompts, self.timeouts = [], []
 
-    def run(self, job, prompt, stdout, stderr, *, video, scratch, cancel_event=None):
+    def run(self, job, prompt, stdout, stderr, *, video, scratch, cancel_event=None,
+            timeout_sec=None):
         self.jobs.append(Path(job))
         self.videos.append(Path(video))
         self.scratches.append(Path(scratch))
+        self.prompts.append(prompt)
+        self.timeouts.append(timeout_sec)
         self.tasks.append(read_json(Path(job) / "task.json"))
         stdout.write_bytes(b"fixture agent stdout\n")
         stderr.write_bytes(b"")
@@ -117,6 +121,9 @@ class FixtureIngestRunner:
             return AgentResult(3)
         if self.behavior == "missing":
             return AgentResult(0)
+        if self.behavior == "frames_only_then_valid" and len(self.jobs) == 1:
+            (output / "frames").mkdir()
+            return AgentResult(0)
         if self.behavior == "tamper":
             instructions = Path(job) / "AGENTS.md"
             instructions.chmod(0o644)
@@ -125,7 +132,7 @@ class FixtureIngestRunner:
 
         rows = frame_rows()
         frames = output / "frames"
-        frames.mkdir()
+        frames.mkdir(exist_ok=True)
         for row in rows:
             (output / row["frame"]).write_bytes(JPEG)
         wiki = wiki_text(rows)
@@ -192,6 +199,7 @@ def test_agentic_wiki_flows_through_freeze_and_query(agentic):
     metadata = read_json(wiki / "ingest.json")
     assert metadata["agentic_version"] == AGENTIC_VERSION
     assert metadata["telemetry"]["frame_count"] == 3
+    assert metadata["telemetry"]["artifact_repairs"] == 0
     assert metadata["agent_provenance"]["model"] == "fixture-agent-model"
     assert "vlm" not in metadata["ingest_config_hash"]
 
@@ -225,6 +233,24 @@ def test_task_json_carries_no_query_split_or_video_identity(agentic):
     # the video, and the mounted video is the real read-only source.
     assert "video" not in runner.jobs[0].name
     assert runner.videos[0].name == "video.mp4"
+
+
+def test_incomplete_output_is_repaired_on_a_second_attempt(agentic):
+    from harness.agentic import REPAIR_PROMPT
+
+    cfg = agentic
+    runner = FixtureIngestRunner("frames_only_then_valid")
+    ingest_all(cfg, runner=runner, jobs=1)
+    wiki = Path(cfg["paths"]["wiki"]) / "qvhighlights" / "videos" / "video"
+    assert (wiki / "wiki.md").is_file() and (wiki / "frames.jsonl").is_file()
+    metadata = read_json(wiki / "ingest.json")
+    assert metadata["telemetry"]["artifact_repairs"] == 1
+    assert len(runner.jobs) == 2 and runner.jobs[0] == runner.jobs[1]
+    assert runner.prompts[1] == REPAIR_PROMPT
+    assert runner.timeouts[0] is None
+    assert 60 <= runner.timeouts[1] <= cfg["ingest"]["agentic"]["timeout_sec"]
+    logs = Path(cfg["paths"]["wiki"]) / "qvhighlights" / ".ingest-logs" / "video"
+    assert (logs / "agent.repair.stdout.log").read_text() == "fixture agent stdout\n"
 
 
 def test_ingest_all_reuses_a_completed_agentic_wiki(agentic):

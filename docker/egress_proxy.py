@@ -8,6 +8,52 @@ import socketserver
 
 
 MAX_HEADER = 64 * 1024
+# Poll interval only. Idle CONNECT tunnels must stay up: Claude Code streams
+# SSE with long TTFB, and agentic ingest can spend minutes in ffmpeg between
+# requests. Closing here produced "socket connection was closed unexpectedly".
+IDLE_SELECT_SEC = 60
+
+
+def enable_keepalive(sock: socket.socket) -> None:
+    """Detect dead peers without tearing down a quiet live tunnel."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return  # Keepalive is diagnostic; failure must not break the tunnel.
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return
+    for option_name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 10),
+                               ("TCP_KEEPCNT", 6)):
+        option = getattr(socket, option_name, None)
+        if option is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+            except OSError:
+                pass
+
+
+def relay_tunnel(client: socket.socket, upstream: socket.socket,
+                 *, idle_select: float = IDLE_SELECT_SEC) -> None:
+    sockets = (client, upstream)
+    while True:
+        try:
+            readable, _, _ = select.select(sockets, (), (), idle_select)
+        except (OSError, ValueError):
+            return
+        if not readable:
+            continue
+        for source in readable:
+            try:
+                data = source.recv(64 * 1024)
+            except OSError:
+                return
+            if not data:
+                return
+            destination = upstream if source is client else client
+            try:
+                destination.sendall(data)
+            except OSError:
+                return
 
 
 class ProxyHandler(socketserver.BaseRequestHandler):
@@ -40,18 +86,10 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             return
         with upstream:
+            enable_keepalive(self.request)
+            enable_keepalive(upstream)
             self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            sockets = (self.request, upstream)
-            while True:
-                readable, _, _ = select.select(sockets, (), (), 60)
-                if not readable:
-                    return
-                for source in readable:
-                    data = source.recv(64 * 1024)
-                    if not data:
-                        return
-                    destination = upstream if source is self.request else self.request
-                    destination.sendall(data)
+            relay_tunnel(self.request, upstream)
 
 
 class ThreadingProxy(socketserver.ThreadingMixIn, socketserver.TCPServer):

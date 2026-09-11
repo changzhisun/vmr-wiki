@@ -206,7 +206,8 @@ class _ContainerRunner:
         if removed.returncode and "No such container" not in removed.stderr:
             raise HarnessError(f"Could not confirm cleanup of container {name}")
 
-    def _wait_for_agent(self, process: subprocess.Popen, prompt: str, cancel_event) -> AgentResult:
+    def _wait_for_agent(self, process: subprocess.Popen, prompt: str, cancel_event, *,
+                        timeout_sec: float | None = None) -> AgentResult:
         if cancel_event is not None and cancel_event.is_set():
             raise AgentCancelled("Agent cancelled")
         assert process.stdin is not None
@@ -219,7 +220,7 @@ class _ContainerRunner:
             with suppress(BrokenPipeError):
                 process.stdin.close()
             process.stdin = None
-        deadline = time.monotonic() + self.timeout_sec
+        deadline = time.monotonic() + (self.timeout_sec if timeout_sec is None else timeout_sec)
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 raise AgentCancelled("Agent cancelled")
@@ -243,7 +244,7 @@ class _ContainerRunner:
             pass  # Never hide the agent or cleanup failure with a derived-log failure.
 
     def run(self, workspace: Path, prompt: str, stdout: Path, stderr: Path, *,
-            cancel_event=None, **extra) -> AgentResult:
+            cancel_event=None, timeout_sec: float | None = None, **extra) -> AgentResult:
         name = f"vmr-{uuid.uuid4().hex}"
         network = f"{name}-internal"
         proxy_name = f"{name}-proxy"
@@ -265,7 +266,8 @@ class _ContainerRunner:
             with trace.open("ab") as events, stderr.open("wb") as err:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=events, stderr=err,
                                            env=self.env, start_new_session=True)
-                result = self._wait_for_agent(process, prompt, cancel_event)
+                result = self._wait_for_agent(
+                    process, prompt, cancel_event, timeout_sec=timeout_sec)
         finally:
             try:
                 # Kill the container as well as its client, including on Ctrl-C.

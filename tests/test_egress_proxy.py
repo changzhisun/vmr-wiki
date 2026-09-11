@@ -1,8 +1,11 @@
+import socket
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from docker.egress_proxy import ProxyHandler
+from docker.egress_proxy import ProxyHandler, enable_keepalive, relay_tunnel
 from harness.common import HarnessError
 from harness.config import hostname
 
@@ -49,3 +52,33 @@ def test_egress_config_requires_exact_public_dns_names(value):
 
 def test_egress_config_normalizes_hostnames():
     assert hostname("API.OpenAI.Com", "allowed host") == "api.openai.com"
+
+
+def test_idle_select_does_not_close_a_quiet_tunnel():
+    client_a, client_b = socket.socketpair()
+    up_a, up_b = socket.socketpair()
+    for sock in (client_a, client_b, up_a, up_b):
+        sock.settimeout(2)
+    thread = threading.Thread(
+        target=relay_tunnel, args=(client_b, up_a),
+        kwargs={"idle_select": 0.05}, daemon=True)
+    thread.start()
+    try:
+        time.sleep(0.2)
+        client_a.sendall(b"hello")
+        assert up_b.recv(16) == b"hello"
+        up_b.sendall(b"world")
+        assert client_a.recv(16) == b"world"
+    finally:
+        for sock in (client_a, client_b, up_a, up_b):
+            sock.close()
+        thread.join(timeout=1)
+
+
+def test_enable_keepalive_tolerates_unix_sockets():
+    a, b = socket.socketpair()
+    try:
+        enable_keepalive(a)
+    finally:
+        a.close()
+        b.close()

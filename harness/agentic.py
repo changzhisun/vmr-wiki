@@ -20,6 +20,33 @@ from harness.ingest import media_command
 LOG = logging.getLogger(__name__)
 
 PUBLISHED = ("wiki.md", "frames.jsonl")
+REQUIRED_OUTPUT = ("wiki.md", "frames.jsonl", "frames")
+
+# Recovery only: not part of the content hash. Some models emit a successful
+# end_turn after creating output/frames/ but before writing wiki.md, often
+# after dumping tool XML as text. One follow-up on the same scratch is enough
+# to finish without changing the instruction templates.
+REPAIR_PROMPT = (
+    "output/ 还不完整：必须恰好有 frames/、frames.jsonl、wiki.md。"
+    "不要再逐张 Read 候选 JPEG，也不要把工具调用写成文本。"
+    "/scratch 里已有候选帧的话直接选用；把终选帧复制到 output/frames/ 并编号为 "
+    "000001.jpg 起，写出 frames.jsonl 和 wiki.md（首行必须是 # Video），自校验后立即结束。\n"
+)
+MIN_REPAIR_SEC = 60
+
+
+def _missing_required(output: Path) -> bool:
+    if not output.is_dir():
+        return True
+    names = {path.name for path in output.iterdir()}
+    return not set(REQUIRED_OUTPUT) <= names
+
+
+def _run_agent(runner, job, prompt, stdout, stderr, *, video, scratch, cancel_event,
+               timeout_sec=None):
+    timeout = {"timeout_sec": timeout_sec} if timeout_sec is not None else {}
+    return runner.run(job, prompt, stdout, stderr, video=video, scratch=scratch,
+                      cancel_event=cancel_event, **timeout)
 
 
 def probe_media(video: Path) -> dict:
@@ -123,8 +150,22 @@ def publish_agentic(video, video_id, output, staging, checkpoint, client, cfg,
 
         check()
         started = time.monotonic()
-        result = runner.run(job, prompt, logs / "agent.stdout.log", logs / "agent.stderr.log",
-                            video=video, scratch=scratch, cancel_event=cancel_event)
+        result = _run_agent(
+            runner, job, prompt, logs / "agent.stdout.log", logs / "agent.stderr.log",
+            video=video, scratch=scratch, cancel_event=cancel_event)
+        repairs = 0
+        budget = options["timeout_sec"]
+        remaining = budget - (time.monotonic() - started)
+        if (not result.timed_out and result.exit_code == 0
+                and _missing_required(job / "output") and remaining >= MIN_REPAIR_SEC):
+            check()
+            LOG.warning("%s: agent exited without wiki.md/frames.jsonl; retrying once "
+                        "(%.0fs remaining); logs: %s", video_id, remaining, logs)
+            result = _run_agent(
+                runner, job, REPAIR_PROMPT, logs / "agent.repair.stdout.log",
+                logs / "agent.repair.stderr.log", video=video, scratch=scratch,
+                cancel_event=cancel_event, timeout_sec=remaining)
+            repairs = 1
         elapsed = time.monotonic() - started
         check()
         if result.timed_out:
@@ -169,6 +210,7 @@ def publish_agentic(video, video_id, output, staging, checkpoint, client, cfg,
             "telemetry": {"agent_sec": elapsed, "exit_code": result.exit_code,
                           "frame_count": len(rows),
                           "wiki_md_bytes": (staging / "wiki.md").stat().st_size,
+                          "artifact_repairs": repairs,
                           "reasons": {reason: sum(row["reason"] == reason for row in rows)
                                       for reason in sorted({row["reason"] for row in rows})}},
             "content_hashes": tree_hashes(staging),
