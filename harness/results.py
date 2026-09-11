@@ -15,7 +15,9 @@ def check_identity(record: dict, dataset: str, split: str) -> None:
 
 def experiment_context(root: Path, dataset_dir: Path | None, split: str | None):
     saved_path = root / "config.yaml"
-    saved = load_config(saved_path) if saved_path.exists() else None
+    # Experiment snapshots use the normalized internal (v1-shaped) contract;
+    # they are not user-authored legacy configs.
+    saved = load_config(saved_path, warn_legacy=False) if saved_path.exists() else None
     experiment_path = root / "experiment.json"
     experiment = read_json(experiment_path) if experiment_path.exists() else None
     if dataset_dir is None:

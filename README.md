@@ -38,22 +38,19 @@ docker build -f docker/Dockerfile \
 
 编辑 [config.yaml](config.yaml)：
 
-- `ingest.vlm.model`：明确指定支持图像输入、`temperature` 和 `max_tokens` 的 Chat Completions 模型。
-- `query.model`：明确指定所使用的 Agent 模型。
-- `ingest.vlm.base_url`：按当前配置选择兼容 Chat Completions 的 VLM `/v1` endpoint。
-- `ingest.vlm.api_key_env`、`query.api_key_env`：只填写环境变量名，不填写密钥。
-- `query.egress_allowed_hosts`：分别为 Codex / Claude Code 声明允许访问的精确模型 API 主机名；不接受通配符或 IP。
-- `query.base_url`：可选地为每个 Agent 指定兼容 OpenAI / Anthropic 的网关 endpoint，`null` 表示使用官方默认地址。必须是 443 端口上的 https URL，且主机名同时出现在 `query.egress_allowed_hosts` 中，否则加载配置时即报错——代理只隧道 443 的 CONNECT，Agent 那一侧只会看到一个无 body 的 403。
-- `caption_mode`：默认 `bidirectional`，执行 Top-down、独立 Bottom-up、reconciliation、边界复查和 coverage review。`agentic` 由 Coding Agent 在容器内自主编译 Wiki（见 2.4）；`hierarchical`、`dense`、`simple` 保留兼容入口。
-- `caption_window_frames`：旧版 Simple / Dense 每次 VLM 请求包含的连续采样帧数量；默认 `5`，为中心目标区间提供前后画面；设为 `1` 时是单图 Caption。
-- `caption_stride_frames`：相邻 Caption 窗口前进的采样帧数量；Dense 模式不能超过窗口大小的一半，以保证中心目标仍处于当前上下文中。
-- `caption_max_repairs`：Hierarchical / Dense 答案违反结构或时间约束时允许的额外重问次数，默认 2；`0` 表示第一次违规就让该视频失败。它参与 `ingest_content_hash`，因为重问会改变最终存下来的 Caption。
-- `ingest.agentic`：仅在 `caption_mode: agentic` 时读取。`agent` 选择 `codex` 或 `claude_code`，`model` 必须明确指定，`container_image` 指向带 ffmpeg 的 Ingest 镜像，`egress_allowed_hosts` / `base_url` 的规则与 `query` 侧相同。`frame_extraction`、`wiki`、`max_frames`、`agent`、`model` 以及指令模板哈希参与 `ingest_content_hash`；`container_image`、`timeout_sec`、`memory_gb`、`cpus`、`pids_limit`、`max_wiki_bytes`、`max_frame_bytes` 和出网配置属于 provenance，改动不会让已有 Wiki 失配。
-- Hierarchical 使用 `ingest.hierarchy` 的采样、停止和预算参数；`sample_interval_sec`、`caption_window_frames`、`caption_stride_frames`、`dense_timestamp_mode` 只用于旧版格式。预处理尺寸、prompt、temperature、token 上限和 Query 的 `max_predictions` 仍是固定实验变量。
+- `profiles.agents`：可复用的 Coding Agent 部署；每个 profile 只描述一种 `kind`、模型、认证变量名、endpoint、出网白名单和容器镜像。`query.agent_profile` 或 agentic Wiki 引用 profile，不再复制整套连接配置。
+- `profiles.vlms`：可复用的 VLM 部署。`generation` 只放 temperature/token 上限，`transport` 只放超时、重试和并发控制。
+- `wiki.method`：选择 `bidirectional`、`agentic`、`hierarchical`、`dense` 或 `simple`。`wiki.method_config` 只允许当前方法的参数，避免无效模式配置同时出现。
+- `wiki.media`：共享的抽帧间隔、图像尺寸和 JPEG 质量；`wiki.repair_attempts` 是结构化回答的额外修复次数。
+- `query.input_mode`：`multimodal` 会把 `wiki/frames/` 提供给 Agent；`text` 不复制图片，并使用独立纯文本模板。
+- `batch.consecutive_failure_limit`：Ingest 连续失败熔断阈值。Query/Ingest 的实际 worker 数仍由各命令的 `--jobs` 指定。
+- `storage.root`：其他存储目录的共同基准；它相对于入口配置文件解析。
 
-通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。可以在配置中指定其他变量名。`caption_mode: agentic` 不使用 `ingest.vlm`，因此不要求配置或校验 VLM endpoint，只需要所选 Coding Agent 的凭据。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
+通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。profile 中只保存环境变量名，不保存密钥。`wiki.method: agentic` 不需要 VLM profile，只需要 `wiki.agent_profile` 指向的 Coding Agent 凭据。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
 
-配置中的相对目录均相对于配置文件所在目录解析。保存到实验中的配置使用完整路径，不包含环境变量的值。Query 模型仍需填写；值为 `REPLACE_...` 占位符时不会发起请求。
+v2 配置可以用显式 `extends` 组合一个路径或路径列表；父文件按顺序深度合并，入口文件最后覆盖，列表整体替换。相对 include 路径相对于声明它的文件，存储路径统一相对于入口配置的 `storage.root`。不要依赖跨文件 YAML anchor。执行时会先归一化成一份完整的旧内部结构，实验保存的仍是可独立复现的完整配置快照。可用 `python harness/config.py explain --config CONFIG` 查看归一化结果和 Wiki 内容哈希。
+
+未写 `version` 的旧配置仍可加载，但已标记 deprecated。v1/v2 的等价配置产生相同内部配置和 `ingest_content_hash`。Query 模型仍需填写；值为 `REPLACE_...` 占位符时不会发起请求。
 
 ## 1. 转换数据集
 
@@ -180,11 +177,11 @@ wiki.md frames.jsonl frames/ ingest.json frozen.json
 
 节点使用 `granularity` 与 `type`，type 可以是 `chapter`、`scene`、`event`、`action`、`state_change`、`transition`、`dialogue` 或 `other`。`confidence` 是分别记录 semantic、boundary、hierarchy 的 high/medium/low 标签；旧版数字 confidence 只作为 legacy 信息，不转换成 high。节点允许 overlap/gap，主 parent 关系无环；一个 observation 可以支持多个节点。
 
-异常处理分三层：网络错误、空响应及损坏的 API JSON 最多按 `vlm.max_retries` 重试；回答内的 JSON 语法错误交给同一 VLM 纯文本修复；字段类型、时间区间、关系等不合要求时，回传原因重新生成。双向流程对 token 截断也会要求重新返回完整且简洁的结构，不接受截断片段。每个逻辑请求最多 `1 + caption_max_repairs` 次生成及 `caption_max_repairs` 次格式修复，传输层重试另计。401/403/404、模型拒绝及耗尽传输重试不会再触发语义层重试。重试、修复、失败和 usage 均保留审计；仍不合法时保留 checkpoint，禁止发布不完整 Wiki。语义不确定但结构合法的内容沿用 unresolved 证据候选。
+异常处理分三层：网络错误、空响应及损坏的 API JSON 最多按所选 VLM profile 的 `transport.max_retries` 重试；回答内的 JSON 语法错误交给同一 VLM 纯文本修复；字段类型、时间区间、关系等不合要求时，回传原因重新生成。双向流程对 token 截断也会要求重新返回完整且简洁的结构，不接受截断片段。每个逻辑请求最多 `1 + wiki.repair_attempts` 次生成及 `wiki.repair_attempts` 次格式修复，传输层重试另计。401/403/404、模型拒绝及耗尽传输重试不会再触发语义层重试。重试、修复、失败和 usage 均保留审计；仍不合法时保留 checkpoint，禁止发布不完整 Wiki。语义不确定但结构合法的内容沿用 unresolved 证据候选。
 
-`--jobs` 控制并行视频数，`ingest.vlm.max_concurrent_requests`（默认 4）独立限制同一进程内、同一 endpoint 的在途 API 请求，覆盖图像、纯文本、修复和重试。429/503 触发共享冷却，重试采用指数退避与随机抖动，并解析数值或日期形式的 `Retry-After`。共享冷却最多持续当前客户端的 `max_retry_delay_sec`，超长值保留在错误与审计中；当前请求放弃自动重试，其他客户端只等待有上限的冷却。等待超过 `queue_timeout_sec`（默认 300 秒），或服务端要求的重试延迟超过 `max_retry_delay_sec`（默认 60 秒），会明确失败，供稍后恢复；等待配额和退避期间响应取消信号。在途 HTTP 调用仍受 `timeout_sec` 约束。多进程或多机器运行时需自行分配各进程并发配额，该限制不覆盖其他进程。
+`--jobs` 控制并行视频数，所选 VLM profile 的 `transport.max_concurrent_requests`（默认 4）独立限制同一进程内、同一 endpoint 的在途 API 请求，覆盖图像、纯文本、修复和重试。429/503 触发共享冷却，重试采用指数退避与随机抖动，并解析数值或日期形式的 `Retry-After`。共享冷却最多持续当前客户端的 `max_retry_delay_sec`，超长值保留在错误与审计中；当前请求放弃自动重试，其他客户端只等待有上限的冷却。等待超过 `queue_timeout_sec`（默认 300 秒），或服务端要求的重试延迟超过 `max_retry_delay_sec`（默认 60 秒），会明确失败，供稍后恢复；等待配额和退避期间响应取消信号。在途 HTTP 调用仍受 `timeout_sec` 约束。多进程或多机器运行时需自行分配各进程并发配额，该限制不覆盖其他进程。
 
-串行和并行批处理会继续处理偶发失败后的其他视频，最后汇总失败并返回非零状态。缺少认证配置、保留的占位模型名以及 HTTP 401/403/404 会立即熔断；其他错误达到 `ingest.consecutive_failure_limit`（默认连续 3 个失败视频）时也停止批处理，成功的视频会重置该计数。并行模式最多提交 `--jobs` 个待处理任务，熔断后停止提交、取消尚未开始的任务并等待运行中的任务退出；已完成产物可在下次运行时复用。失败清单写入 Wiki 数据集目录的 `.ingest-failures/<video_id>.json`，成功重跑后移除；正常取消不会新增失败记录，已有失败记录保留，它不进入 Query 工作区。重跑相同命令复用已完成窗口，空 observation 数组只有通过当前角色的校验才算成功；失败窗口不会标为 seen，也不会自动替换为空结果。
+串行和并行批处理会继续处理偶发失败后的其他视频，最后汇总失败并返回非零状态。缺少认证配置、保留的占位模型名以及 HTTP 401/403/404 会立即熔断；其他错误达到 `batch.consecutive_failure_limit`（默认连续 3 个失败视频）时也停止批处理，成功的视频会重置该计数。并行模式最多提交 `--jobs` 个待处理任务，熔断后停止提交、取消尚未开始的任务并等待运行中的任务退出；已完成产物可在下次运行时复用。失败清单写入 Wiki 数据集目录的 `.ingest-failures/<video_id>.json`，成功重跑后移除；正常取消不会新增失败记录，已有失败记录保留，它不进入 Query 工作区。重跑相同命令复用已完成窗口，空 observation 数组只有通过当前角色的校验才算成功；失败窗口不会标为 seen，也不会自动替换为空结果。
 
 ### 2.2 旧版层次化 Wiki
 
@@ -219,7 +216,7 @@ wiki-hierarchical/<dataset>/videos/<video_id>/
 
 `observations.jsonl` 是历史观察档案，父节点引用反映生成时关系，不应作为当前树遍历；最终关系以 `nodes.jsonl` 为准。Query Agent 可读取 nodes、observations、wiki、frames 索引和图像；不暴露 sampling、请求审计和源视频身份元数据。所有产物均参与冻结。
 
-默认每次最多 12 个子节点、最多生成 2,000 个节点（包括中间合并节点）、最多 1,000 个逻辑 split/merge 请求。超预算会明确失败并保留 checkpoint，不发布部分树。修复使用 `caption_max_repairs`，传输重试沿用 VLM 设置；两者不计入逻辑请求数，但计入调用审计。不同视频可由 `--jobs` 并发；单视频按树依赖顺序处理。
+默认每次最多 12 个子节点、最多生成 2,000 个节点（包括中间合并节点）、最多 1,000 个逻辑 split/merge 请求。超预算会明确失败并保留 checkpoint，不发布部分树。修复使用 `wiki.repair_attempts`，传输重试沿用 VLM profile；两者不计入逻辑请求数，但计入调用审计。不同视频可由 `--jobs` 并发；单视频按树依赖顺序处理。
 
 图像、变化分析和每次 split/merge 成功响应均可断点恢复。更改层次化内容参数需要新 Wiki 根目录；规则版本为 `hierarchy_processing_version: 1`，进入内容哈希。层次化 Wiki 时长使用主视频流时长，容器时长单独保存在 `container_duration`。
 
@@ -240,20 +237,20 @@ python harness/embed_wiki.py \
 
 ### 2.4 Agentic Wiki（Coding Agent 自主编译）
 
-`caption_mode: agentic` 不调用 VLM，而是把每个视频交给一个隔离容器里的 Coding Agent（Codex 或 Claude Code），由它自己决定如何抽帧、如何细化边界、如何组织语义，最终产出与其他模式相同的 Wiki 目录。
+`wiki.method: agentic` 不调用 VLM，而是把每个视频交给一个隔离容器里的 Coding Agent（Codex 或 Claude Code），由它自己决定如何抽帧、如何细化边界、如何组织语义，最终产出与其他模式相同的 Wiki 目录。
 
 方法本身写在 [templates/wiki_agents.md](templates/wiki_agents.md)（HOW）里，逐视频配置由 `task.json`（WHAT）承载，两者的哈希都参与 `ingest_content_hash`：**改动指令模板等于换了一种方法，旧 Wiki 会失配**。
 
 使用与 Query 相同的 `vmr-wiki-agents:local` 镜像（见安装一节），无需单独构建：镜像里的 `ffmpeg` 供 Agent 自行抽帧，而 Query Agent 用不到它——Query 工作区只有冻结后的 Wiki，源视频从不挂载进去，"不能重新抽帧"由挂载边界保证而非镜像内容。共用一个镜像也保证两侧 CLI 版本永远一致。
 
-配置 `ingest.agentic` 的 `agent`、`model`、`egress_allowed_hosts` 后，沿用常规入口即可：
+设置 `wiki.agent_profile`，并在 `wiki.method_config` 中配置抽帧、结构和资源预算后，沿用常规入口即可：
 
 ```bash
 python harness/ingest_all.py --dataset qvhighlights --split train --jobs 2
 python harness/freeze.py --dataset qvhighlights --split train
 ```
 
-容器挂载：workspace（`AGENTS.md`、`task.json`）只读，`/input/video.mp4` 只读，`/workspace/output` 可写，`/scratch` 可写。`--read-only` 根文件系统、`--cap-drop=ALL`、`--security-opt=no-new-privileges`、非特权 UID、内部网络加白名单出网代理与 Query 侧完全一致；资源上限由 `ingest.agentic` 的 `memory_gb`、`cpus`、`pids_limit` 控制（抽帧需要比 Query 更大的额度）。
+容器挂载：workspace（`AGENTS.md`、`task.json`）只读，`/input/video.mp4` 只读，`/workspace/output` 可写，`/scratch` 可写。`--read-only` 根文件系统、`--cap-drop=ALL`、`--security-opt=no-new-privileges`、非特权 UID、内部网络加白名单出网代理与 Query 侧完全一致；资源上限由 `wiki.method_config` 的 `memory_gb`、`cpus`、`pids_limit` 控制（抽帧需要比 Query 更大的额度）。
 
 `task.json` 刻意不包含 video_id、split 或任何 Query：Wiki 必须 query-independent，而公开 benchmark 的标识符是模型可能已记住的精确查找键。宿主临时目录名也不使用 video_id，因为容器能通过 `/proc` 读到自己 bind mount 的源路径。
 
@@ -274,7 +271,7 @@ Agentic 模式不做视频内断点续传：一次编译是一个不透明的长
 
 ### 2.5 旧版 Simple / Dense
 
-下文的固定采样和窗口配置适用于旧版模式。切换为 `caption_mode: dense` 时，将 `templates/dense_prompt.md` 的内容写入 `ingest.vlm.prompt`；Simple 则使用无时间戳占位符的普通 Caption prompt。复用旧产物时使用其原始配置及 Wiki 根目录。
+下文的固定采样和窗口配置适用于旧版模式。切换为 `wiki.method: dense` 时，将 `templates/dense_prompt.md` 的内容写入所选 VLM profile 的 `prompt`，并在 `wiki.method_config` 设置 `window_frames`、`stride_frames` 和 `timestamp_mode`；Simple 使用无时间戳占位符的普通 Caption prompt。复用旧产物时使用其原始配置及 Wiki 根目录。
 
 单视频入口：
 
@@ -297,7 +294,7 @@ python harness/ingest_all.py --dataset qvhighlights --split val --freeze
 python harness/freeze.py --dataset qvhighlights --split val
 ```
 
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `caption_window_frames` 和 `caption_stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt。视频短于窗口时只生成一个短窗口；否则只生成完整窗口，必要时增加一个向视频末尾对齐的完整窗口，不再生成 3、2、1 帧的重复尾窗。该贴尾规则同时适用于 Simple 和 Dense；即使大 stride 有意留出空档，视频末尾仍至少被一个窗口覆盖。Simple 模式 Caption 整个窗口；Dense 模式把窗口内采样时间替换进 `{{FRAME_TIMESTAMPS}}`，并额外给出中心目标区间。模型应重点描述目标区间，其他帧只作为上下文；跨越目标边界的事件仍可使用窗口中的其他合法时间戳，解析器不会因此拒绝。默认 `5/1` 下，中间窗口 `[1,2,3,4,5]` 重点负责 `[3,4]`，首尾窗口延伸负责无法获得对称上下文的视频边界。时间戳表示请求的采样时刻，不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
+Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `wiki.method_config.window_frames` 和 `stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt。视频短于窗口时只生成一个短窗口；否则只生成完整窗口，必要时增加一个向视频末尾对齐的完整窗口，不再生成 3、2、1 帧的重复尾窗。该贴尾规则同时适用于 Simple 和 Dense；即使大 stride 有意留出空档，视频末尾仍至少被一个窗口覆盖。Simple 模式 Caption 整个窗口；Dense 模式把窗口内采样时间替换进 `{{FRAME_TIMESTAMPS}}`，并额外给出中心目标区间。模型应重点描述目标区间，其他帧只作为上下文；跨越目标边界的事件仍可使用窗口中的其他合法时间戳，解析器不会因此拒绝。`5/1` 下，中间窗口 `[1,2,3,4,5]` 重点负责 `[3,4]`，首尾窗口延伸负责无法获得对称上下文的视频边界。时间戳表示请求的采样时刻，不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
 
 Dense 时间坐标必须显式选择，不能自动猜测：默认 `dense_timestamp_mode: absolute_seconds` 只接受当前窗口提供的秒数；`frame_index` 则向模型提供 `0..n-1` 的帧索引，要求 `start` / `end` 都为闭区间索引，再整体转换回秒数。两种模式均拒绝半开区间终点 `n`、非采样时刻及越界值。例如窗口 `[2,3,4,5]` 中的事件 `[0,2]` 在秒数模式下非法，在索引模式下转换为 `[2,4]`，不会混用两种解释。处理规则版本 `caption_processing_version: 4` 由代码维护，并进入内容哈希；旧 Wiki 与 checkpoint 不能直接复用，需要新的 Wiki 根目录。
 
@@ -319,7 +316,7 @@ Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`�
 
 完整 Ingest 再次执行时只核验并复用，不重新 caption。处理中每个抽帧文件、已完成窗口和请求审计原子保存到 `wiki/<dataset>/.ingest-checkpoints/<video_id>/<identity_hash>/`。失败或正常 Ctrl-C 会清除发布用 staging，但保留 checkpoint；重新执行相同 Ingest 命令即可验证并复用已完成的帧和窗口。Checkpoint 身份包含源视频哈希、内容配置、媒体时长和 FFmpeg 版本，损坏记录会报错，身份不同的记录不会复用。成功发布后清理对应 checkpoint，其他身份的旧缓存保留。强制杀进程可能留下锁文件，必须确认没有活跃进程后才可手动移除该视频的锁；也可能重做尚未原子保存的调用，不保证 API 恰好调用一次。
 
-API 对临时网络错误、限流、服务端错误、空响应及损坏的 API JSON 做有限重试。旧版 Simple / Dense / Hierarchical 对 token 截断直接失败；双向模式的修复策略见 2.1。Dense 响应可以包在 Markdown JSON 围栏里，也兼容顶层事件数组和多余字段；事件字段不符、无序、时间越界、非采样时间点或围栏外有其它文字时，会回传拒绝原因，最多按 `caption_max_repairs` 重问当前窗口，仍不合法则失败。该修复预算按本次运行的窗口调用计算，历史失败审计保留。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
+API 对临时网络错误、限流、服务端错误、空响应及损坏的 API JSON 做有限重试。旧版 Simple / Dense / Hierarchical 对 token 截断直接失败；双向模式的修复策略见 2.1。Dense 响应可以包在 Markdown JSON 围栏里，也兼容顶层事件数组和多余字段；事件字段不符、无序、时间越界、非采样时间点或围栏外有其它文字时，会回传拒绝原因，最多按 `wiki.repair_attempts` 重问当前窗口，仍不合法则失败。该修复预算按本次运行的窗口调用计算，历史失败审计保留。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
 
 重叠窗口使用每个 VLM client 上限 32 MiB 的图像 Base64 LRU 缓存，减少重复读图和编码；不会减少模型实际接收的图像或 API token。FFmpeg 仍逐采样点 seek，暂不改变抽帧语义。`telemetry.extraction_sec` 汇总保留的成功抽帧耗时，`extraction_sec_this_run` 仅为本次新抽帧耗时；`caption_sec` 包括历史保留的 caption 尝试和重试等待，`reused_frames` / `reused_windows` 显示本次复用量。服务端不返回 usage 时无法推算 token，汇总报告显示 `null`。
 
@@ -331,14 +328,14 @@ API 对临时网络错误、限流、服务端错误、空响应及损坏的 API
 python harness/run_query.py \
   --dataset qvhighlights \
   --split val \
-  --agent codex \
+  --agent-profile codex_default \
   --experiment codex_wiki_val \
   --query-id 7803
 
 python harness/run_all_queries.py \
   --dataset qvhighlights \
   --split val \
-  --agent codex \
+  --agent-profile codex_default \
   --jobs 4 \
   --experiment codex_wiki_val
 ```
@@ -349,7 +346,7 @@ python harness/run_all_queries.py \
 python harness/run_all_queries.py \
   --dataset qvhighlights \
   --split val \
-  --agent claude_code \
+  --agent-profile claude_default \
   --model YOUR_CLAUDE_MODEL \
   --jobs 4 \
   --experiment claude_wiki_val
@@ -376,7 +373,7 @@ wiki/frames/
 output/
 ```
 
-当 endpoint 只支持文本时，设置 `query.text_only: true`。此时 workspace 不复制 `wiki/frames/`，
+当 endpoint 只支持文本时，设置 `query.input_mode: text`。此时 workspace 不复制 `wiki/frames/`，
 只保留 Wiki、结构化 JSONL 和 `frames.jsonl` 中的已有文字与 timestamp，并使用独立的纯文本 AGENTS/prompt
 模板；模板中不会同时出现要求查看图片的冲突指令。
 
@@ -423,7 +420,7 @@ Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Q
 
 宿主仓库、视频、GT、其他 Query、其他预测都不挂载进容器。容器以非 root 用户运行，根文件系统和整个 workspace 只读，唯一的任务输出挂载点 `output/` 可写。容器 Home 和临时目录每次新建且退出销毁，CLI 禁用 session 持久化，不使用 resume。Claude 显式加载同一份 `AGENTS.md`。
 
-Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到 `query.egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放 `Bash,Read,Write,Edit,Glob,Grep` 六个内置工具，不启用额外 MCP；`WebSearch`、`WebFetch`、`Agent`、`Task*`、`Cron*` 等工具不会声明给模型。配置了 `query.base_url` 时，endpoint 以 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 传入容器，并作为 `runtime.api_base_url` 记入每次运行的 provenance。修改 allowlist 或 endpoint 会改变实验配置哈希，应使用新实验名。
+Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到所选 Agent profile 的 `egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放 `Bash,Read,Write,Edit,Glob,Grep` 六个内置工具，不启用额外 MCP；`WebSearch`、`WebFetch`、`Agent`、`Task*`、`Cron*` 等工具不会声明给模型。配置了 profile 的 `base_url` 时，endpoint 以 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 传入容器，并作为 `runtime.api_base_url` 记入每次运行的 provenance。修改 allowlist 或 endpoint 会改变实验配置哈希，应使用新实验名。
 
 Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。若 Agent 的 `end_sec` 因尾点精度仅比 `task.json.duration` 大 0.05 秒以内，Harness 会将它截断到权威上限，并在 `run_metadata.output_adjustments` 和 CLI `[adjusted]` 状态中记录有意义的修正；浮点 ULP 噪声会静默归一化。更大的越界以及截断后无法形成正长区间的预测仍按 `invalid_output` 失败。
 

@@ -276,7 +276,11 @@ def arguments(batch: bool = False):
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--dataset")
     parser.add_argument("--split", help="Exact dataset.json split name (or dataset.split in config)")
-    parser.add_argument("--agent", choices=["codex", "claude_code"])
+    agent = parser.add_mutually_exclusive_group()
+    agent.add_argument("--agent", choices=["codex", "claude_code"],
+                       help="Select the unique v2 profile of this kind (or override a v1 config)")
+    agent.add_argument("--agent-profile",
+                       help="Select a named profiles.agents entry (version 2 configs only)")
     parser.add_argument("--model")
     parser.add_argument("--experiment", required=True)
     if batch:
@@ -288,14 +292,12 @@ def arguments(batch: bool = False):
 
 
 def configured(args) -> dict:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, query_agent=args.agent, query_model=args.model,
+                      query_agent_profile=args.agent_profile)
     if args.dataset:
         cfg["dataset"]["name"] = identifier(args.dataset)
     if args.split is not None:
         cfg["dataset"]["split"] = args.split
-    for name in ("agent", "model"):
-        if getattr(args, name):
-            cfg["query"][name] = getattr(args, name)
     return cfg
 
 

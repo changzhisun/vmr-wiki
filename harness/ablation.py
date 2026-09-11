@@ -79,7 +79,7 @@ def prepare(cfg: dict, output: Path, *, split: str, limit_videos: int = 10, seed
         variant["ingest"]["vlm"]["prompt"] = dense_prompt if mode == "dense" else SIMPLE_PROMPT
         path = output / "configs" / f"{name}.yaml"
         atomic_text(path, yaml.safe_dump(variant, sort_keys=False, allow_unicode=True))
-        load_config(path)
+        load_config(path, warn_legacy=False)
         configs[name] = file_hash(path)
     template_names = (("AGENTS_text_only.md", "query_prompt_text_only.md")
                       if cfg["query"].get("text_only", False)
@@ -106,7 +106,7 @@ def load_suite(root: Path):
         path = root / "configs" / f"{name}.yaml"
         if file_hash(path) != expected:
             raise HarnessError(f"Ablation config changed: {path}; prepare a new suite")
-        cfg = load_config(path)
+        cfg = load_config(path, warn_legacy=False)
         for name_, digest in manifest["templates"].items():
             if file_hash(Path(cfg["paths"]["templates"]) / name_) != digest:
                 raise HarnessError("Ablation templates changed; prepare a new suite")

@@ -29,14 +29,25 @@ JPEG = b"\xff\xd8\xff" + b"\x00" * 64
 def agentic_config(tmp_path: Path, **agentic) -> Path:
     raw = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
     raw["dataset"]["split"] = "train"
-    raw["ingest"]["caption_mode"] = "agentic"
-    raw["ingest"]["sample_interval_sec"] = 1.0
-    raw["ingest"]["image_max_size"] = 64
-    raw["ingest"]["agentic"].update({"model": "fixture-agent-model", **agentic})
-    raw["query"]["model"] = "fixture-agent"
-    for kind in ("datasets", "wiki", "runs", "results"):
-        raw["paths"][kind] = str(tmp_path / kind)
-    raw["paths"]["templates"] = str(ROOT / "templates")
+    agent = agentic.pop("agent", "claude_code")
+    profile_name = f"{agent.removesuffix('_code')}_default"
+    profile = raw["profiles"]["agents"][profile_name]
+    profile["model"] = agentic.pop("model", "fixture-agent-model")
+    for key in ("base_url", "egress_allowed_hosts", "api_key_env", "container_image"):
+        if key in agentic:
+            value = agentic.pop(key)
+            profile[key] = value.get(agent) if isinstance(value, dict) else value
+    raw["wiki"] = {
+        "method": "agentic",
+        "agent_profile": profile_name,
+        "media": {"sample_interval_sec": 1.0, "image_max_size": 64, "jpeg_quality": 2},
+        "method_config": agentic,
+    }
+    raw["profiles"]["agents"]["codex_default"]["model"] = "fixture-agent"
+    raw["storage"].update({kind: str(tmp_path / kind)
+                           for kind in ("datasets", "runs", "results")})
+    raw["storage"]["wikis"] = str(tmp_path / "wiki")
+    raw["storage"]["templates"] = str(ROOT / "templates")
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=True, allow_unicode=True), encoding="utf-8")
     return path
@@ -282,10 +293,14 @@ def test_identity_leak_is_rejected(tmp_path):
 
 def test_agentic_config_needs_no_vlm_deployment(tmp_path):
     raw = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-    raw["ingest"]["caption_mode"] = "agentic"
-    raw["ingest"]["agentic"]["model"] = "fixture-agent-model"
-    del raw["ingest"]["vlm"]
-    raw["paths"]["templates"] = str(ROOT / "templates")
+    raw["wiki"] = {
+        "method": "agentic",
+        "agent_profile": "claude_default",
+        "media": {"sample_interval_sec": 1.0, "image_max_size": 64, "jpeg_quality": 2},
+    }
+    raw["profiles"]["agents"]["claude_default"]["model"] = "fixture-agent-model"
+    del raw["profiles"]["vlms"]
+    raw["storage"]["templates"] = str(ROOT / "templates")
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=True), encoding="utf-8")
     cfg = load_config(path)
@@ -297,7 +312,7 @@ def test_agentic_config_needs_no_vlm_deployment(tmp_path):
 def test_agentic_config_rejects_unpinned_model_and_unreachable_gateway(tmp_path):
     with pytest.raises(HarnessError, match="explicit ingest.agentic.model"):
         load_config(agentic_config(tmp_path, model="REPLACE_WITH_AGENT_MODEL"))
-    with pytest.raises(HarnessError, match="not in ingest.agentic.egress_allowed_hosts"):
+    with pytest.raises(HarnessError, match="not in profiles.agents.codex_default.egress_allowed_hosts"):
         load_config(agentic_config(tmp_path, agent="codex",
                                    base_url={"codex": "https://elsewhere.example.org/v1",
                                              "claude_code": None}))

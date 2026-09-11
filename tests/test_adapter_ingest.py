@@ -56,7 +56,7 @@ def test_default_config_uses_bidirectional_captions():
     ingest = config["ingest"]
     assert ingest["sample_interval_sec"] == 1.0
     assert ingest["caption_mode"] == "bidirectional"
-    assert ingest["caption_window_frames"] == 5
+    assert ingest["caption_window_frames"] == 1
     assert ingest["caption_stride_frames"] == 1
     assert ingest["caption_processing_version"] == 4
     assert ingest["vlm"]["max_tokens"] == 8192
@@ -67,30 +67,34 @@ def test_default_config_uses_bidirectional_captions():
 def test_caption_mode_and_dense_prompt_template_are_validated(tmp_path):
     source = Path(__file__).resolve().parents[1] / "config.yaml"
     raw = yaml.safe_load(source.read_text())
-    raw["ingest"]["caption_mode"] = "dense"
-    raw["ingest"]["vlm"]["prompt"] = "No frame timeline placeholder."
+    raw["wiki"]["method"] = "dense"
+    raw["wiki"]["method_config"] = {"window_frames": 5, "stride_frames": 1}
+    raw["profiles"]["vlms"]["qwen_default"]["prompt"] = "No frame timeline placeholder."
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(HarnessError, match="exactly one.*FRAME_TIMESTAMPS"):
         load_config(path)
 
-    raw["ingest"].pop("caption_mode")
+    raw["wiki"].pop("method")
     path.write_text(yaml.safe_dump(raw))
-    assert load_config(path)["ingest"]["caption_mode"] == "simple"
+    with pytest.raises(HarnessError, match="wiki.method"):
+        load_config(path)
 
     raw = yaml.safe_load(source.read_text())
-    raw["ingest"]["caption_mode"] = "dense"
-    raw["ingest"]["vlm"]["prompt"] = "Timeline {{FRAME_TIMESTAMPS}}"
-    raw["ingest"]["caption_stride_frames"] = 3
+    raw["wiki"]["method"] = "dense"
+    raw["wiki"]["method_config"] = {"window_frames": 5, "stride_frames": 3}
+    raw["profiles"]["vlms"]["qwen_default"]["prompt"] = "Timeline {{FRAME_TIMESTAMPS}}"
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(HarnessError, match="must not exceed half"):
         load_config(path)
 
-    raw = yaml.safe_load(source.read_text())
+    # Code-owned processing versions remain guarded for legacy configurations.
+    raw = load_config(source)
     raw["ingest"]["caption_processing_version"] = 3
     path.write_text(yaml.safe_dump(raw))
-    with pytest.raises(HarnessError, match="unsupported"):
-        load_config(path)
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        with pytest.raises(HarnessError, match="unsupported"):
+            load_config(path)
 
 
 def test_caption_windows_use_full_anchored_tail_without_redundant_short_windows():

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from agents.runner import AgentCancelled, DockerRunner, trace_path
+from harness.config import load_config
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("VMR_TEST_DOCKER") != "1", reason="Docker integration is opt-in")
@@ -66,7 +67,10 @@ def test_actual_container_readonly_mounts_fresh_home_and_cli_flags(cfg, tmp_path
     # Both production command vectors must parse with this exact image; --help
     # exits before any model request. Each invocation still has its own home.
     for agent in ("codex", "claude_code"):
-        cfg["query"]["agent"] = agent
+        selected = load_config(
+            Path(__file__).resolve().parents[1] / "config.yaml", query_agent=agent)["query"]
+        selected["model"] = "fixture-agent"
+        cfg["query"].update(selected)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-no-api-call")
         adapter = DockerRunner(cfg)
         network = f"vmr-cli-{agent}-network"

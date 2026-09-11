@@ -283,9 +283,9 @@ def test_hierarchy_config_rejects_invalid_settings(tmp_path, key, value):
     if path_keys is None:
         pytest.skip("setting belongs only to the legacy hierarchical pipeline")
     if len(path_keys) == 1:
-        raw["ingest"]["bidirectional"][path_keys[0]] = value
+        raw["wiki"]["method_config"][path_keys[0]] = value
     else:
-        raw["ingest"]["bidirectional"][path_keys[0]][path_keys[1]] = value
+        raw["wiki"]["method_config"][path_keys[0]][path_keys[1]] = value
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(HarnessError):
