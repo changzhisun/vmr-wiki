@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agents.runner import DockerRunner
+from agents.runner import DockerRunner, trace_path
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("VMR_TEST_DOCKER") != "1", reason="Docker integration is opt-in")
@@ -58,6 +58,8 @@ def test_actual_container_readonly_mounts_fresh_home_and_cli_flags(cfg, tmp_path
     runner = ContainerProbeRunner(cfg)
     result = runner.run(workspace, "probe", tmp_path / "stdout", tmp_path / "stderr")
     assert result.exit_code == 0, (tmp_path / "stderr").read_text()
+    trace = trace_path(tmp_path / "stdout")
+    assert trace.exists() and '"type": "harness.input"' in trace.read_text()
     assert (workspace / "output" / "prediction.json").read_text() == "{}"
     assert (workspace / "wiki" / "wiki.md").read_text() == "immutable wiki"
     # Both production command vectors must parse with this exact image; --help

@@ -16,7 +16,8 @@ def command(model: str) -> list[str]:
     # --setting-sources drops hooks and settings, --strict-mcp-config with no
     # servers drops MCP, CLAUDE_CODE_DISABLE_AUTO_MEMORY is set in the
     # environment, and the read-only workspace holds no CLAUDE.md to discover.
-    return ["claude", "--print", "--no-session-persistence", "--model", model,
+    return ["claude", "--print", "--verbose", "--output-format", "stream-json",
+            "--no-session-persistence", "--model", model,
             "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--disable-slash-commands", "--tools", TOOLS,
             "--permission-mode", "dontAsk", "--allowedTools", TOOLS,

@@ -261,7 +261,12 @@ python harness/freeze.py --dataset qvhighlights --split train
 
 Agent 自己会在退出前自校验，但**自检不是证据**：[harness/agentic_validate.py](harness/agentic_validate.py) 在宿主端独立重跑一遍等价校验，任何一项不通过该视频即失败，不发布。校验覆盖文件集合严格相等、无符号链接与大小上限、JSONL schema 与字段白名单、`frame_id` 唯一、注册路径与磁盘图片双向 1:1（不允许孤儿图片）、timestamp 严格递增且落在视频流时长内、`wiki.md` 引用的每张图都已注册、无绝对路径与路径穿越、首行必须是 `# Video`，以及 wiki 与注册表都不泄漏视频身份。Agent 篡改自己的 `AGENTS.md` 或 `task.json` 同样判失败。
 
-Agent 的 stdout/stderr 写在 `wiki/<dataset>/.ingest-logs/<video_id>/`，位于 Wiki 目录之外，不进 `content_hashes`，不参与冻结。
+Agent 的可读 stdout、stderr 和完整 CLI 事件流分别写在
+`wiki/<dataset>/.ingest-logs/<video_id>/agent.stdout.log`、`agent.stderr.log` 和
+`agent.trace.jsonl`，位于 Wiki 目录之外，不进 `content_hashes`，不参与冻结。事件流默认启用：
+Codex 使用 `exec --json`，Claude Code 使用 `--verbose --output-format stream-json`；其中包含
+模型消息、工具调用及工具结果，并在首行记录 Harness 传入的 prompt。它不是 HTTP 抓包，不包含
+API key、请求头或网关内部的重试详情。
 
 Agentic 模式不做视频内断点续传：一次编译是一个不透明的长容器调用，失败即整个视频重来，`ingest_all.py` 的连续失败熔断与 `.ingest-failures` 报告照常生效。缺少凭据或镜像属于共享配置失败，在批次开始前就抛出，不会记到任何一个视频头上。
 
@@ -334,6 +339,7 @@ python harness/run_all_queries.py \
   --dataset qvhighlights \
   --split val \
   --agent codex \
+  --jobs 4 \
   --experiment codex_wiki_val
 ```
 
@@ -345,8 +351,15 @@ python harness/run_all_queries.py \
   --split val \
   --agent claude_code \
   --model YOUR_CLAUDE_MODEL \
+  --jobs 4 \
   --experiment claude_wiki_val
 ```
+
+批量 Query 的 `--jobs` 默认为 1；大于 1 时，每个 worker 同时运行一条独立 Query，
+并各自创建 Agent 容器、出网代理、workspace、metadata、stdout/stderr 和 trace。
+实现只维持最多一波 `jobs` 个在途任务；遇到 Harness/基础设施错误后不再提交新 Query，
+已启动的容器完成清理后退出。Agent 自身的 timeout、invalid output 等作为该次运行的失败结果，
+不会阻止其他 Query，并会在下次运行同一实验时重试。并发数应同时受宿主 CPU/内存和模型 endpoint 容量约束。
 
 Ingest/Freeze/Query 使用显式 `--split`，也可设置 `dataset.split`；这些阶段不会使用 `default_eval_split` 猜测子集。每个实验只运行所选 split，且不要求其他 split 已 Ingest。
 
@@ -373,7 +386,8 @@ output/
   "video_id": "v8c17de40ab926f3d",
   "split": "s15a0d1954e686b4c",
   "query": "When does the man open the refrigerator?",
-  "max_predictions": 5
+  "max_predictions": 5,
+  "duration": 43.93
 }
 ```
 
@@ -383,7 +397,8 @@ Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Q
 
 > **这条措施缩小了通道，但没有关闭它。** `query` 文本本身就是任务输入，无法遮蔽，而公开 benchmark 的 query 文本同样可检索。采样帧里若出现视频自带的标题字幕也会泄露。把别名理解为「移除了精确查表键」，不要当成去污染的保证；报告结果时应当说明这一点。
 
-`task.json` 保留 `query_id`、`video_id`、`split`、`query` 和固定的 `max_predictions`（均为别名形式）。Agent 必须在预测中原样复制 split；示例中为可读性使用真实 ID：
+`task.json` 保留 `query_id`、`video_id`、`split`、`query`、固定的 `max_predictions` 和权威预测上限 `duration`（ID 字段为别名形式）。
+`duration` 是冻结 Wiki 媒体时长与数据集标注时长的较小值，Agent 必须用它而不是 Wiki 中可能更精确的媒体尾点。Agent 必须在预测中原样复制 split；示例中为可读性使用真实 ID：
 
 ```json
 {
@@ -404,20 +419,22 @@ Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Q
 
 Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到 `query.egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放 `Bash,Read,Write,Edit,Glob,Grep` 六个内置工具，不启用额外 MCP；`WebSearch`、`WebFetch`、`Agent`、`Task*`、`Cron*` 等工具不会声明给模型。配置了 `query.base_url` 时，endpoint 以 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 传入容器，并作为 `runtime.api_base_url` 记入每次运行的 provenance。修改 allowlist 或 endpoint 会改变实验配置哈希，应使用新实验名。
 
-Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。JSON 缺失、解析失败、字段多余/缺失、错误 ID、布尔值冒充数字、NaN、时间越界、分数越界、排序错误、预测数量超限、额外输出文件等均记录为 `invalid_output` 失败，**不会自动修复或重新调用 Agent**。`moments: []` 是成功的 abstention。
+Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。若 Agent 的 `end_sec` 超过 `task.json.duration`，Harness 会统一将它截断到权威上限，并在 `run_metadata.output_adjustments` 和 CLI `[adjusted]` 状态中记录原值、新值和差值。若 `start_sec >= duration`，截断后无法形成正长区间，仍会按时间越界失败。
+
+JSON 缺失、解析失败、字段多余/缺失、错误 ID、布尔值冒充数字、NaN、其他时间越界、分数越界、排序错误、预测数量超限、额外输出文件等均记录为 `invalid_output`；本次批处理不会原地自动修复，但再次运行同一实验时会重新调用 Agent。`moments: []` 是成功的 abstention。
 
 每次运行都记录 `failure_kind`，把"Agent 没做好"和"Harness / 基础设施坏了"分开：
 
 | failure_kind | 含义 | 归属 | 是否重跑 |
 | --- | --- | --- | --- |
-| `timeout` | Agent 超时 | Agent | 否，终局 |
-| `agent_error` | Agent 进程非零退出 | Agent | 否，终局 |
-| `invalid_output` | 输出缺失、无法解析、schema 不合法、多余产物 | Agent | 否，终局 |
-| `tampered` | Agent 改动了冻结输入 | Agent | 否，终局 |
-| `harness_error` | Docker 不可用、磁盘错误、Harness 不变量被破坏 | Harness | 是 |
-| `interrupted` | Ctrl-C 或进程未收尾 | Harness | 是 |
+| `timeout` | Agent 超时 | Agent | 下次批处理重跑 |
+| `agent_error` | Agent 进程非零退出 | Agent | 下次批处理重跑 |
+| `invalid_output` | 输出缺失、无法解析、schema 不合法、多余产物 | Agent | 下次批处理重跑 |
+| `tampered` | Agent 改动了冻结输入 | Agent | 下次批处理重跑 |
+| `harness_error` | Docker 不可用、磁盘错误、Harness 不变量被破坏 | Harness | 下次批处理重跑 |
+| `interrupted` | Ctrl-C 或进程未收尾 | Harness | 下次批处理重跑 |
 
-Agent 自己的失败是终局，绝不会为同一条 Query 再启动第二个进程，因此不存在 best-of-N。Harness 侧失败不是 Agent 的成绩：`run_all_queries.py` **立即中止整批**而不是把剩余 Query 记成零分，修好原因后重跑会自动重试这些 Query，并在 `attempts` 和 `superseded_failures` 中留下审计痕迹，重跑过的 Query 不会被误认为首次尝试。成功记录和 Agent 失败记录都不会被重跑。没有 `failure_kind` 字段的历史记录按终局处理。配置、模型、Agent、代码、模板、manifest 或镜像 ID 变化时，必须使用新实验名。
+再次使用同一实验名运行 `run_all_queries.py` 时，会按数据集顺序检查已有记录：成功 Query 校验 prediction 后直接跳过，所有失败 Query（包括 timeout、agent_error、invalid_output、tampered、harness_error、interrupted 以及没有 `failure_kind` 的旧记录）都会重新运行，并覆盖该 Query 的当前 prediction、日志和状态。`attempts` 与 `superseded_failures` 会保留简短审计痕迹。Harness 侧失败仍会**立即中止整批**，而不是把尚未运行的 Query 记成零分。配置、模型、Agent、代码、模板、manifest 或镜像 ID 变化时，必须使用新实验名。
 
 ```text
 results/<experiment>/
@@ -425,12 +442,14 @@ results/<experiment>/
 ├── run_metadata/<query_id>.json
 ├── logs/<query_id>.stdout.log
 ├── logs/<query_id>.stderr.log
+├── logs/<query_id>.trace.jsonl
 ├── templates/
 ├── experiment.json
 └── config.yaml
 ```
 
-元数据包含 dataset、split、agent、时间、exit code、失败原因、Wiki/config/template/source/manifest 哈希、镜像 ID 和 Git commit；目录不是 Git 仓库时 commit 为 `null`，代码仍有内容哈希。
+每个 Query 默认保存 `trace.jsonl` 原始 CLI 事件流；`stdout.log` 仍只保留便于阅读的最终回答。超时时已写入的事件也会保留。
+元数据包含 dataset、split、agent、时间、exit code、失败原因、轨迹路径、Wiki/config/template/source/manifest 哈希、镜像 ID 和 Git commit；目录不是 Git 仓库时 commit 为 `null`，代码仍有内容哈希。
 
 若宿主进程被 `SIGKILL` 或机器断电，正常的 `finally` 清理无法执行。确认没有相关进程/容器继续运行后，可人工移除对应 `.experiment.lock`、`.ingest.lock` 和残留临时目录；不要删除已记录的 Query 结果来假装首次执行。
 
@@ -461,7 +480,7 @@ python harness/evaluate.py \
 
 **所有指标的单位为百分数，范围 0–100。** 分母是所选 split 的全部带标签 Query，缺失/失败结果按零命中处理；不因某个 Query 失败就从评测集删除它。只跑一个 Query 时评测该 split，其余同 split 内未运行的 Query 也会计入失败；需要子集实验时应先准备对应子集的 manifests。
 
-若 run metadata 中存在 `harness_error` 或 `interrupted`，评测**直接拒绝**并列出对应 Query：这些 Query 根本没有测量值，把它们当成零分会让一次 Docker 故障看起来像 Agent 不会做 VMR。修好原因后重跑即可（这两类会自动重试）；确实要按零分计入时显式传 `--allow-harness-failures`。
+若 run metadata 中存在 `harness_error` 或 `interrupted`，评测**直接拒绝**并列出对应 Query：这些 Query 根本没有测量值，把它们当成零分会让一次 Docker 故障看起来像 Agent 不会做 VMR。修好原因后重跑即可（所有失败记录都会自动重试）；确实要按零分计入时显式传 `--allow-harness-failures`。
 
 通用 evaluator 输出配置的 `R@K,IoU=T`，语义为前 K 个预测命中任意一个 GT 即成功。UCA-VMR 使用此 evaluator（每个 Query 只有一个 GT moment，属于 `any_acceptable_moment` 语义）。QVHighlights adapter 额外输出：
 
@@ -542,7 +561,7 @@ python -m pytest -q
 
 Split 测试覆盖任意名称、unknown split、严格布尔类型、默认 eval split、视频/Query 筛选、共享 Wiki 增量冻结、跨 split Query ID、预测隔离、无 GT 拒绝和混合 provenance。
 
-测试通过 FFmpeg 生成三秒视频，使用明确的测试 captioner 与短生命周期子进程模拟模型输出。覆盖完整链路、Query/GT 不被 Ingest 读取、GT 不被 Query 读取、隔离输入结构、篡改检测、失败不重跑、超时/非法输出、AP 匹配和排名语义。没有 FFmpeg 时媒体集成测试会明确跳过。模拟 runner 只存在于测试，不是正式实验选项。
+测试通过 FFmpeg 生成三秒视频，使用明确的测试 captioner 与短生命周期子进程模拟模型输出。覆盖完整链路、Query/GT 不被 Ingest 读取、GT 不被 Query 读取、隔离输入结构、篡改检测、失败重跑与成功跳过、超时/非法输出、AP 匹配和排名语义。没有 FFmpeg 时媒体集成测试会明确跳过。模拟 runner 只存在于测试，不是正式实验选项。
 
 Agentic 模式由 [tests/test_agentic.py](tests/test_agentic.py) 用一个不联网的 fixture runner 扮演 Coding Agent，覆盖 ingest → freeze → query 完整链路、`task.json` 不含 Query/Split/视频身份、已完成 Wiki 只核验不重编译、十七种契约违规逐项拒绝、身份泄漏检测的长度下界、指令模板与模型属于内容身份而容器预算不是，以及只读视频挂载与凭据不进命令行。
 

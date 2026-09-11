@@ -53,10 +53,11 @@ class Aliases:
             if len(set(mapping.values())) != len(mapping):
                 raise HarnessError(f"Alias collision for {kind} identifiers")
 
-    def task(self, query: dict, max_predictions: int) -> dict:
+    def task(self, query: dict, max_predictions: int, duration: float) -> dict:
         """The only description of the task the agent ever sees."""
         return {"query_id": self.query[query["query_id"]],
                 "video_id": self.video[query["video_id"]],
                 "split": self.split,
                 "query": query["query"],
-                "max_predictions": max_predictions}
+                "max_predictions": max_predictions,
+                "duration": duration}

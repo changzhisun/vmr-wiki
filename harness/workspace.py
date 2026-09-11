@@ -25,7 +25,8 @@ def require_anonymous_wiki(wiki_md: Path) -> None:
 
 
 @contextmanager
-def query_workspace(query: dict, task: dict, wiki: Path, templates: dict[str, str], runs: Path):
+def query_workspace(query: dict, task: dict, wiki: Path, templates: dict[str, str], runs: Path,
+                    *, text_only: bool = False):
     validate_query(query)
     seal = verify_wiki(wiki)
     if seal["video_id"] != query["video_id"]:
@@ -42,9 +43,10 @@ def query_workspace(query: dict, task: dict, wiki: Path, templates: dict[str, st
                         "bottomup_observations.jsonl", "coverage.jsonl"}
         for name in sorted(public_files & seal["files"].keys()):
             shutil.copyfile(wiki / name, target / name)
-        shutil.copytree(wiki / "frames", target / "frames")
+        if not text_only:
+            shutil.copytree(wiki / "frames", target / "frames")
         expected = {key: value for key, value in seal["files"].items()
-                    if key in public_files or key.startswith("frames/")}
+                    if key in public_files or (not text_only and key.startswith("frames/"))}
         if tree_hashes(target) != expected:
             raise HarnessError("Wiki changed while creating workspace")
         make_readonly(target)

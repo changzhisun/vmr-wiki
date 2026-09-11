@@ -139,8 +139,8 @@ def refuse_harness_failures(kinds: dict) -> None:
     shown = ", ".join(broken[:8]) + (f" ... (+{len(broken) - 8})" if len(broken) > 8 else "")
     raise HarnessError(
         f"{len(broken)} run(s) failed inside the harness rather than in the agent: {shown}.\n"
-        "Those queries carry no measurement. Fix the cause and rerun them (harness and "
-        "interrupted failures are retried automatically), or pass "
+        "Those queries carry no measurement. Fix the cause and rerun the experiment "
+        "(failed queries are retried automatically), or pass "
         "--allow-harness-failures to deliberately score them as zeros.")
 
 

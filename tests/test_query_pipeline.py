@@ -6,14 +6,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agents.runner import AgentResult, DockerRunner
+from agents.runner import AgentResult, DockerRunner, readable_trace, trace_path
 from harness.aggregate import aggregate
 from harness.common import HarnessError, read_json, write_json
 from harness.config import load_config
 from harness.evaluate import evaluate
 from harness.freeze import freeze_dataset
 from harness.ingest_all import ingest_all
-from harness.run_query import Experiment
+from harness.run_query import Experiment, clamp_prediction_ends, run_status
 from harness.workspace import require_anonymous_wiki
 
 
@@ -68,6 +68,49 @@ Path("output/prediction.json").write_text(json.dumps(result))
                            self.behavior == "timeout")
 
 
+def test_structured_trace_keeps_readable_final_answers(tmp_path):
+    assert trace_path(tmp_path / "q1.stdout.log") == tmp_path / "q1.trace.jsonl"
+    assert trace_path(tmp_path / "stdout") == tmp_path / "stdout.trace.jsonl"
+
+    claude = b'\n'.join([
+        b'{"type":"harness.input","prompt":"secret task"}',
+        b'{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}',
+        b'{"type":"result","result":"claude final"}',
+    ])
+    assert readable_trace("claude_code", claude) == b"claude final\n"
+
+    codex = b'\n'.join([
+        b'{"type":"item.completed","item":{"type":"command_execution","command":"pwd"}}',
+        b'{"type":"item.completed","item":{"type":"agent_message","text":"codex final"}}',
+    ])
+    assert readable_trace("codex", codex) == b"codex final\n"
+    assert readable_trace("claude_code", b"legacy plain output\n") == b"legacy plain output\n"
+
+
+def test_all_prediction_ends_over_duration_are_clamped():
+    prediction = {"moments": [
+        {"start_sec": 41.0, "end_sec": 43.933333, "score": 0.9},
+        {"start_sec": 10.0, "end_sec": 44.0, "score": 0.8},
+        {"start_sec": 43.931, "end_sec": 43.932, "score": 0.7},
+    ]}
+    adjustments = clamp_prediction_ends(prediction, duration=43.93)
+    assert prediction["moments"][0]["end_sec"] == 43.93
+    assert prediction["moments"][1]["end_sec"] == 43.93
+    assert prediction["moments"][2]["end_sec"] == 43.93
+    assert adjustments[0] == {
+        "kind": "clamp_end_to_effective_duration",
+        "moment_index": 0,
+        "original_end_sec": 43.933333,
+        "adjusted_end_sec": 43.93,
+        "delta_sec": 0.003333,
+        "reason": "end_sec exceeded the authoritative prediction duration",
+    }
+    assert [row["moment_index"] for row in adjustments] == [0, 1, 2]
+    status = run_status({"query_id": "q1", "status": "success",
+                         "output_adjustments": adjustments}, Path("results/test"))
+    assert "success [adjusted]" in status
+
+
 def test_end_to_end_fresh_processes_cleanup_and_no_gt_reads(frozen):
     cfg, captioner = frozen
     truth = Path(cfg["paths"]["datasets"]) / "qvhighlights" / "ground_truth.jsonl"
@@ -98,6 +141,41 @@ def test_end_to_end_fresh_processes_cleanup_and_no_gt_reads(frozen):
     assert (root / "config.yaml").exists()
 
 
+def test_text_only_query_omits_frames_and_records_effective_instructions(frozen):
+    cfg, _ = frozen
+    cfg["query"]["text_only"] = True
+    seen = []
+
+    class TextOnlyRunner(ProcessFixtureRunner):
+        def run(self, workspace, prompt, stdout, stderr):
+            wiki_files = set(p.name for p in (workspace / "wiki").iterdir())
+            assert wiki_files == {"wiki.md", "frames.jsonl"}
+            assert not (workspace / "wiki" / "frames").exists()
+            assert "本次不提供图片" in prompt
+            assert "wiki/frames/" in prompt
+            assert "本次输入模式：纯文本" in (workspace / "AGENTS.md").read_text()
+            seen.append(workspace)
+
+            task = read_json(workspace / "task.json")
+            write_json(workspace / "output" / "prediction.json", {
+                "query_id": task["query_id"], "video_id": task["video_id"],
+                "split": task["split"], "moments": [
+                    {"start_sec": 0, "end_sec": 1, "score": 0.9}
+                ]})
+            stdout.write_text("text-only fixture\n")
+            stderr.write_text("")
+            return AgentResult(0)
+
+    with Experiment(cfg, "text-only", runner=TextOnlyRunner()) as experiment:
+        result = experiment.run(experiment.queries[0])
+        assert result["status"] == "success"
+        saved_agents = (experiment.root / "templates" / "AGENTS.md").read_text()
+        saved_prompt = (experiment.root / "templates" / "query_prompt.md").read_text()
+        assert "本次输入模式：纯文本" in saved_agents
+        assert "本次不提供图片" in saved_prompt
+    assert len(seen) == 1 and not seen[0].exists()
+
+
 def test_experiment_requires_frozen_split(prepared):
     cfg, captioner = prepared
     with pytest.raises(HarnessError, match="not ingested"):
@@ -109,17 +187,30 @@ def test_experiment_requires_frozen_split(prepared):
 
 
 @pytest.mark.parametrize("behavior", ["missing", "invalid", "extra", "nonzero", "timeout", "symlink", "mutate"])
-def test_failures_never_retried_or_published(frozen, behavior):
+def test_failed_cases_are_retried_then_success_is_skipped(frozen, behavior):
     cfg, _ = frozen
     runner = ProcessFixtureRunner(behavior)
     with Experiment(cfg, "test", runner=runner) as experiment:
-        result = experiment.run(experiment.queries[0])
+        query = experiment.queries[0]
+        result = experiment.run(query)
         assert result["status"] == "failed"
         assert result["finished_at"] is not None
-        assert experiment.run(experiment.queries[0]) == result
         assert not (experiment.root / "predictions" / "1.json").exists()
         assert len(runner.workspaces) == 1
         assert not runner.workspaces[0].exists()
+
+    retry = ProcessFixtureRunner()
+    with Experiment(cfg, "test", runner=retry) as experiment:
+        result = experiment.run(experiment.queries[0])
+        assert result["status"] == "success"
+        assert result["attempts"] == 2
+        assert len(result["superseded_failures"]) == 1
+        assert len(retry.workspaces) == 1
+
+    skipped = ProcessFixtureRunner()
+    with Experiment(cfg, "test", runner=skipped) as experiment:
+        assert experiment.run(experiment.queries[0]) == result
+        assert skipped.workspaces == []
 
 
 def test_workspace_hides_public_identifiers_and_saves_real_ones(frozen):
@@ -137,11 +228,42 @@ def test_workspace_hides_public_identifiers_and_saves_real_ones(frozen):
     assert task["query_id"] != query["query_id"] and task["video_id"] != query["video_id"]
     assert task["split"] != cfg["dataset"]["split"]
     assert task["query"] == query["query"]  # the task input itself cannot be obscured
-    assert set(task) == {"query_id", "video_id", "split", "query", "max_predictions"}
+    assert set(task) == {"query_id", "video_id", "split", "query", "max_predictions", "duration"}
+    assert task["duration"] == 3.0
     saved = read_json(Path(cfg["paths"]["results"]) / "test" / "predictions" / f"{query['query_id']}.json")
     assert (saved["query_id"], saved["video_id"], saved["split"]) == (
         query["query_id"], query["video_id"], cfg["dataset"]["split"])
     assert result["task_query_id"] == task["query_id"]
+
+
+def test_query_clamps_wiki_annotation_duration_gap_and_records_it(frozen):
+    cfg, _ = frozen
+    seen = []
+
+    class RoundingGapRunner(ProcessFixtureRunner):
+        def run(self, workspace, prompt, stdout, stderr):
+            seen.append(read_json(workspace / "task.json"))
+            return super().run(workspace, prompt, stdout, stderr)
+
+    with Experiment(cfg, "rounding-gap", runner=RoundingGapRunner()) as experiment:
+        query = experiment.queries[0]
+        # The frozen media is 3.0s; emulate a dataset annotation rounded down.
+        experiment.videos[query["video_id"]]["duration"] = 2.99
+        result = experiment.run(query)
+
+    assert seen[0]["duration"] == 2.99
+    assert result["status"] == "success"
+    assert result["output_adjustments"] == [{
+        "kind": "clamp_end_to_effective_duration",
+        "moment_index": 1,
+        "original_end_sec": 3,
+        "adjusted_end_sec": 2.99,
+        "delta_sec": 0.01,
+        "reason": "end_sec exceeded the authoritative prediction duration",
+    }]
+    saved = read_json(Path(cfg["paths"]["results"]) / "rounding-gap" /
+                      "predictions" / f"{query['query_id']}.json")
+    assert saved["moments"][1]["end_sec"] == 2.99
 
 
 def test_aliases_are_stable_within_and_distinct_across_experiments(frozen):
@@ -290,12 +412,15 @@ def test_docker_mount_boundary_and_credentials_not_in_command(cfg, monkeypatch, 
     assert mounts == [f"type=bind,src={tmp_path},dst=/workspace,readonly",
                       f"type=bind,src={tmp_path / 'output'},dst=/workspace/output"]
     assert "--ephemeral" in command
+    assert "--json" in command
     assert "resume" not in command
     assert "sha256:fixture" in command
     cfg["query"]["agent"] = "claude_code"
     monkeypatch.setenv("ANTHROPIC_API_KEY", "another-secret")
     command = DockerRunner(cfg).agent_command()
     assert "--no-session-persistence" in command
+    assert command[command.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in command
     assert "--append-system-prompt-file" in command
     assert "--strict-mcp-config" in command
 
@@ -343,6 +468,18 @@ def written_config(tmp_path, **query) -> Path:
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))
     return path
+
+
+def test_text_only_defaults_off_and_rejects_non_boolean(tmp_path):
+    raw = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text())
+    del raw["query"]["text_only"]
+    path = tmp_path / "default.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    assert load_config(path)["query"]["text_only"] is False
+
+    path = written_config(tmp_path, text_only="true")
+    with pytest.raises(HarnessError, match="query.text_only must be a boolean"):
+        load_config(path)
 
 
 def test_base_url_defaults_to_the_vendor_endpoint(tmp_path):

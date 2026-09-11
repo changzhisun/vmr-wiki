@@ -14,9 +14,8 @@ import yaml
 
 from agents.runner import DockerRunner
 from harness.alias import Aliases, new_secret
-from harness.common import (AGENT_FAILURE_KINDS, HarnessError, RunFailure, atomic_text, cli,
-                            file_hash, identifier, ingest_content_hash, now, object_hash,
-                            read_json, write_json)
+from harness.common import (HarnessError, RunFailure, atomic_text, cli, file_hash, identifier,
+                            ingest_content_hash, now, object_hash, read_json, write_json)
 from harness.config import dataset_path, load_config
 from harness.dataset import dataset_context, load_query_inputs
 from harness.freeze import split_not_ready_error, verify_wiki, wiki_readiness
@@ -24,10 +23,42 @@ from harness.validate import validate_prediction
 from harness.workspace import query_workspace
 
 
+TEXT_ONLY_AGENTS_APPENDIX = """
+
+## 本次输入模式：纯文本（优先于上文中的图片说明）
+
+本次任务不提供 `wiki/frames/` 图片目录。只能依据 Wiki、结构化 JSONL 中已有的文本描述和
+timestamp 作答。不要尝试读取、搜索或重建任何图片，也不要因为图片不可用而反复探测路径；
+在现有文本证据上选择最佳候选并尽快写入 `output/prediction.json`。
+"""
+
+TEXT_ONLY_QUERY_PROMPT = """阅读 AGENTS.md 和 task.json，使用当前只读 Wiki 的文本描述和时间戳完成本次
+Video Moment Retrieval 任务。本次不提供图片，不要尝试访问 wiki/frames/。找到最佳候选后立即将唯一的
+最终 JSON 结果写入 output/prediction.json，然后退出。"""
+
+
 def git_commit() -> str | None:
     result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
                             capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def clamp_prediction_ends(prediction: dict, *, duration: float) -> list[dict]:
+    """Clip every end_sec beyond the authoritative prediction duration."""
+    adjustments = []
+    for index, moment in enumerate(prediction["moments"]):
+        end = moment["end_sec"]
+        if end > duration:
+            moment["end_sec"] = duration
+            adjustments.append({
+                "kind": "clamp_end_to_effective_duration",
+                "moment_index": index,
+                "original_end_sec": end,
+                "adjusted_end_sec": duration,
+                "delta_sec": round(end - duration, 9),
+                "reason": "end_sec exceeded the authoritative prediction duration",
+            })
+    return adjustments
 
 
 class Experiment:
@@ -51,6 +82,10 @@ class Experiment:
             self.freeze["videos"][vid] = seal["wiki_hash"]
         self.templates = {name: (Path(cfg["paths"]["templates"]) / name).read_text(encoding="utf-8")
                           for name in ("AGENTS.md", "query_prompt.md")}
+        if cfg["query"]["text_only"]:
+            self.templates["AGENTS.md"] = (
+                self.templates["AGENTS.md"].rstrip() + TEXT_ONLY_AGENTS_APPENDIX)
+            self.templates["query_prompt.md"] = TEXT_ONLY_QUERY_PROMPT
         self.runner = runner if runner is not None else DockerRunner(cfg)
         source_root = Path(__file__).resolve().parents[1]
         source_files = {str(p.relative_to(source_root)): file_hash(p)
@@ -130,20 +165,14 @@ class Experiment:
                 if file_hash(prediction_path) != previous["prediction_hash"]:
                     raise HarnessError(f"Saved prediction was modified: {qid}")
                 return previous
-            # The agent's own failure stays terminal: it never gets a second
-            # process at the same query. A harness or interrupt failure is not
-            # the agent's score, so that attempt is retried once its cause is
-            # fixed; the superseded attempts stay in the record so a retried
-            # query is never mistaken for a first attempt. Records written
-            # before failure kinds existed carry none and remain terminal.
             kind = previous.get("failure_kind")
-            if kind is None or kind in AGENT_FAILURE_KINDS:
-                return previous
             attempts = previous.get("attempts", 1) + 1
             superseded = [*previous.get("superseded_failures", []),
                           {"kind": kind, "error": previous.get("error"),
                            "finished_at": previous.get("finished_at")}]
             prediction_path.unlink(missing_ok=True)
+            for suffix in ("stdout.log", "stderr.log", "trace.jsonl"):
+                (self.root / "logs" / f"{qid}.{suffix}").unlink(missing_ok=True)
         elif prediction_path.exists():
             raise HarnessError(f"Prediction exists without run metadata: {qid}")
         wiki = self.wiki_root / query["video_id"]
@@ -152,12 +181,16 @@ class Experiment:
             raise HarnessError("Wiki version changed after experiment initialization")
         if not hasattr(self, "aliases"):
             raise HarnessError("Enter the experiment context before running queries")
-        task = self.aliases.task(query, self.cfg["query"]["max_predictions"])
+        visible_duration = seal["duration"]
+        duration = min(visible_duration, self.videos[query["video_id"]]["duration"])
+        task = self.aliases.task(query, self.cfg["query"]["max_predictions"], duration)
         # The secret lives in experiment.json only; per-run records do not repeat it.
         metadata = {key: value for key, value in self.metadata.items() if key != "alias_secret"}
         metadata.update({"query_id": qid, "video_id": query["video_id"],
                          "task_query_id": task["query_id"], "task_video_id": task["video_id"],
                          "wiki_hash": seal["wiki_hash"], "frames_jsonl_hash": seal["frames_jsonl_hash"],
+                         "trace_path": f"logs/{qid}.trace.jsonl",
+                         "effective_duration": duration, "output_adjustments": [],
                          "status": "running", "failure_kind": None, "exit_code": None,
                          "timed_out": False, "attempts": attempts,
                          "superseded_failures": superseded,
@@ -166,7 +199,8 @@ class Experiment:
         try:
             prediction = None
             with query_workspace(query, task, wiki, self.templates,
-                                 Path(self.cfg["paths"]["runs"])) as workspace:
+                                 Path(self.cfg["paths"]["runs"]),
+                                 text_only=self.cfg["query"]["text_only"]) as workspace:
                 result = self.runner.run(workspace, self.templates["query_prompt.md"],
                                          self.root / "logs" / f"{qid}.stdout.log",
                                          self.root / "logs" / f"{qid}.stderr.log")
@@ -175,7 +209,9 @@ class Experiment:
                     raise RunFailure("Agent timed out", "timeout")
                 if result.exit_code != 0:
                     raise RunFailure(f"Agent exited with code {result.exit_code}", "agent_error")
-                prediction = self.read_prediction(workspace / "output", query, task, seal)
+                prediction, adjustments = self.read_prediction(
+                    workspace / "output", query, task, seal, duration)
+                metadata["output_adjustments"] = adjustments
             # Publish only after immutable-input checks and workspace cleanup succeeded.
             write_json(prediction_path, prediction)
             metadata.update(status="success", prediction_hash=file_hash(prediction_path))
@@ -195,7 +231,8 @@ class Experiment:
             write_json(metadata_path, metadata)
         return metadata
 
-    def read_prediction(self, output: Path, query: dict, task: dict, seal: dict) -> dict:
+    def read_prediction(self, output: Path, query: dict, task: dict, seal: dict,
+                        duration: float) -> tuple[dict, list[dict]]:
         """Read the agent's only output. Every rejection here is the agent's own.
 
         The agent echoes the aliases it was given, so they are validated as
@@ -212,12 +249,16 @@ class Experiment:
                 raise HarnessError("Prediction exceeds 1 MiB")
             prediction = validate_prediction(
                 read_json(prediction_file), query_id=task["query_id"], split=task["split"],
+                video_id=task["video_id"], max_predictions=self.cfg["query"]["max_predictions"])
+            adjustments = clamp_prediction_ends(prediction, duration=duration)
+            prediction = validate_prediction(
+                prediction, query_id=task["query_id"], split=task["split"],
                 video_id=task["video_id"], max_predictions=self.cfg["query"]["max_predictions"],
-                duration=min(seal["duration"], self.videos[query["video_id"]]["duration"]))
+                duration=duration)
         except (OSError, ValueError) as exc:
             raise RunFailure(f"{exc}", "invalid_output") from exc
-        return {**prediction, "query_id": query["query_id"],
-                "video_id": query["video_id"], "split": self.split}
+        return ({**prediction, "query_id": query["query_id"],
+                 "video_id": query["video_id"], "split": self.split}, adjustments)
 
 
 def arguments(batch: bool = False):
@@ -228,7 +269,10 @@ def arguments(batch: bool = False):
     parser.add_argument("--agent", choices=["codex", "claude_code"])
     parser.add_argument("--model")
     parser.add_argument("--experiment", required=True)
-    if not batch:
+    if batch:
+        parser.add_argument("-j", "--jobs", type=int, default=1,
+                            help="Concurrent query Agent containers (default: 1)")
+    else:
         parser.add_argument("--query-id", required=True)
     return parser.parse_args()
 
@@ -261,12 +305,16 @@ def run_status(result: dict, root: Path) -> str:
     """Useful CLI diagnostics without opening large metadata files."""
     qid = result["query_id"]
     message = f"{qid}: {result['status']}"
+    adjustments = result.get("output_adjustments") or []
+    if adjustments:
+        message += f" [adjusted] clipped {len(adjustments)} end_sec value(s) to the effective duration"
     if result["status"] != "success":
         reason = " ".join(str(result.get("error") or "No error detail recorded").split())[:300]
         message += f" [{result.get('failure_kind') or 'unclassified'}] {reason}"
         message += f"\n  metadata: {root / 'run_metadata' / (qid + '.json')}"
         message += f"\n  logs: {root / 'logs' / (qid + '.stderr.log')}"
         message += f"\n        {root / 'logs' / (qid + '.stdout.log')}"
+        message += f"\n        {root / 'logs' / (qid + '.trace.jsonl')}"
     return message
 
 

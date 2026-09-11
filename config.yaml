@@ -114,6 +114,8 @@ ingest:
 
 query:
   agent: codex
+  # Omit sampled JPEGs from the agent workspace for text-only model endpoints.
+  text_only: false
   model: REPLACE_WITH_AGENT_MODEL
   max_predictions: 5
   timeout_sec: 600

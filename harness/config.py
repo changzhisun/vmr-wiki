@@ -166,6 +166,9 @@ def load_config(path: str | Path = "config.yaml") -> dict:
             if type(vlm["max_retries"]) is not int or vlm["max_retries"] < 0:
                 raise HarnessError("max_retries must be a nonnegative integer")
         query = cfg["query"]
+        query.setdefault("text_only", False)
+        if type(query["text_only"]) is not bool:
+            raise HarnessError("query.text_only must be a boolean")
         if query["agent"] not in ("codex", "claude_code"):
             raise HarnessError("query.agent must be codex or claude_code")
         nonempty(query["model"], "query.model")

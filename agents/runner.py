@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -19,6 +20,43 @@ class AgentResult:
 
 class FatalAgentError(HarnessError):
     """Shared credential, image or endpoint failure, not one video's fault."""
+
+
+def trace_path(stdout: Path) -> Path:
+    """Return the raw event-stream path paired with a readable stdout log."""
+    suffix = ".stdout.log"
+    if stdout.name.endswith(suffix):
+        return stdout.with_name(stdout.name[:-len(suffix)] + ".trace.jsonl")
+    return stdout.with_name(stdout.name + ".trace.jsonl")
+
+
+def readable_trace(agent: str, raw: bytes) -> bytes:
+    """Extract the final answer while preserving non-JSON fallback output.
+
+    Codex and Claude emit different JSONL event schemas. The complete stream is
+    the audit artifact; stdout remains a small human-readable diagnostic.
+    """
+    answers, fallback = [], []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            fallback.append(line)
+            continue
+        if not isinstance(event, dict) or event.get("type") == "harness.input":
+            continue
+        if agent == "claude_code" and event.get("type") == "result":
+            result = event.get("result")
+            if isinstance(result, str) and result:
+                answers = [result]
+        elif agent == "codex" and event.get("type") == "item.completed":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    answers.append(text)
+    text = "\n".join(answers if answers else fallback)
+    return (text + ("\n" if text else "")).encode("utf-8")
 
 
 class _ContainerRunner:
@@ -126,22 +164,28 @@ class _ContainerRunner:
         name = f"vmr-{uuid.uuid4().hex}"
         network = f"{name}-internal"
         proxy_name = f"{name}-proxy"
+        trace = trace_path(stdout)
         process = None
         network_created = False
+        result = None
         try:
             self._docker(["docker", "network", "create", "--internal", network],
                          "Could not create an isolated agent network")
             network_created = True
             self._start_egress_proxy(network, proxy_name)
             command = self.docker_command(workspace, name, network, **extra)
-            with stdout.open("wb") as out, stderr.open("wb") as err:
-                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
+            with trace.open("wb") as events, stderr.open("wb") as err:
+                header = {"type": "harness.input", "version": 1, "time": time.time(),
+                          "agent": self.agent, "model": self.model, "prompt": prompt}
+                events.write((json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8"))
+                events.flush()
+                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=events, stderr=err,
                                            env=self.env, start_new_session=True)
                 try:
                     process.communicate(prompt.encode("utf-8"), timeout=self.timeout_sec)
-                    return AgentResult(process.returncode)
+                    result = AgentResult(process.returncode)
                 except subprocess.TimeoutExpired:
-                    return AgentResult(None, timed_out=True)
+                    result = AgentResult(None, timed_out=True)
         finally:
             # Kill the container as well as its client, including on Ctrl-C.
             # This prevents descendants from writing output after timeout/cleanup.
@@ -165,6 +209,10 @@ class _ContainerRunner:
                                                  capture_output=True, text=True, timeout=30)
                         if removed.returncode and "not found" not in removed.stderr.lower():
                             raise HarnessError(f"Could not remove isolated network {network}")
+        stdout.write_bytes(readable_trace(self.agent, trace.read_bytes()))
+        if result is None:
+            raise HarnessError("Agent process ended without a result")
+        return result
 
 
 class DockerRunner(_ContainerRunner):
