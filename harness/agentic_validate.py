@@ -15,6 +15,12 @@ from harness.common import HarnessError, nonempty, number, read_jsonl
 ARTIFACTS = ("frames.jsonl", "frames/", "wiki.md")
 WIKI_TITLE = "# Video"
 
+LEVEL_HEADINGS = {
+    "chapter": re.compile(r"(?m)^### C[0-9]{4}(?:\s|[-—:])"),
+    "event": re.compile(r"(?m)^#### E[0-9]{4}(?:\s|[-—:])"),
+    "moment": re.compile(r"(?m)^##### M[0-9]{4}(?:\s|[-—:])"),
+}
+
 FRAME_ID = re.compile(r"^f[0-9]{6}$")
 FRAME_PATH = re.compile(r"^frames/[0-9]{6}\.jpg$")
 
@@ -145,7 +151,8 @@ def _validate_registry(output: Path, images: dict[str, Path], duration: float) -
     return rows
 
 
-def _validate_wiki(output: Path, registered: set[str], forbidden: tuple[str, ...]) -> None:
+def _validate_wiki(output: Path, registered: set[str], forbidden: tuple[str, ...],
+                   required_levels: tuple[str, ...]) -> None:
     text = (output / "wiki.md").read_text(encoding="utf-8")
     if text.split("\n", 1)[0].strip() != WIKI_TITLE:
         raise HarnessError(
@@ -153,6 +160,13 @@ def _validate_wiki(output: Path, registered: set[str], forbidden: tuple[str, ...
             "and the query agent would receive a public dataset identifier")
     if not text.strip():
         raise HarnessError("wiki.md is empty")
+    for level in required_levels:
+        pattern = LEVEL_HEADINGS[level]
+        if not pattern.search(text):
+            prefix = {"chapter": "### C0001", "event": "#### E0001",
+                      "moment": "##### M0001"}[level]
+            raise HarnessError(
+                f"wiki.md has no configured {level} heading; expected a heading like {prefix}")
     for prefix in FORBIDDEN_PREFIXES:
         if prefix in text:
             raise HarnessError(f"wiki.md contains a non-portable absolute path: {prefix}")
@@ -169,11 +183,12 @@ def _validate_wiki(output: Path, registered: set[str], forbidden: tuple[str, ...
 
 def validate_agent_wiki(output: Path, *, duration: float, max_frames: int,
                         max_wiki_bytes: int, max_frame_bytes: int,
-                        forbidden_tokens: tuple[str, ...] = ()) -> list[dict]:
+                        forbidden_tokens: tuple[str, ...] = (),
+                        required_levels: tuple[str, ...] = ()) -> list[dict]:
     """Return the validated frame registry, or raise on the first violation."""
     images = _validate_files(output, max_wiki_bytes, max_frame_bytes, max_frames)
     rows = _validate_registry(output, images, duration)
-    _validate_wiki(output, set(images), forbidden_tokens)
+    _validate_wiki(output, set(images), forbidden_tokens, required_levels)
     leak = _leaked((output / "frames.jsonl").read_text(encoding="utf-8"), forbidden_tokens)
     if leak is not None:
         raise HarnessError(

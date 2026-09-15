@@ -161,6 +161,12 @@ class FixtureIngestRunner:
             wiki += "\nSee [context](../other/frames/000001.jpg).\n"
         elif self.behavior == "bad_title":
             wiki = wiki.replace("# Video\n", "# Video video.mp4\n", 1)
+        elif self.behavior == "missing_chapter":
+            wiki = wiki.replace("### C0001", "### X0001", 1)
+        elif self.behavior == "missing_event":
+            wiki = wiki.replace("#### E0001", "#### X0001", 1)
+        elif self.behavior == "missing_moment":
+            wiki = wiki.replace("##### M0001", "##### X0001", 1)
         elif self.behavior == "empty_registry":
             rows = []
 
@@ -277,6 +283,9 @@ def test_ingest_all_reuses_a_completed_agentic_wiki(agentic):
     ("absolute_path", "non-portable absolute path"),
     ("traversal", "path traversal"),
     ("bad_title", "must start with"),
+    ("missing_chapter", "no configured chapter heading"),
+    ("missing_event", "no configured event heading"),
+    ("missing_moment", "no configured moment heading"),
     ("empty_registry", "registers no frames"),
     ("nonzero", "exited with code 3"),
     ("timeout", "timed out"),
@@ -358,6 +367,32 @@ def test_instruction_templates_are_part_of_the_content_identity(tmp_path, agenti
     ingest_all(cfg, runner=FixtureIngestRunner(), jobs=1)
     with pytest.raises(HarnessError, match="instruction templates differ"):
         freeze_dataset(changed)
+
+
+def test_agentic_instructions_use_dense_temporal_observation_and_prioritize_complete_output():
+    instructions = (ROOT / "templates" / "wiki_agents.md").read_text(encoding="utf-8")
+    prompt = (ROOT / "templates" / "wiki_prompt.md").read_text(encoding="utf-8")
+
+    assert "最多再使用 16 轮工具调用" in instructions
+    assert "Dense Temporal Observation" in instructions
+    assert "dense_interval_sec = max(min_interval_sec, min(1.0, initial_interval_sec))" in instructions
+    assert "每个相邻 5 帧" in instructions and "按 1 帧步长重叠" in instructions
+    assert "将 `/scratch/dense_frames.jsonl` 注册的基础覆盖帧全部保留" in instructions
+    assert "单张静态图只能证明" in instructions
+    assert "必须保持原始宽高比" in instructions and "force_original_aspect_ratio" in instructions
+    assert "宽和高都必须小于 2000 像素" in instructions
+    assert instructions.index("### 3. 像 Dense Caption 一样记录原子变化") < instructions.index(
+        "### 4. 保留密集覆盖并生成完整产物")
+    for heading in ("### C0001", "#### E0001", "##### M0001"):
+        assert heading in instructions
+    assert "不要再次读取" in prompt and "只做一次最终校验" in prompt
+    assert "相邻 5 帧、步长 1 帧" in prompt
+
+    from harness.agentic import REPAIR_PROMPT
+    assert "最多再用 8 轮工具调用" in REPAIR_PROMPT
+    assert "禁止重新探测视频、重新抽帧" in REPAIR_PROMPT
+    assert "dense_frames.jsonl" in REPAIR_PROMPT
+    assert "保留现有密集时间覆盖" in REPAIR_PROMPT
 
 
 def test_model_change_is_a_content_change(agentic):

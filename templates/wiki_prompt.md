@@ -1,1 +1,1 @@
-阅读 AGENTS.md 和 task.json，把 /input/video.mp4 编译成 query-independent 的 Visual Wiki。自主决定抽帧与细化策略，在 /scratch 中完成所有中间工作，最终只在 output/ 写出 frames/、frames.jsonl 和 wiki.md。退出前自行校验这三样产物满足 AGENTS.md 的契约，然后结束运行。
+按 AGENTS.md 的 Dense Temporal Observation 流程执行。AGENTS.md 已作为系统指令加载，不要再次读取；只读取一次 task.json。一次性建立约 1 秒的完整时间覆盖，把连续帧组成尺寸小于 2000×2000 的 contact sheet，并按相邻 5 帧、步长 1 帧观察原子状态变化。保留全部基础覆盖帧；单张图不能证明完整动作。随后立即写齐 output/frames/、output/frames.jsonl、output/wiki.md，只做一次最终校验并结束。不要输出伪工具 XML 或长篇总结。

@@ -27,10 +27,16 @@ REQUIRED_OUTPUT = ("wiki.md", "frames.jsonl", "frames")
 # after dumping tool XML as text. One follow-up on the same scratch is enough
 # to finish without changing the instruction templates.
 REPAIR_PROMPT = (
-    "output/ 还不完整：必须恰好有 frames/、frames.jsonl、wiki.md。"
-    "不要再逐张 Read 候选 JPEG，也不要把工具调用写成文本。"
-    "/scratch 里已有候选帧的话直接选用；把终选帧复制到 output/frames/ 并编号为 "
-    "000001.jpg 起，写出 frames.jsonl 和 wiki.md（首行必须是 # Video），自校验后立即结束。\n"
+    "进入恢复模式；本提示优先于 AGENTS.md 的常规分析流程。最多再用 8 轮工具调用。"
+    "先用一次 Bash 检查 task.json、output/、/scratch/progress.json、/scratch/dense_frames.jsonl "
+    "和已有密集候选帧，然后只补齐缺失产物。"
+    "禁止重新探测视频、重新抽帧、裁剪、缩放、运动检测、制作或调试 contact sheet。"
+    "优先使用 progress.json、dense_frames.jsonl、已有 contact sheet 和已有 frames.jsonl/wiki.md；"
+    "信息不足时最多 Read 2 张已有 contact sheet 或 8 张已有候选帧。保留现有密集时间覆盖，不要缩减成少量粗帧。"
+    "必须写齐且只保留 output/frames/、output/frames.jsonl、output/wiki.md；图片从 000001.jpg "
+    "连续编号，wiki.md 首行必须是 # Video；task.json.wiki.levels 启用的层级必须分别使用 "
+    "### C0001、#### E0001、##### M0001 格式且至少出现一次。最多做一次紧凑校验，通过后立即结束。"
+    "工具调用必须通过真正的工具接口发出，绝不能输出 XML、invoke_* 或伪工具调用文本。\n"
 )
 MIN_REPAIR_SEC = 60
 
@@ -184,7 +190,7 @@ def publish_agentic(video, video_id, output, staging, checkpoint, client, cfg,
         rows = validate_agent_wiki(
             job / "output", duration=video_stream_duration, max_frames=options["max_frames"],
             max_wiki_bytes=options["max_wiki_bytes"], max_frame_bytes=options["max_frame_bytes"],
-            forbidden_tokens=forbidden)
+            forbidden_tokens=forbidden, required_levels=tuple(options["wiki"]["levels"]))
 
         validated = {name: file_hash(job / "output" / name) for name in PUBLISHED}
         validated.update({row["frame"]: file_hash(job / "output" / row["frame"]) for row in rows})

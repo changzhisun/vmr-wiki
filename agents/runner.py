@@ -138,8 +138,27 @@ class _ContainerRunner:
             result = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],
                                     capture_output=True, text=True, check=True, timeout=30)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise FatalAgentError("Docker/image unavailable. Start Docker and build the agent image; see README.") from exc
-        digest = result.stdout.strip()
+            # Docker Desktop's containerd image store can transiently list and
+            # run a local image while its image-inspect endpoint returns 404.
+            # Resolve the exact reference through the image listing as a safe
+            # fallback; the returned value is still the immutable image ID used
+            # for every container in this batch.
+            try:
+                listed = subprocess.run(
+                    ["docker", "image", "ls", "--no-trunc", "--quiet", image],
+                    capture_output=True, text=True, check=True, timeout=30)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as fallback_exc:
+                raise FatalAgentError(
+                    "Docker/image unavailable. Start Docker and build the agent image; see README."
+                ) from fallback_exc
+            digests = {line.strip() for line in listed.stdout.splitlines() if line.strip()}
+            if len(digests) != 1:
+                raise FatalAgentError(
+                    "Docker/image unavailable. Start Docker and build the agent image; see README."
+                ) from exc
+            digest = digests.pop()
+        else:
+            digest = result.stdout.strip()
         if not digest.startswith("sha256:"):
             raise FatalAgentError("Docker did not return an immutable image ID")
         return digest
@@ -190,14 +209,25 @@ class _ContainerRunner:
         self._docker(command, "Could not start the allowlisted egress proxy")
         self._docker(["docker", "network", "connect", "--alias", "egress-proxy", network, name],
                      "Could not attach the egress proxy to the isolated network")
-        probe = ["docker", "exec", name, "python3", "-c",
-                 "import socket; socket.create_connection(('127.0.0.1',8080),1).close()"]
-        for _ in range(50):
-            result = subprocess.run(probe, capture_output=True, text=True)
-            if result.returncode == 0:
-                return
-            time.sleep(0.1)
-        raise HarnessError("Allowlisted egress proxy did not become ready; rebuild the agent image")
+        # Probe through the same isolated network and DNS alias the agent will
+        # use. Besides exercising the actual route, this avoids Docker
+        # Desktop's occasionally stale container-name lookup in `docker exec`.
+        probe_script = (
+            "import socket,time\n"
+            "for attempt in range(50):\n"
+            " try:\n"
+            "  socket.create_connection(('egress-proxy',8080),1).close(); break\n"
+            " except OSError:\n"
+            "  if attempt == 49: raise\n"
+            "  time.sleep(.1)\n"
+        )
+        probe = ["docker", "run", "--rm", "--network", network, "--dns", "127.0.0.1",
+                 "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                 "--user", "1000:1000", "--pids-limit", "16", "--memory", "64m",
+                 "--cpus", "0.25", self.image, "python3", "-c", probe_script]
+        self._docker(probe,
+                     "Allowlisted egress proxy did not become reachable from the isolated network",
+                     timeout=30)
 
     @staticmethod
     def _remove_container(name: str) -> None:

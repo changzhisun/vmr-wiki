@@ -102,6 +102,46 @@ def test_structured_trace_keeps_readable_final_answers(tmp_path):
     assert readable_trace("codex", trace) == b"codex final\n"
 
 
+def test_image_id_falls_back_to_exact_image_listing(monkeypatch):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[2] == "inspect":
+            raise subprocess.CalledProcessError(1, command, stderr="No such image")
+        return subprocess.CompletedProcess(command, 0, "sha256:fixture-id\n", "")
+
+    monkeypatch.setattr("agents.runner.subprocess.run", run)
+    assert DockerRunner._inspect("vmr-wiki-agents:local") == "sha256:fixture-id"
+    assert calls == [
+        ["docker", "image", "inspect", "--format", "{{.Id}}", "vmr-wiki-agents:local"],
+        ["docker", "image", "ls", "--no-trunc", "--quiet", "vmr-wiki-agents:local"],
+    ]
+
+
+def test_egress_proxy_is_probed_from_the_agent_network():
+    runner = object.__new__(DockerRunner)
+    runner.image = "sha256:fixture"
+    runner.allowed_hosts = ("api.example.test",)
+    calls = []
+    runner._docker = lambda command, message, **kwargs: calls.append(
+        (command, message, kwargs))
+
+    runner._start_egress_proxy("vmr-test-internal", "vmr-test-proxy")
+
+    assert calls[0][0][:6] == [
+        "docker", "run", "--detach", "--rm", "--name", "vmr-test-proxy"]
+    assert calls[1][0] == [
+        "docker", "network", "connect", "--alias", "egress-proxy",
+        "vmr-test-internal", "vmr-test-proxy"]
+    probe = calls[2][0]
+    assert probe[:3] == ["docker", "run", "--rm"]
+    assert probe[probe.index("--network") + 1] == "vmr-test-internal"
+    assert probe[-3:-1] == ["python3", "-c"]
+    assert "egress-proxy" in probe[-1]
+    assert calls[2][2] == {"timeout": 30}
+
+
 def test_readable_stdout_is_written_even_when_container_cleanup_fails(cfg, tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_API_KEY", "test-secret")
     monkeypatch.setattr(DockerRunner, "_inspect", staticmethod(lambda _: "sha256:fixture"))

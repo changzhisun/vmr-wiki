@@ -237,7 +237,7 @@ python harness/embed_wiki.py \
 
 ### 2.4 Agentic Wiki（Coding Agent 自主编译）
 
-`wiki.method: agentic` 不调用 VLM，而是把每个视频交给一个隔离容器里的 Coding Agent（Codex 或 Claude Code），由它自己决定如何抽帧、如何细化边界、如何组织语义，最终产出与其他模式相同的 Wiki 目录。
+`wiki.method: agentic` 不调用独立 VLM，而是把每个视频交给一个隔离容器里的 Coding Agent（Codex 或 Claude Code）。Agent 使用有界的 Dense Temporal Observation 流程：一次性建立默认约 1 秒的完整时间覆盖，把连续帧组成尺寸受限的 contact sheet，按相邻 5 帧、步长 1 帧观察原子状态变化，然后再组织 Chapter → Event → Moment。基础覆盖帧会保留给下游复核，层级摘要不能替代细粒度时间证据。
 
 方法本身写在 [templates/wiki_agents.md](templates/wiki_agents.md)（HOW）里，逐视频配置由 `task.json`（WHAT）承载，两者的哈希都参与 `ingest_content_hash`：**改动指令模板等于换了一种方法，旧 Wiki 会失配**。
 
@@ -256,9 +256,9 @@ python harness/freeze.py --dataset qvhighlights --split train
 
 产物契约是 `output/` 下**恰好** `wiki.md`、`frames.jsonl`、`frames/` 三样。`frames.jsonl` 沿用仓库约定的 `frame_id`（`^f[0-9]{6}$`）、`timestamp`（秒）、`frame`（`frames/NNNNNN.jpg`），并新增 `reason`（`periodic_sample`、`scene_boundary`、`event_boundary`、`action_boundary`、`boundary_refinement`、`semantic_evidence`）和 `description`，可选 `entities`、`objects`、`location`、`shot_id`。`wiki.md` 使用 Chapter → Event → Moment 三级层级，把 Observed 与 Inferred 显式分开，并给出 retrieval aliases 和时间关系。
 
-Agent 自己会在退出前自校验，但**自检不是证据**：[harness/agentic_validate.py](harness/agentic_validate.py) 在宿主端独立重跑一遍等价校验，任何一项不通过该视频即失败，不发布。校验覆盖文件集合严格相等、无符号链接与大小上限、JSONL schema 与字段白名单、`frame_id` 唯一、注册路径与磁盘图片双向 1:1（不允许孤儿图片）、timestamp 严格递增且落在视频流时长内、`wiki.md` 引用的每张图都已注册、无绝对路径与路径穿越、首行必须是 `# Video`，以及 wiki 与注册表都不泄漏视频身份。Agent 篡改自己的 `AGENTS.md` 或 `task.json` 同样判失败。
+Agent 自己会在退出前自校验，但**自检不是证据**：[harness/agentic_validate.py](harness/agentic_validate.py) 在宿主端独立重跑一遍等价校验，任何一项不通过该视频即失败，不发布。校验覆盖文件集合严格相等、无符号链接与大小上限、JSONL schema 与字段白名单、`frame_id` 唯一、注册路径与磁盘图片双向 1:1（不允许孤儿图片）、timestamp 严格递增且落在视频流时长内、`wiki.md` 引用的每张图都已注册、配置启用的 Chapter/Event/Moment 标题至少各有一个、无绝对路径与路径穿越、首行必须是 `# Video`，以及 wiki 与注册表都不泄漏视频身份。Agent 篡改自己的 `AGENTS.md` 或 `task.json` 同样判失败。
 
-如果 Agent 正常退出但缺少 `wiki.md`、`frames.jsonl` 或 `frames/`，Harness 会在原 workspace 和 scratch 上追加一次定向修复；修复与首次运行共享同一个 `wiki.method_config.timeout_sec` 总预算，且每次调用的剩余 timeout 独立传入，不会在 `--jobs>1` 时影响其他视频。修复日志单独保存为 `agent.repair.stdout.log` / `agent.repair.stderr.log`，次数记录在 `telemetry.artifact_repairs`。格式错误、额外文件和校验失败不会无限重试。
+如果 Agent 正常退出但缺少 `wiki.md`、`frames.jsonl` 或 `frames/`，Harness 会在原 workspace 和 scratch 上追加一次定向修复；修复只允许利用现有 `progress.json`、`dense_frames.jsonl`、contact sheet 和候选帧补文件，不重新抽帧或调试图像流程，也不能把密集覆盖缩减成少量粗帧。修复与首次运行共享同一个 `wiki.method_config.timeout_sec` 总预算，且每次调用的剩余 timeout 独立传入，不会在 `--jobs>1` 时影响其他视频。修复日志单独保存为 `agent.repair.stdout.log` / `agent.repair.stderr.log`，次数记录在 `telemetry.artifact_repairs`。格式错误、额外文件和校验失败不会无限重试。
 
 Agent 的可读 stdout、stderr 和完整 CLI 事件流分别写在
 `wiki/<dataset>/.ingest-logs/<video_id>/agent.stdout.log`、`agent.stderr.log` 和
