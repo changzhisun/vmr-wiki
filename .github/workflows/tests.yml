@@ -2,10 +2,27 @@ name: Tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 19 * * *'
 permissions:
   contents: read
 jobs:
-  unit:
+  fast:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e '.[test]' ruff==0.15.16
+      - run: ruff format --check vmr tests/unit tests/integration tests/compatibility
+      - run: ruff check --select E9,F63,F7,F82 vmr harness agents adapters tests
+      - run: python -m pytest -q -m 'unit or compatibility'
+  integration:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -16,6 +33,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - run: python -m pip install -e '.[test]' ruff==0.11.13
-      - run: ruff check --select E9,F63,F7,F82 harness agents adapters tests
-      - run: python -m pytest -q
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest -q -m integration
+      - run: python -m pytest -q tests/test_egress_proxy.py
+  docker:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '.[test]'
+      - run: docker build -f docker/Dockerfile --build-arg CODEX_VERSION=0.153.4 --build-arg CLAUDE_VERSION=2.1.158 -t vmr-wiki-agents:local .
+      - run: VMR_TEST_DOCKER=1 python -m pytest -q -m docker

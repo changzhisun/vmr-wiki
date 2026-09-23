@@ -23,7 +23,7 @@ def response(content='{"nodes":[]}'):
                                      b'{"choices":[{"message":{"content":" "}}]}',
                                      b'{"choices":[{"message":{"content":[123]}}]}'])
 def test_invalid_envelope_retries_then_records_usage(cfg, monkeypatch, bad):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     monkeypatch.setattr("harness.vlm.pause", lambda *args: None)
     calls = []
     def request(req, timeout):
@@ -38,7 +38,7 @@ def test_invalid_envelope_retries_then_records_usage(cfg, monkeypatch, bad):
 
 
 def test_persistent_bad_envelope_has_finite_retry_budget(cfg, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     monkeypatch.setattr("harness.vlm.pause", lambda *args: None)
     monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: io.BytesIO(b'null'))
     client = VLMClient(cfg["ingest"]["vlm"])
@@ -49,7 +49,7 @@ def test_persistent_bad_envelope_has_finite_retry_budget(cfg, monkeypatch):
 
 
 def test_concurrent_clients_share_endpoint_slots_for_vision_and_text(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     config = deepcopy(cfg["ingest"]["vlm"])
     config.update(max_concurrent_requests=2, base_url="https://concurrency.example/v1")
     clients = [VLMClient(config) for _ in range(6)]
@@ -86,7 +86,7 @@ def test_concurrent_clients_share_endpoint_slots_for_vision_and_text(cfg, tmp_pa
 
 
 def test_cancelled_queue_and_backoff_do_not_send_requests(cfg, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     cancelled = threading.Event()
     client = VLMClient(cfg["ingest"]["vlm"], cancel_event=cancelled)
     client.gate = EndpointGate(1)
@@ -115,7 +115,7 @@ def test_admission_timeout_and_long_retry_after(cfg, monkeypatch):
         with pytest.raises(HarnessError, match="admission wait timed out"):
             with gate.slot(None, .01):
                 pytest.fail("Acquired occupied slot")
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     client = VLMClient(cfg["ingest"]["vlm"])
     client.gate = EndpointGate(1)
     calls = []
@@ -132,7 +132,7 @@ def test_admission_timeout_and_long_retry_after(cfg, monkeypatch):
 
 
 def test_retry_after_backoff_is_shared_and_releases_slot(cfg, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     client = VLMClient(cfg["ingest"]["vlm"])
     client.gate = EndpointGate(1)
     delayed, waits, calls = [], [], []
@@ -164,7 +164,7 @@ def test_transport_limits_do_not_change_frozen_content_identity(cfg):
 
 def test_null_truncation_is_a_reask_signal_and_preserves_usage(cfg, monkeypatch):
     from harness.vlm_transport import ResponseRejected
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     def request(req, timeout):
         return io.BytesIO(json.dumps({"choices": [{"finish_reason": "length", "message": {"content": None}}],
                                     "usage": {"total_tokens": 7}}).encode())
@@ -178,7 +178,7 @@ def test_null_truncation_is_a_reask_signal_and_preserves_usage(cfg, monkeypatch)
 
 def test_long_retry_after_does_not_poison_second_client(cfg, monkeypatch):
     import time
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     config = {**cfg["ingest"]["vlm"], "base_url": "https://cooldown.example/v1",
               "max_retry_delay_sec": .02, "queue_timeout_sec": 1, "max_retries": 0}
     first, second = VLMClient(config), VLMClient(config)
@@ -208,7 +208,7 @@ def test_admission_error_explains_bounded_server_cooldown():
 
 
 def test_multipart_answer_filters_non_text_without_retry(cfg, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     content = [{"type": "reasoning_content", "reasoning": "private reasoning"},
                {"type": "reasoning", "text": "not the answer"},
                {"type": "text", "text": '{"nodes":'},
@@ -223,7 +223,7 @@ def test_multipart_answer_filters_non_text_without_retry(cfg, monkeypatch):
 @pytest.mark.parametrize("status", [401, 403, 404])
 def test_shared_http_configuration_errors_are_typed(cfg, monkeypatch, status):
     from harness.vlm_transport import FatalVLMError
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     def request(req, timeout):
         raise urllib.error.HTTPError(req.full_url, status, "secret error body", {}, None)
     monkeypatch.setattr("urllib.request.urlopen", request)

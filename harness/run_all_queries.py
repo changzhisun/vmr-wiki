@@ -148,4 +148,12 @@ def main():
 
 
 if __name__ == "__main__":
-    cli(main)
+    import sys
+    import warnings
+    warnings.warn("Legacy harness CLI is deprecated; use python -m vmr", FutureWarning)
+    if "--wiki-set" in sys.argv:
+        from vmr.cli import entrypoint
+        sys.argv.insert(1, "query")
+        entrypoint()
+    else:
+        cli(main)

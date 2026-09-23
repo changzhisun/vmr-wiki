@@ -14,6 +14,9 @@ RUN test -n "$CODEX_VERSION" && test -n "$CLAUDE_VERSION" \
     && npm install -g "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
     && npm cache clean --force
 
+# Keep runtime helpers inside the pinned image, not in a host-repo bind.
+COPY --chmod=0755 docker/bin/ffmpeg /usr/local/bin/ffmpeg
+
 COPY --chown=node:node docker/egress_proxy.py /opt/vmr/egress_proxy.py
 
 USER node

@@ -62,8 +62,8 @@ def test_offline_ablation_end_to_end(prepared, tmp_path, monkeypatch):
         def caption(self, images, *, timestamps=None, **kwargs):
             return '{"events":[]}' if timestamps is not None else "A red scene."
 
-    monkeypatch.setattr("harness.ingest.VLMClient", FixtureVLM)
-    monkeypatch.setattr("harness.run_query.DockerRunner", lambda cfg: ProcessFixtureRunner())
+    monkeypatch.setattr("vmr.compiler.context.VLMClient", FixtureVLM)
+    monkeypatch.setattr("vmr.runtime.docker.DockerRunner", lambda cfg: ProcessFixtureRunner())
     try:
         run(suite, "all", 1)
         report = summarize(suite)

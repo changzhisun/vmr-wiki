@@ -1,0 +1,56 @@
+# Model, base URL, and API key come from VLM_MODEL, VLM_BASE_URL, and VLM_API_KEY.
+compile:
+  compiler: bidirectional
+  repair_attempts: 2
+  method_config:
+    max_frames_per_call: 100
+    topdown:
+      enabled: true
+      max_depth: 4
+      min_segment_duration_sec: 8.0
+      max_children_per_node: 12
+    bottomup:
+      enabled: true
+      window_sec: 45.0
+      overlap_ratio: 0.25
+      independent_observation: true
+    reconciliation:
+      window_sec: 180.0
+      max_records: 128
+      max_chars: 48000
+    boundary_refinement:
+      enabled: true
+      context_expand_ratio: 0.25
+      max_rounds: 2
+      uncertainty_sec: 2.0
+      endpoint_context_sec: 4.0
+    confidence:
+      self_consistency_for_low_confidence: true
+      max_review_rounds: 2
+    budget:
+      requests_per_hour: 1000
+      nodes_per_hour: 2000
+      max_requests: null
+      max_nodes: null
+    shared_cache_dir: null
+profiles:
+  vlms:
+    qwen_default:
+      provider: openai-compatible
+      model: VLM_MODEL
+      base_url: VLM_BASE_URL
+      api_key_env: VLM_API_KEY
+      prompt: >-
+        Describe observable activities at the requested semantic level. Use
+        concise, specific titles and summaries. Keep stable actor/object
+        descriptions across levels when supported by the images. Do not infer
+        invisible details.
+      generation:
+        temperature: 0
+        max_tokens: 8192
+      transport:
+        timeout_sec: 120
+        max_retries: 3
+        max_concurrent_requests: 4
+        max_retry_delay_sec: 60
+        queue_timeout_sec: 300

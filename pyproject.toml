@@ -14,9 +14,23 @@ test = ["pytest>=8,<10"]
 official = ["numpy>=1.24", "scipy>=1.10", "scikit-learn>=1.2"]
 
 [tool.setuptools.packages.find]
-include = ["harness*", "adapters*", "agents*"]
+include = ["vmr*", "harness*", "adapters*", "agents*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "unit: pure domain checks without containers or model calls",
+  "integration: media and fake-runtime pipeline checks",
+  "compatibility: legacy migration and CLI checks",
+  "docker: container/security/egress checks",
+]
 
+
+[project.scripts]
+vmr = "vmr.cli:entrypoint"
+
+[tool.ruff]
+required-version = "==0.15.16"
+target-version = "py310"
+line-length = 88

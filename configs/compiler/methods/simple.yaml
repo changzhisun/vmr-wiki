@@ -1,0 +1,27 @@
+# Frame-by-frame captions. Do not put {{FRAME_TIMESTAMPS}} in the VLM prompt.
+# Model, base URL, and API key come from VLM_MODEL, VLM_BASE_URL, and VLM_API_KEY.
+compile:
+  compiler: simple
+  repair_attempts: 2
+  method_config: {}
+profiles:
+  vlms:
+    qwen_default:
+      provider: openai-compatible
+      model: VLM_MODEL
+      base_url: VLM_BASE_URL
+      api_key_env: VLM_API_KEY
+      prompt: >-
+        Describe observable activities at the requested semantic level. Use
+        concise, specific titles and summaries. Keep stable actor/object
+        descriptions across levels when supported by the images. Do not infer
+        invisible details.
+      generation:
+        temperature: 0
+        max_tokens: 8192
+      transport:
+        timeout_sec: 120
+        max_retries: 3
+        max_concurrent_requests: 4
+        max_retry_delay_sec: 60
+        queue_timeout_sec: 300

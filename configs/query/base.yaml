@@ -1,0 +1,35 @@
+# Default config for `vmr query`.
+version: 3
+dataset:
+  name: monitor
+  split: dev
+storage:
+  root: ../..
+  datasets: datasets
+  runs: runs
+  results: results
+  templates: templates
+  artifacts: artifacts
+profiles:
+  agent:
+    model: AGENT_MODEL
+    container_image: vmr-wiki-agents:local
+    api_key_env: AGENT_API_KEY
+    base_url: AGENT_BASE_URL
+    egress_allowed_hosts:
+    - api.example.com
+    - chat.example.com
+    - api.example.net
+    - note3-prev-api.askdiandian.com
+    - api.anthropic.com
+query:
+  kind: claude_code
+  input_mode: multimodal
+  max_predictions: 5
+  timeout_sec: 600
+  templates:
+    agents: query_agents.md
+    prompt: query_prompt.md
+    text:
+      agents: query_agents_text_only.md
+      prompt: query_prompt_text_only.md

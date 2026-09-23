@@ -10,65 +10,105 @@ from harness.vlm import VLMClient
 
 
 def test_hierarchical_prompt_override_and_frame_limit(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")
     seen = []
+
     def request(req, timeout):
         seen.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({"choices": [{"finish_reason": "stop", "message": {
-            "content": '{"terminal":true,"nodes":[]}'}}]}).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"terminal":true,"nodes":[]}'},
+                        }
+                    ]
+                }
+            ).encode()
+        )
+
     monkeypatch.setattr("urllib.request.urlopen", request)
     client = VLMClient(cfg["ingest"]["vlm"])
-    client.caption([image] * 100, prompt_override="Hierarchy schema", correction="Fix partition")
+    client.caption(
+        [image] * 100, prompt_override="Hierarchy schema", correction="Fix partition"
+    )
     parts = seen[0]["messages"][0]["content"]
     assert len(parts) == 101
-    assert "Hierarchy schema" in parts[0]["text"] and "Fix partition" in parts[0]["text"]
+    assert (
+        "Hierarchy schema" in parts[0]["text"] and "Fix partition" in parts[0]["text"]
+    )
     with pytest.raises(HarnessError, match="at most 100"):
         client.caption([image] * 101, prompt_override="Hierarchy schema")
     assert len(seen) == 1
 
 
 def test_fixed_image_payload_and_caption(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image bytes")
     seen = []
+
     def request(req, timeout):
         seen.append(json.loads(req.data))
         assert req.get_header("Authorization") == "Bearer fake-key"
-        return io.BytesIO(json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": "A person."}}]}).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": "A person."}}
+                    ]
+                }
+            ).encode()
+        )
+
     monkeypatch.setattr("urllib.request.urlopen", request)
     assert VLMClient(cfg["ingest"]["vlm"]).caption(image) == "A person."
     assert seen[0]["temperature"] == 0
     assert len(seen[0]["messages"]) == 1
-    assert seen[0]["messages"][0]["content"][0]["text"] == cfg["ingest"]["vlm"]["prompt"]
-    assert seen[0]["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert (
+        seen[0]["messages"][0]["content"][0]["text"] == cfg["ingest"]["vlm"]["prompt"]
+    )
+    assert seen[0]["messages"][0]["content"][1]["image_url"]["url"].startswith(
+        "data:image/jpeg;base64,"
+    )
 
 
-def test_complete_supports_text_only_requests_with_same_model(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+def test_complete_supports_text_only_requests_with_same_model(
+    cfg, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     payloads = []
 
     def request(req, timeout):
         payloads.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "stop", "message": {"content": '{"ok":true}'}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": '{"ok":true}'}}
+                    ]
+                }
+            ).encode()
+        )
 
     monkeypatch.setattr("urllib.request.urlopen", request)
     client = VLMClient(cfg["ingest"]["vlm"])
     assert client.complete("Compare these text records.") == '{"ok":true}'
     payload = payloads[0]
     assert payload["model"] == cfg["ingest"]["vlm"]["model"]
-    assert payload["messages"][0]["content"] == [{"type": "text", "text": "Compare these text records."}]
+    assert payload["messages"][0]["content"] == [
+        {"type": "text", "text": "Compare these text records."}
+    ]
     assert all("image_url" not in part for part in payload["messages"][0]["content"])
     with pytest.raises(HarnessError, match="at most 100"):
         client.complete("too many frames", [tmp_path / "missing.jpg"] * 101)
 
 
 def test_multi_image_payload_preserves_chronological_order(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     images = [tmp_path / "first.jpg", tmp_path / "second.jpg"]
     images[0].write_bytes(b"first")
     images[1].write_bytes(b"second")
@@ -76,9 +116,15 @@ def test_multi_image_payload_preserves_chronological_order(cfg, tmp_path, monkey
 
     def request(req, timeout):
         seen.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "stop", "message": {"content": "A sequence."}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": "A sequence."}}
+                    ]
+                }
+            ).encode()
+        )
 
     monkeypatch.setattr("urllib.request.urlopen", request)
     assert VLMClient(cfg["ingest"]["vlm"]).caption(images) == "A sequence."
@@ -89,7 +135,7 @@ def test_multi_image_payload_preserves_chronological_order(cfg, tmp_path, monkey
 
 
 def test_dense_prompt_injects_frame_timestamps(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     cfg["ingest"]["vlm"]["prompt"] = "Timeline:\n{{FRAME_TIMESTAMPS}}\nReturn JSON."
     images = [tmp_path / "000001.jpg", tmp_path / "000002.jpg"]
     for image in images:
@@ -98,9 +144,18 @@ def test_dense_prompt_injects_frame_timestamps(cfg, tmp_path, monkeypatch):
 
     def request(req, timeout):
         seen.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "stop", "message": {"content": '{"events":[]}'}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"events":[]}'},
+                        }
+                    ]
+                }
+            ).encode()
+        )
 
     monkeypatch.setattr("urllib.request.urlopen", request)
     client = VLMClient(cfg["ingest"]["vlm"])
@@ -116,7 +171,7 @@ def test_dense_prompt_injects_frame_timestamps(cfg, tmp_path, monkeypatch):
 
 
 def test_dense_prompt_marks_soft_center_target_and_schema(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     default_prompt = cfg["ingest"]["vlm"]["prompt"]
     assert "guessing gender" not in default_prompt
     assert "watermarks" not in default_prompt
@@ -129,9 +184,18 @@ def test_dense_prompt_marks_soft_center_target_and_schema(cfg, tmp_path, monkeyp
 
     def request(req, timeout):
         seen.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "stop", "message": {"content": '{"events":[]}'}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"events":[]}'},
+                        }
+                    ]
+                }
+            ).encode()
+        )
 
     monkeypatch.setattr("urllib.request.urlopen", request)
     client = VLMClient(cfg["ingest"]["vlm"])
@@ -150,7 +214,7 @@ def test_dense_prompt_marks_soft_center_target_and_schema(cfg, tmp_path, monkeyp
 
 
 def test_rejection_is_fed_back_to_the_captioner(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     cfg["ingest"]["vlm"]["prompt"] = "Timeline:\n{{FRAME_TIMESTAMPS}}\nReturn JSON."
     image = tmp_path / "000001.jpg"
     image.write_bytes(b"image")
@@ -158,26 +222,39 @@ def test_rejection_is_fed_back_to_the_captioner(cfg, tmp_path, monkeypatch):
 
     def request(req, timeout):
         seen.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "stop", "message": {"content": '{"events":[]}'}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"events":[]}'},
+                        }
+                    ]
+                }
+            ).encode()
+        )
 
     monkeypatch.setattr("urllib.request.urlopen", request)
     client = VLMClient(cfg["ingest"]["vlm"])
-    client.caption([image], timestamps=[0.0], correction="end 14.0 is outside its window")
+    client.caption(
+        [image], timestamps=[0.0], correction="end 14.0 is outside its window"
+    )
     prompt = seen[0]["messages"][0]["content"][0]["text"]
     assert "previous answer was rejected: end 14.0 is outside its window" in prompt
 
 
 def test_retry_transient_only_and_no_credential_in_errors(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("VLM_API_KEY", "secret")
     monkeypatch.setattr("time.sleep", lambda _: None)
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")
     calls = []
+
     def request(req, timeout):
         calls.append(req)
         raise urllib.error.HTTPError(req.full_url, 429, "secret", {}, None)
+
     monkeypatch.setattr("urllib.request.urlopen", request)
     with pytest.raises(HarnessError) as exc:
         VLMClient(cfg["ingest"]["vlm"]).caption(image)
@@ -186,16 +263,28 @@ def test_retry_transient_only_and_no_credential_in_errors(cfg, tmp_path, monkeyp
 
 
 def test_length_with_visible_caption_is_rejected(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")
     calls = []
+
     def request(req, timeout):
         calls.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "length",
-                         "message": {"content": "A person stands indoors near a doorway."}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": "A person stands indoors near a doorway."
+                            },
+                        }
+                    ]
+                }
+            ).encode()
+        )
+
     monkeypatch.setattr("urllib.request.urlopen", request)
     with pytest.raises(HarnessError, match="finish_reason='length'"):
         VLMClient(cfg["ingest"]["vlm"]).caption(image)
@@ -204,17 +293,27 @@ def test_length_with_visible_caption_is_rejected(cfg, tmp_path, monkeypatch):
 
 
 def test_qwen3_disables_thinking(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     cfg["ingest"]["vlm"]["model"] = "Qwen3-VL-8B-Instruct"
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")
     payloads = []
+
     def request(req, timeout):
         payloads.append(json.loads(req.data))
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "stop",
-                         "message": {"content": "A person stands indoors."}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": "A person stands indoors."},
+                        }
+                    ]
+                }
+            ).encode()
+        )
+
     monkeypatch.setattr("urllib.request.urlopen", request)
     assert VLMClient(cfg["ingest"]["vlm"]).caption(image) == "A person stands indoors."
     assert payloads[0]["messages"][0]["content"][0]["text"].endswith("/no_think")
@@ -223,28 +322,50 @@ def test_qwen3_disables_thinking(cfg, tmp_path, monkeypatch):
 
 
 def test_think_block_is_stripped_from_caption(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")
+
     def request(req, timeout):
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "stop", "message": {
-                "content": "<think>plan</think>\nA red chair is in the room."}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": "<think>plan</think>\nA red chair is in the room."
+                            },
+                        }
+                    ]
+                }
+            ).encode()
+        )
+
     monkeypatch.setattr("urllib.request.urlopen", request)
-    assert VLMClient(cfg["ingest"]["vlm"]).caption(image) == "A red chair is in the room."
+    assert (
+        VLMClient(cfg["ingest"]["vlm"]).caption(image) == "A red chair is in the room."
+    )
 
 
 def test_content_filter_fails_immediately(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")
     calls = []
+
     def request(req, timeout):
         calls.append(req)
-        return io.BytesIO(json.dumps({
-            "choices": [{"finish_reason": "content_filter", "message": {"content": ""}}]
-        }).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {"finish_reason": "content_filter", "message": {"content": ""}}
+                    ]
+                }
+            ).encode()
+        )
+
     monkeypatch.setattr("urllib.request.urlopen", request)
     with pytest.raises(HarnessError, match="finish_reason='content_filter'"):
         VLMClient(cfg["ingest"]["vlm"]).caption(image)
@@ -252,7 +373,7 @@ def test_content_filter_fails_immediately(cfg, tmp_path, monkeypatch):
 
 
 def test_encoded_images_are_reused_and_invalidated(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"first")
     client = VLMClient(cfg["ingest"]["vlm"])
@@ -272,8 +393,10 @@ def test_encoded_images_are_reused_and_invalidated(cfg, tmp_path, monkeypatch):
     assert reads == [image]
 
 
-def test_request_usage_and_errors_are_recorded_without_credentials(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+def test_request_usage_and_errors_are_recorded_without_credentials(
+    cfg, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
     monkeypatch.setattr("time.sleep", lambda _: None)
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")
@@ -283,9 +406,20 @@ def test_request_usage_and_errors_are_recorded_without_credentials(cfg, tmp_path
         calls.append(req)
         if len(calls) == 1:
             raise urllib.error.HTTPError(req.full_url, 429, "fake-key", {}, None)
-        return io.BytesIO(json.dumps({"usage": {"prompt_tokens": 8, "completion_tokens": 2,
-                                               "total_tokens": 10}, "choices": [{
-            "finish_reason": "stop", "message": {"content": "A person."}}]}).encode())
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 2,
+                        "total_tokens": 10,
+                    },
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": "A person."}}
+                    ],
+                }
+            ).encode()
+        )
 
     monkeypatch.setattr("urllib.request.urlopen", request)
     client = VLMClient(cfg["ingest"]["vlm"])
@@ -294,3 +428,26 @@ def test_request_usage_and_errors_are_recorded_without_credentials(cfg, tmp_path
     assert client.last_requests[1]["usage"]["total_tokens"] == 10
     assert client.last_requests[1]["elapsed_sec"] >= 0
     assert "fake-key" not in json.dumps(client.last_requests)
+
+
+def test_unresolved_vlm_env_sentinels_are_rejected(monkeypatch):
+    monkeypatch.delenv("VLM_API_KEY", raising=False)
+    config = {
+        "provider": "openai-compatible",
+        "model": "VLM_MODEL",
+        "prompt": "Describe",
+        "base_url": "https://vlm.example.com/v1",
+        "api_key_env": "VLM_API_KEY",
+        "temperature": 0,
+        "max_tokens": 8,
+        "timeout_sec": 1,
+        "max_retries": 0,
+        "max_concurrent_requests": 1,
+    }
+    monkeypatch.setenv("VLM_API_KEY", "fake-key")
+    with pytest.raises(HarnessError, match="VLM_MODEL"):
+        VLMClient(config)
+    config["model"] = "fixture-vlm"
+    config["base_url"] = "VLM_BASE_URL"
+    with pytest.raises(HarnessError, match="VLM_BASE_URL"):
+        VLMClient(config)

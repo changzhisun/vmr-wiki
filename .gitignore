@@ -14,3 +14,7 @@ runs/
 results/
 .env
 tmp*
+
+artifacts/
+wiki_sets/
+experiments/

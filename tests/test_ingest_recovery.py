@@ -20,7 +20,7 @@ def recovery(cfg, tmp_path, monkeypatch):
         extracted.append(timestamp)
         path.write_bytes(b"jpeg")
 
-    monkeypatch.setattr("harness.ingest.extract_frame", extract)
+    monkeypatch.setattr("vmr.compiler.methods.window.extract_frame", extract)
     monkeypatch.setattr("harness.ingest.probe_durations", lambda _: (3.0, 3.0))
     monkeypatch.setattr("harness.ingest.media_command", lambda _: "ffmpeg fixture")
     return cfg, video, tmp_path / "wiki" / "videos" / "clip", extracted
@@ -105,7 +105,7 @@ def test_checkpoint_cleanup_failure_does_not_fail_published_wiki(recovery, monke
     def fail_cleanup(path):
         raise PermissionError("fixture")
 
-    monkeypatch.setattr("harness.ingest.remove_tree", fail_cleanup)
+    monkeypatch.setattr("vmr.compiler.methods.window.remove_tree", fail_cleanup)
     metadata = ingest_video(video, "clip", output, cfg, captioner=Captioner())
     assert read_json(output / "ingest.json") == metadata
 

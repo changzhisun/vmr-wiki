@@ -16,36 +16,8 @@ from harness.dataset import dataset_context, load_videos
 from harness.progress import ProgressBar
 
 
-def tree_hashes(root: Path, exclude: tuple[str, ...] = ()) -> dict[str, str]:
-    if root.is_symlink() or not root.is_dir():
-        raise HarnessError(f"Expected a real directory: {root}")
-    hashes = {}
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root).as_posix()
-        if path.is_symlink():
-            raise HarnessError(f"Symlink is forbidden in frozen input: {relative}")
-        if path.is_file() and relative not in exclude:
-            hashes[relative] = file_hash(path)
-        elif not path.is_dir() and not path.is_file():
-            raise HarnessError(f"Non-regular input: {relative}")
-    return hashes
-
-
-def make_readonly(root: Path) -> None:
-    for path in root.rglob("*"):
-        path.chmod(0o555 if path.is_dir() else 0o444)
-    root.chmod(0o555)
-
-
-def remove_tree(root: Path) -> None:
-    """Remove our own temporary copies, including their read-only directories."""
-    if not root.exists():
-        return
-    root.chmod(0o700)
-    for path in root.rglob("*"):
-        if not path.is_symlink() and path.is_dir():
-            path.chmod(0o700)
-    shutil.rmtree(root)
+# remove_tree remains an intentional compatibility export for legacy callers.
+from vmr.artifact.integrity import tree_hashes, make_readonly, remove_tree
 
 
 def _format_ids(video_ids: list[str], limit: int = 8) -> str:
@@ -161,6 +133,8 @@ def freeze_dataset(cfg: dict, *, split: str | None = None) -> dict:
 
 
 def main():
+    import warnings
+    warnings.warn("Legacy freeze CLI is deprecated; use python -m vmr compile", FutureWarning)
     parser = argparse.ArgumentParser(description="Verify and freeze one split's unique videos")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--dataset")

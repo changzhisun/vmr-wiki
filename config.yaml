@@ -14,32 +14,26 @@ storage:
   results: results
   templates: templates
 
-# Reusable deployment profiles. Roles below select one named profile instead
-# of repeating model, credential, endpoint, allowlist, and container settings.
+# Shared coding-agent deployment. query.kind selects codex or claude_code.
 profiles:
-  agents:
-    codex_default:
-      kind: codex
-      model: REPLACE_WITH_AGENT_MODEL
-      container_image: vmr-wiki-agents:local
-      api_key_env: CODEX_API_KEY
-      base_url: null
-      egress_allowed_hosts: [api.example.com, chat.example.com]
-
-    claude_default:
-      kind: claude_code
-      model: REPLACE_WITH_AGENT_MODEL
-      container_image: vmr-wiki-agents:local
-      api_key_env: ANTHROPIC_API_KEY
-      base_url: null
-      egress_allowed_hosts: [api.example.net]
+  agent:
+    model: AGENT_MODEL
+    container_image: vmr-wiki-agents:local
+    api_key_env: AGENT_API_KEY
+    base_url: AGENT_BASE_URL
+    egress_allowed_hosts:
+    - api.example.com
+    - chat.example.com
+    - api.example.net
+    - note3-prev-api.askdiandian.com
+    - api.anthropic.com
 
   vlms:
     qwen_default:
       provider: openai-compatible
-      model: Qwen3-VL-8B-Instruct
-      base_url: https://vlm.example.com/v1
-      api_key_env: OPENAI_API_KEY
+      model: VLM_MODEL
+      base_url: VLM_BASE_URL
+      api_key_env: VLM_API_KEY
       prompt: |-
         Describe observable activities at the requested semantic level. Use concise,
         specific titles and summaries. Keep stable actor/object descriptions across
@@ -97,10 +91,16 @@ wiki:
     shared_cache_dir: null
 
 query:
-  agent_profile: codex_default
+  kind: claude_code
   input_mode: multimodal  # text | multimodal
   max_predictions: 5
   timeout_sec: 600
+  templates:
+    agents: query_agents.md
+    prompt: query_prompt.md
+    text:
+      agents: query_agents_text_only.md
+      prompt: query_prompt_text_only.md
 
 batch:
   consecutive_failure_limit: 3

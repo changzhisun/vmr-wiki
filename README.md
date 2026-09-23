@@ -1,607 +1,144 @@
 # VMR Wiki
 
-将视频转换成与 Query 无关的层次化时间语义树，再让每条 Query 在全新的 Codex / Claude Code 进程中完成 Video Moment Retrieval。支持 QVHighlights、UCA-VMR 和 Monitor；旧版 Simple / Dense 视觉时间线仍可使用。
+将视频编译为与 Query 无关的不可变 Wiki Artifact，再让每条 Query 在独立 Codex / Claude Code 容器中定位视频片段。
 
 ```text
-QVHighlights / UCA-VMR annotations → videos / queries / ground_truth manifests
-视频 → 全局扫描 → 混合采样与递归细化 → 自底向上合并 → JSONL / Markdown → SHA256 Freeze
-选定 Split 的单 Query + 当前 Wiki → 独立容器 / 新进程 → prediction.json
-predictions → aggregate → mAP / R@K → metrics.json
+Video → Compiler → Sealed Wiki Artifact → WikiSet → Query → Prediction → Evaluate
 ```
 
-Ground Truth 和预测始终使用 `moments: [...]`，不会在转换或聚合时丢弃额外片段。
+支持 `simple`、`dense`、`hierarchical`、`bidirectional`、`agentic` 五种 compiler。不同方法共享 Artifact v2（兼容读取 v1） 和同一个 QueryEngine；Query 不需要 compiler 代码、compile 配置或原始视频。数据集支持 Monitor、QVHighlights 和 UCA-VMR，下文以 Monitor 为例。
 
 ## 安装
 
-需要 Python 3.10+、宿主机的 `ffmpeg` / `ffprobe`，以及运行中的 Docker。命令均在本仓库根目录执行。
+需要 Python 3.10+；Compile 内置方法需要 FFmpeg / FFprobe，真实 Agent 运行需要 Docker。运行时依赖 PyYAML。
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[test]'
-```
-
-macOS 可通过 `brew install ffmpeg` 安装媒体工具；Linux 可使用发行版包管理器。运行时只需要 PyYAML，VLM 客户端使用 Python 标准库。
-
-构建 Agent 镜像时必须指定 CLI 版本；所有实验会记录实际镜像的 SHA256 ID，在一次实验中始终按此 ID 启动，避免浮动 tag 造成混用。
-
-```bash
 docker build -f docker/Dockerfile \
-  --build-arg CODEX_VERSION=0.153.4 \
-  --build-arg CLAUDE_VERSION=2.1.158 \
+  --build-arg CODEX_VERSION=0.153.4 --build-arg CLAUDE_VERSION=2.1.158 \
   -t vmr-wiki-agents:local .
 ```
 
-镜像中只安装 CLI 和基本文件工具（含 `ffmpeg`/`jq`，供 agentic ingest 自行抽帧），不包含仓库、数据集或认证文件。Ingest 与 Query 共用这一个镜像。CLI 版本可以调整，但必须支持相应 adapter 使用的参数，并为变更后的运行创建新实验。
+FFmpeg 的非交互包装脚本随 Agent 镜像提供，不再挂载宿主仓库中的 `docker/bin`。从旧版本升级时，请重新执行上面的镜像构建命令。
 
-## 配置
+CLI 安装后使用 `vmr`，也可以使用 `python -m vmr`。模型凭据由环境变量提供，配置只保存变量名；Query 不挂载宿主机登录状态。
 
-编辑 [config.yaml](config.yaml)：
+## 数据准备
 
-- `profiles.agents`：可复用的 Coding Agent 部署；每个 profile 只描述一种 `kind`、模型、认证变量名、endpoint、出网白名单和容器镜像。`query.agent_profile` 或 agentic Wiki 引用 profile，不再复制整套连接配置。
-- `profiles.vlms`：可复用的 VLM 部署。`generation` 只放 temperature/token 上限，`transport` 只放超时、重试和并发控制。
-- `wiki.method`：选择 `bidirectional`、`agentic`、`hierarchical`、`dense` 或 `simple`。`wiki.method_config` 只允许当前方法的参数，避免无效模式配置同时出现。
-- `wiki.media`：共享的抽帧间隔、图像尺寸和 JPEG 质量；`wiki.repair_attempts` 是结构化回答的额外修复次数。
-- `query.input_mode`：`multimodal` 会把 `wiki/frames/` 提供给 Agent；`text` 不复制图片，并使用独立纯文本模板。
-- `batch.consecutive_failure_limit`：Ingest 连续失败熔断阈值。Query/Ingest 的实际 worker 数仍由各命令的 `--jobs` 指定。
-- `storage.root`：其他存储目录的共同基准；它相对于入口配置文件解析。
-
-通过环境配置 `OPENAI_API_KEY`（Ingest）、`CODEX_API_KEY`（Codex）或 `ANTHROPIC_API_KEY`（Claude Code）。profile 中只保存环境变量名，不保存密钥。`wiki.method: agentic` 不需要 VLM profile，只需要 `wiki.agent_profile` 指向的 Coding Agent 凭据。当前 Query adapter 使用 API key，不挂载宿主机登录状态。
-
-v2 配置可以用显式 `extends` 组合一个路径或路径列表；父文件按顺序深度合并，入口文件最后覆盖，列表整体替换。相对 include 路径相对于声明它的文件，存储路径统一相对于入口配置的 `storage.root`。不要依赖跨文件 YAML anchor。执行时会先归一化成一份完整的旧内部结构，实验保存的仍是可独立复现的完整配置快照。可用 `python harness/config.py explain --config CONFIG` 查看归一化结果和 Wiki 内容哈希。
-
-未写 `version` 的旧配置仍可加载，但已标记 deprecated。v1/v2 的等价配置产生相同内部配置和 `ingest_content_hash`。Query 模型仍需填写；值为 `REPLACE_...` 占位符时不会发起请求。
-
-## 1. 转换数据集
-
-准备 QVHighlights 官方各 split 的 JSONL annotation，以及对应的 `.mp4` 文件。输入字段为 `qid`、`vid`、`query`、`duration`；带标签 split 还包含 `relevant_windows`。视频文件必须名为 `<vid>.mp4`，且已经裁成 annotation 中对应的片段；文件内 0 秒就是标注的 0 秒，不能直接提供未裁剪的长视频。
+保持 Adapter-owned contract，Adapter 输出 `dataset.json`、`videos.jsonl`、`queries.jsonl` 和有标签 split 的 `ground_truth.jsonl`。
 
 ```bash
-python adapters/qvhighlights.py \
-  --annotations /path/to/highlight_val_release.jsonl \
-  --split val \
-  --video-root /path/to/qvhighlights/videos \
-  --output datasets/qvhighlights
+python adapters/monitor.py \
+  --annotations /path/to/dev.jsonl --split dev \
+  --video-root /path/to/videos --output datasets/monitor
 ```
 
-生成：
+多个 split 可以用 `--annotation-dir` 一次发现全部 `<split>.jsonl`，用 `--default-eval-split` 指定评测省略 `--split` 时使用的有标签 split。
+
+Split 名称是 opaque string，不自动映射或合并；视频须与标注时间轴一致。Query、GT 均保留多个 moments。Monitor 使用 `generic` evaluator 和 `any_acceptable_moment` 的 GT 语义。其他 Adapter 和官方评测说明见 [原有数据集文档](docs/legacy-workflow.md)。
+
+## Compile
+
+默认配置是 [configs/compiler/base.yaml](configs/compiler/base.yaml)。该文件只保留 dataset、路径、batch 和共享 media，通过 `extends` 组合 [configs/compiler/methods/](configs/compiler/methods/) 里的方法配置。模型、endpoint、凭据和 prompt 写在对应的 method 文件里。切换 compiler 只需改这一行：
+
+```yaml
+extends: methods/agentic.yaml  # simple | dense | hierarchical | bidirectional | agentic
+```
+
+v3 配置将 compile 和 query 分开；原 v1/v2 配置仍可显式迁移读取。Monitor 的默认 split 是 `dev`，需要别的 split 时再传 `--split`。
+
+```bash
+vmr compile --dataset datasets/monitor \
+  --output-set wiki_sets/monitor-dev-agentic.json --jobs 4
+```
+
+成功构建自动校验、封存、发布，不需要单独 freeze。失败不会发布不完整 Artifact，完成的请求 checkpoint 可在重跑时复用；共享配置错误立即停止，其他错误受连续失败熔断限制。失败记录在 artifact store 的 `.compile-failures/`。
 
 ```text
-datasets/qvhighlights/
-├── videos.jsonl
-├── queries.jsonl
-├── ground_truth.jsonl
-└── dataset.json
+artifacts/sha256-<content-id>/<manifest-hash>/
+├── artifact.json       # host-only manifest
+├── public/             # manifest 声明的全部 Query 输入
+│   ├── wiki.md
+│   └── ...
+└── internal/           # 构建记录、原始回答、审计
 ```
 
-所有 GT windows 原样保留；`queries.jsonl` 只含 `query_id`、`video_id`、`split`、`query`。同一 split 内重复 ID、非法区间、共享视频身份冲突、部分 Query 有标签而其他 Query 无标签都会报错。无标签 split 可以转换和预测，但禁止本地评测；全数据集均无 GT 时不创建 `ground_truth.jsonl`。已有输出目录不会被覆盖。
-
-转换器写入绝对视频路径；手工编写 manifest 时，相对 `video_path` 以 `videos.jsonl` 所在目录为基准。
-
-### Dataset metadata 与任意 Split
-
-一次转换所有 QVHighlights release 文件，并由 Adapter 发现原始 split 名称：
+Artifact ID 绑定 source、compiler 内容身份、公开表面和公开文件哈希，区分同一配置的不同模型输出；审计时间戳不改变内容 ID。不同构建记录由完整 manifest hash 区分并保留，WikiSet 和构建缓存同时锁定这两个值。构建缓存键不包含 endpoint、重试、并发等 transport 参数。WikiSet 保存 video → Artifact ID 和 manifest hash 映射；store 路径相对于 WikiSet 解析，复制时保留相对布局或显式设置 store。
 
 ```bash
-python adapters/qvhighlights.py \
-  --annotation-dir /path/to/qvhighlights/annotations \
-  --video-root /path/to/qvhighlights/videos \
-  --output datasets/qvhighlights \
-  --default-eval-split val
+vmr artifact validate artifacts/sha256-<content-id>/<manifest-hash>
+vmr wikiset validate wiki_sets/monitor-dev-agentic.json
 ```
 
-Adapter 从 `highlight_<split>_release.jsonl` 提取完整名称，包括 `val_1`、`val_2`。自定义文件名使用重复的 `--annotations 'SPLIT=PATH'`，例如 `--annotations 'validation=/data/custom.jsonl'`。不要将原始名称改写为其他名称。
+## Query
 
-`dataset.json` 示例：
-
-```json
-{
-  "name": "qvhighlights",
-  "splits": {
-    "train": {"has_ground_truth": true},
-    "val": {"has_ground_truth": true},
-    "test": {"has_ground_truth": false}
-  },
-  "default_eval_split": "val",
-  "evaluator": "qvhighlights"
-}
-```
-
-Harness 仅将 split 视为非空、不修改的字符串，通过 metadata 验证。`validation` 不会自动映射到 `val`；unknown split 报错并列出全部合法名称。没有保留的 `all` 名称：`--split all` 仅在数据集确实定义了名为 `all` 的 split 时有效。
-
-所有 manifest 行必须带 `split`。同一个视频被多个 split 引用时，`videos.jsonl` 为每个 `(split, video_id)` 保存一个成员关系行，路径与时长必须一致；一个 split 内 Query ID 唯一，不同 split 可以复用相同 Query ID。
-
-```json
-{"video_id":"v1","video_path":"/data/v1.mp4","duration":20.0,"split":"validation"}
-{"query_id":"q1","video_id":"v1","split":"validation","query":"When does the person stand up?"}
-{"query_id":"q1","video_id":"v1","split":"validation","moments":[{"start_sec":2.0,"end_sec":4.0},{"start_sec":12.0,"end_sec":15.0}]}
-```
-
-以上三行分别属于 videos、queries、ground_truth。新 Adapter 只需在 `adapters/<name>.py` 中转换原始 annotation、发现 split 并声明 evaluator；Harness 不解释任何 split 名称。可通过 Adapter 的 `evaluate_predictions` 函数扩展官方评测语义，无需在 Harness 增加 dataset 判断。
-
-### 1.1 UCA-VMR
-
-UCA-VMR 的 annotation 是每条 Query 一行 JSONL，输入字段为 `query_id`、`video_id`、`path`、`duration`、`query`（对象，取 `text` 字段）、`gold_moments`（`[[start, end], ...]`）。`path` 是相对于 `--video-root` 的视频路径，例如 `Videos/Abuse/Abuse043_x264.mp4`。每个 Query 只有一个 gold moment，原样保留在 `moments` 数组中。
+默认配置是 [configs/query/base.yaml](configs/query/base.yaml)，只包含 Query 所需的 profile、运行参数和路径。填写真实 Agent model/endpoint/白名单并设置凭据。
 
 ```bash
-python adapters/uca.py \
-  --annotations /path/to/UCA-VMR/dev.jsonl \
-  --split dev \
-  --video-root /path/to/UCF_Crimes \
-  --output datasets/uca
+vmr query --dataset datasets/monitor \
+  --wiki-set wiki_sets/monitor-dev-agentic.json \
+  --experiment results/bidirectional-codex-01 --jobs 4
 ```
 
-用 `--annotation-dir` 可一次发现目录下全部 `<split>.jsonl`：
+切换构建方法只需切换 WikiSet。`--query-id` 可以只执行一条查询。`query.input_mode: text` 只复制 manifest 的 `text_files`；`multimodal` 额外复制 `multimodal_files`。路径使用显式文件列表，不支持 glob。
+
+每条 Query 使用独立 workspace 和 Agent 进程，真实 video/query/split ID 通过 HMAC 别名隐藏；只将 `public/` 的声明文件提供给 Agent。运行前、复制后和接受结果前检查完整性，保持严格 Prediction 校验与失败分类。源 Artifact 不会被修改。
+
+实验 pin WikiSet、Artifact IDs、manifest hashes、Query 配置、模板和执行代码；构建配置不参与 Query resume。成功记录校验后复用，失败记录保留历史并重试。旧实验不能直接 resume 为新版实验，必须使用新目录。
+
+## Evaluate
 
 ```bash
-python adapters/uca.py \
-  --annotation-dir /path/to/UCA-VMR \
-  --video-root /path/to/UCF_Crimes \
-  --output datasets/uca \
-  --default-eval-split dev
+vmr evaluate --dataset datasets/monitor \
+  --experiment results/bidirectional-codex-01
 ```
 
-生成：
+生成 `predictions.jsonl`、provenance sidecar 和 `metrics.json`。evaluator 由 Adapter 声明，Monitor 使用 `generic`；保持原来的 evaluator 输入输出和全 split 分母，基础设施错误不会静默算成模型零分。仅 QVHighlights 数据集可通过 `--official-root /path/to/moment_detr` 改用官方 evaluator，需安装 `.[official]`。
 
-```text
-datasets/uca/
-├── videos.jsonl
-├── queries.jsonl
-├── ground_truth.jsonl
-└── dataset.json
-```
-
-`queries.jsonl` 只含 `query_id`、`video_id`、`query`、`split`；`ground_truth.jsonl` 保留全部 `gold_moments`。重复 ID、非法时间区间、同视频时长不一致、`path` 逃出 video root、`query.text` 缺失都会报错，已有输出目录不会被覆盖。UCA-VMR 的 test split GT 公开，因此 train / dev / test 均可转换。
-
-## 2. Ingest 与 Freeze
-
-### 2.1 双向 Wiki（默认）
-
-默认配置写入新的 `wiki-bidirectional/`，不会覆盖旧 Wiki。填写 VLM endpoint、模型和认证环境变量后，沿用原入口：
+## 对照实验
 
 ```bash
-python harness/ingest_all.py --config config.yaml --dataset monitor --split dev --freeze
-```
-
-处理流程是 Top-down 全局骨架、独立 Bottom-up 固定窗口扫描、VLM reconciliation、边界复查和一致性/coverage review。Bottom-up 首轮不会看到 Top-down 标签，避免 confirmation bias；同一 VLM 的纯文本请求用于归并、冲突分析和结构检查。
-
-默认配置为 45 秒窗口、25% 重叠、每次最多 100 帧、180 秒 reconciliation 批次。窗口覆盖表示成功处理过采样请求，不代表所有事件都已召回；无法解释的独立 observation 会作为 `review_status: unresolved` 候选保留，并进入 Query 工作区。
-
-输出文件包括：
-
-```text
-nodes.jsonl topdown_nodes.jsonl bottomup_observations.jsonl observations.jsonl
-reconciliation.jsonl coverage.jsonl sampling.jsonl caption_audit.jsonl
-wiki.md frames.jsonl frames/ ingest.json frozen.json
-```
-
-节点使用 `granularity` 与 `type`，type 可以是 `chapter`、`scene`、`event`、`action`、`state_change`、`transition`、`dialogue` 或 `other`。`confidence` 是分别记录 semantic、boundary、hierarchy 的 high/medium/low 标签；旧版数字 confidence 只作为 legacy 信息，不转换成 high。节点允许 overlap/gap，主 parent 关系无环；一个 observation 可以支持多个节点。
-
-异常处理分三层：网络错误、空响应及损坏的 API JSON 最多按所选 VLM profile 的 `transport.max_retries` 重试；回答内的 JSON 语法错误交给同一 VLM 纯文本修复；字段类型、时间区间、关系等不合要求时，回传原因重新生成。双向流程对 token 截断也会要求重新返回完整且简洁的结构，不接受截断片段。每个逻辑请求最多 `1 + wiki.repair_attempts` 次生成及 `wiki.repair_attempts` 次格式修复，传输层重试另计。401/403/404、模型拒绝及耗尽传输重试不会再触发语义层重试。重试、修复、失败和 usage 均保留审计；仍不合法时保留 checkpoint，禁止发布不完整 Wiki。语义不确定但结构合法的内容沿用 unresolved 证据候选。
-
-`--jobs` 控制并行视频数，所选 VLM profile 的 `transport.max_concurrent_requests`（默认 4）独立限制同一进程内、同一 endpoint 的在途 API 请求，覆盖图像、纯文本、修复和重试。429/503 触发共享冷却，重试采用指数退避与随机抖动，并解析数值或日期形式的 `Retry-After`。共享冷却最多持续当前客户端的 `max_retry_delay_sec`，超长值保留在错误与审计中；当前请求放弃自动重试，其他客户端只等待有上限的冷却。等待超过 `queue_timeout_sec`（默认 300 秒），或服务端要求的重试延迟超过 `max_retry_delay_sec`（默认 60 秒），会明确失败，供稍后恢复；等待配额和退避期间响应取消信号。在途 HTTP 调用仍受 `timeout_sec` 约束。多进程或多机器运行时需自行分配各进程并发配额，该限制不覆盖其他进程。
-
-串行和并行批处理会继续处理偶发失败后的其他视频，最后汇总失败并返回非零状态。缺少认证配置、保留的占位模型名以及 HTTP 401/403/404 会立即熔断；其他错误达到 `batch.consecutive_failure_limit`（默认连续 3 个失败视频）时也停止批处理，成功的视频会重置该计数。并行模式最多提交 `--jobs` 个待处理任务，熔断后停止提交、取消尚未开始的任务并等待运行中的任务退出；已完成产物可在下次运行时复用。失败清单写入 Wiki 数据集目录的 `.ingest-failures/<video_id>.json`，成功重跑后移除；正常取消不会新增失败记录，已有失败记录保留，它不进入 Query 工作区。重跑相同命令复用已完成窗口，空 observation 数组只有通过当前角色的校验才算成功；失败窗口不会标为 seen，也不会自动替换为空结果。
-
-### 2.2 旧版层次化 Wiki
-
-1. 全片均匀采样最多 100 帧，请 VLM 预测覆盖全视频的 Chapter。
-2. 对每个节点重新采样，按 Chapter → Scene → Event → Action 细化。每次图像输入最多 `max_frames`（硬上限 100）；短视频或低帧率视频会去重，少于 100 帧。
-3. 局部采样默认 60% 均匀帧，剩余配额平分给场景变化附近帧和高运动/视觉变化帧；无显著变化时补充均匀帧。FFmpeg 以默认 2 fps、64×36 灰度预扫描，用亮度直方图变化估计切镜、像素平均差估计运动/视觉变化，包括镜头运动；它不是光流或学习式场景检测器。分数写入 `sampling.jsonl`。
-4. 采样时刻对齐到主视频流的 presentation timestamps，避免 EOF 后抽帧并适配可变帧率。节点边界可使用区间内的浮点秒数，表达采样证据支持的估计范围，不声称逐帧精确。
-5. 相邻节点的图像上下文默认保留 15% 重叠，可设置 10%–20%。具体定义：每个共享边界的重叠长度为较短目标区间时长乘以比例，向两侧各延伸一半；上下文不超出父区间。主树中的兄弟节点仍是连续、不重叠的时间分区。
-6. 达到 `min_segment_sec`（默认 2 秒）、语义不可再分、Action 层或 `max_depth` 时停止。全局至少返回一个 Chapter；低信息或静态画面也应如实描述，不能让全片静默消失。
-7. 细化完成后，自底向上请求 VLM 将同层相邻、属于同一连续活动的节点分组。合并范围由程序取成员边界，子节点重新挂到合并节点；重复但独立的活动应保持分离。不会合并一个已展开节点和一个未展开叶子，避免产生缺失的子区间。原始原子观察及中间合并节点保留在独立 JSONL 中。
-
-主树是虚拟 Video 根下的 Chapter 列表，Chapter 的 `parent_id` 为 `null`。其余节点只允许紧邻层级的父子关系。每个节点包含用户语义字段和可追溯证据：
-
-```json
-{"node_id":"event_root_001_001_001","parent_id":"scene_root_001_001","level":"event","start":120.5,"end":138.2,"title":"加入西红柿","summary":"女子将切好的西红柿加入锅中。","actors":["女子"],"actions":["加入"],"objects":["西红柿","锅"],"state_before":"西红柿位于砧板上","state_after":"西红柿已经进入锅中","confidence":0.93,"evidence_frame_ids":["f_example"]}
-```
-
-上例只展示格式。ID、parent_id 和合并边界由程序生成；`confidence` 是模型自报值，未经概率校准。叶子另带 `stop_reason`，合并节点另带 `source_node_ids`。状态未知时是空字符串，实体未知时是空数组。
-
-```text
-wiki-hierarchical/<dataset>/videos/<video_id>/
-├── nodes.jsonl           # 主树，先父后子；所有推荐 Schema 字段
-├── observations.jsonl    # 原始/中间观察档案，供 source_node_ids 追溯
-├── wiki.md               # 章节索引和四层语义树
-├── frames.jsonl          # 去重帧索引：frame_id、timestamp、frame
-├── frames/               # 所有请求实际使用的图像
-├── sampling.jsonl        # 低分辨率变化分析分数
-├── caption_audit.jsonl   # split/merge 输入、原始响应、修复及 usage
-├── ingest.json
-└── frozen.json
-```
-
-`observations.jsonl` 是历史观察档案，父节点引用反映生成时关系，不应作为当前树遍历；最终关系以 `nodes.jsonl` 为准。Query Agent 可读取 nodes、observations、wiki、frames 索引和图像；不暴露 sampling、请求审计和源视频身份元数据。所有产物均参与冻结。
-
-默认每次最多 12 个子节点、最多生成 2,000 个节点（包括中间合并节点）、最多 1,000 个逻辑 split/merge 请求。超预算会明确失败并保留 checkpoint，不发布部分树。修复使用 `wiki.repair_attempts`，传输重试沿用 VLM profile；两者不计入逻辑请求数，但计入调用审计。不同视频可由 `--jobs` 并发；单视频按树依赖顺序处理。
-
-图像、变化分析和每次 split/merge 成功响应均可断点恢复。更改层次化内容参数需要新 Wiki 根目录；规则版本为 `hierarchy_processing_version: 1`，进入内容哈希。层次化 Wiki 时长使用主视频流时长，容器时长单独保存在 `container_duration`。
-
-### 2.3 独立 Embedding（可选）
-
-不把向量写入节点 JSONL 或冻结 Wiki。使用支持 `/embeddings` 的模型，显式运行独立导出：
-
-```bash
-python harness/embed_wiki.py \
-  --wiki wiki-hierarchical/monitor/videos/VIDEO_ID \
-  --output embeddings/monitor/VIDEO_ID \
-  --model YOUR_EMBEDDING_MODEL \
-  --base-url https://YOUR_EMBEDDING_ENDPOINT/v1 \
-  --api-key-env OPENAI_API_KEY
-```
-
-输出 `vectors.npy`（L2 归一化 float32）、`index.jsonl`（行号 → node_id、时间范围、文本哈希）和 `manifest.json`（模型、源 Wiki 哈希、维度和文件哈希）。格式可直接由 NumPy 加载或导入 FAISS；导出器本身无需 NumPy。所有层级都参与向量化，embedding 文本由标题、摘要、实体、动作、前后状态组成。该步骤单独调用 Embedding API，不随 ingest 自动执行，也不会自动挂载到 Query 工作区。
-
-### 2.4 Agentic Wiki（Coding Agent 自主编译）
-
-`wiki.method: agentic` 不调用独立 VLM，而是把每个视频交给一个隔离容器里的 Coding Agent（Codex 或 Claude Code）。Agent 使用有界的 Dense Temporal Observation 流程：一次性建立默认约 1 秒的完整时间覆盖，把连续帧组成尺寸受限的 contact sheet，按相邻 5 帧、步长 1 帧观察原子状态变化，然后再组织 Chapter → Event → Moment。基础覆盖帧会保留给下游复核，层级摘要不能替代细粒度时间证据。
-
-方法本身写在 [templates/wiki_agents.md](templates/wiki_agents.md)（HOW）里，逐视频配置由 `task.json`（WHAT）承载，两者的哈希都参与 `ingest_content_hash`：**改动指令模板等于换了一种方法，旧 Wiki 会失配**。
-
-使用与 Query 相同的 `vmr-wiki-agents:local` 镜像（见安装一节），无需单独构建：镜像里的 `ffmpeg` 供 Agent 自行抽帧，而 Query Agent 用不到它——Query 工作区只有冻结后的 Wiki，源视频从不挂载进去，"不能重新抽帧"由挂载边界保证而非镜像内容。共用一个镜像也保证两侧 CLI 版本永远一致。
-
-设置 `wiki.agent_profile`，并在 `wiki.method_config` 中配置抽帧、结构和资源预算后，沿用常规入口即可：
-
-```bash
-python harness/ingest_all.py --dataset qvhighlights --split train --jobs 2
-python harness/freeze.py --dataset qvhighlights --split train
-```
-
-容器挂载：workspace（`AGENTS.md`、`task.json`）只读，`/input/video.mp4` 只读，`/workspace/output` 可写，`/scratch` 可写。`--read-only` 根文件系统、`--cap-drop=ALL`、`--security-opt=no-new-privileges`、非特权 UID、内部网络加白名单出网代理与 Query 侧完全一致；资源上限由 `wiki.method_config` 的 `memory_gb`、`cpus`、`pids_limit` 控制（抽帧需要比 Query 更大的额度）。
-
-`task.json` 刻意不包含 video_id、split 或任何 Query：Wiki 必须 query-independent，而公开 benchmark 的标识符是模型可能已记住的精确查找键。宿主临时目录名也不使用 video_id，因为容器能通过 `/proc` 读到自己 bind mount 的源路径。
-
-产物契约是 `output/` 下**恰好** `wiki.md`、`frames.jsonl`、`frames/` 三样。`frames.jsonl` 沿用仓库约定的 `frame_id`（`^f[0-9]{6}$`）、`timestamp`（秒）、`frame`（`frames/NNNNNN.jpg`），并新增 `reason`（`periodic_sample`、`scene_boundary`、`event_boundary`、`action_boundary`、`boundary_refinement`、`semantic_evidence`）和 `description`，可选 `entities`、`objects`、`location`、`shot_id`。`wiki.md` 使用 Chapter → Event → Moment 三级层级，把 Observed 与 Inferred 显式分开，并给出 retrieval aliases 和时间关系。
-
-Agent 自己会在退出前自校验，但**自检不是证据**：[harness/agentic_validate.py](harness/agentic_validate.py) 在宿主端独立重跑一遍等价校验，任何一项不通过该视频即失败，不发布。校验覆盖文件集合严格相等、无符号链接与大小上限、JSONL schema 与字段白名单、`frame_id` 唯一、注册路径与磁盘图片双向 1:1（不允许孤儿图片）、timestamp 严格递增且落在视频流时长内、`wiki.md` 引用的每张图都已注册、配置启用的 Chapter/Event/Moment 标题至少各有一个、无绝对路径与路径穿越、首行必须是 `# Video`，以及 wiki 与注册表都不泄漏视频身份。Agent 篡改自己的 `AGENTS.md` 或 `task.json` 同样判失败。
-
-如果 Agent 正常退出但缺少 `wiki.md`、`frames.jsonl` 或 `frames/`，Harness 会在原 workspace 和 scratch 上追加一次定向修复；修复只允许利用现有 `progress.json`、`dense_frames.jsonl`、contact sheet 和候选帧补文件，不重新抽帧或调试图像流程，也不能把密集覆盖缩减成少量粗帧。修复与首次运行共享同一个 `wiki.method_config.timeout_sec` 总预算，且每次调用的剩余 timeout 独立传入，不会在 `--jobs>1` 时影响其他视频。修复日志单独保存为 `agent.repair.stdout.log` / `agent.repair.stderr.log`，次数记录在 `telemetry.artifact_repairs`。格式错误、额外文件和校验失败不会无限重试。
-
-Agent 的可读 stdout、stderr 和完整 CLI 事件流分别写在
-`wiki/<dataset>/.ingest-logs/<video_id>/agent.stdout.log`、`agent.stderr.log` 和
-`agent.trace.jsonl`，位于 Wiki 目录之外，不进 `content_hashes`，不参与冻结。事件流默认启用：
-Codex 使用 `exec --json`，Claude Code 使用 `--verbose --output-format stream-json`；其中包含
-模型消息、工具调用及工具结果，并在首行记录 Harness 传入的 prompt。它不是 HTTP 抓包，不包含
-API key、请求头或网关内部的重试详情。
-
-Agentic 模式不做视频内断点续传：一次编译是一个不透明的长容器调用，失败即整个视频重来，`ingest_all.py` 的连续失败熔断与 `.ingest-failures` 报告照常生效。缺少凭据或镜像属于共享配置失败，在批次开始前就抛出，不会记到任何一个视频头上。
-
-**不可复现性**：Agent 自主决定抽哪些帧，同一配置两次 ingest 的产物并不相同。`ingest_content_hash` 标识的是**配置**而非产物，`frozen.json` 仍然锁死具体产物。因此 Agentic Wiki 的对照实验必须复用同一份冻结产物，不能靠重跑复现。
-
-### 2.5 旧版 Simple / Dense
-
-下文的固定采样和窗口配置适用于旧版模式。切换为 `wiki.method: dense` 时，将 `templates/dense_prompt.md` 的内容写入所选 VLM profile 的 `prompt`，并在 `wiki.method_config` 设置 `window_frames`、`stride_frames` 和 `timestamp_mode`；Simple 使用无时间戳占位符的普通 Caption prompt。复用旧产物时使用其原始配置及 Wiki 根目录。
-
-单视频入口：
-
-```bash
-python harness/ingest.py \
-  --video /path/to/video.mp4 \
-  --video-id video_001 \
-  --output wiki/qvhighlights/videos/video_001
-```
-
-正式数据集建议批量执行并冻结：
-
-```bash
-python harness/ingest_all.py --dataset qvhighlights --split val --freeze
-```
-
-也可以在检查 Wiki 后单独冻结：
-
-```bash
-python harness/freeze.py --dataset qvhighlights --split val
-```
-
-Ingest 读取 `dataset.json` 和当前 split 的 video 成员关系，不读取 Query 或 GT；按 `0, interval, 2 × interval, … < video_stream_duration` 抽帧，再按 `wiki.method_config.window_frames` 和 `stride_frames` 将采样帧组成时间窗口。每个窗口独立调用一次固定 VLM prompt。视频短于窗口时只生成一个短窗口；否则只生成完整窗口，必要时增加一个向视频末尾对齐的完整窗口，不再生成 3、2、1 帧的重复尾窗。该贴尾规则同时适用于 Simple 和 Dense；即使大 stride 有意留出空档，视频末尾仍至少被一个窗口覆盖。Simple 模式 Caption 整个窗口；Dense 模式把窗口内采样时间替换进 `{{FRAME_TIMESTAMPS}}`，并额外给出中心目标区间。模型应重点描述目标区间，其他帧只作为上下文；跨越目标边界的事件仍可使用窗口中的其他合法时间戳，解析器不会因此拒绝。`5/1` 下，中间窗口 `[1,2,3,4,5]` 重点负责 `[3,4]`，首尾窗口延伸负责无法获得对称上下文的视频边界。时间戳表示请求的采样时刻，不是事件的精确边界。图像保持纵横比，并限制最长边，不放大小图像。
-
-Dense 时间坐标必须显式选择，不能自动猜测：默认 `dense_timestamp_mode: absolute_seconds` 只接受当前窗口提供的秒数；`frame_index` 则向模型提供 `0..n-1` 的帧索引，要求 `start` / `end` 都为闭区间索引，再整体转换回秒数。两种模式均拒绝半开区间终点 `n`、非采样时刻及越界值。例如窗口 `[2,3,4,5]` 中的事件 `[0,2]` 在秒数模式下非法，在索引模式下转换为 `[2,4]`，不会混用两种解释。处理规则版本 `caption_processing_version: 4` 由代码维护，并进入内容哈希；旧 Wiki 与 checkpoint 不能直接复用，需要新的 Wiki 根目录。
-
-每个视频输出：
-
-```text
-wiki/qvhighlights/videos/<video_id>/
-├── wiki.md
-├── frames.jsonl
-├── caption_audit.jsonl
-├── frames/
-├── ingest.json
-└── frozen.json
-```
-
-`ingest.json` 记录媒体 SHA256、配置、FFmpeg 版本、处理规则版本、内容哈希和 `telemetry`。`caption_audit.jsonl` 保留每个窗口的原始响应、标准化事件、修复原因、请求状态、耗时和服务端提供的 token 用量。审计文件参与冻结，但不会复制进 Query Agent 工作区，Agent 仍只看到 `wiki.md`、`frames.jsonl` 和 `frames/`。`frozen.json` 覆盖 Markdown、JSONL、**每一张图像**及 Ingest 元数据。每个视频独立冻结，实验的 `experiment.json` 保存所选视频的哈希快照；不再使用阻止新增视频的数据集级 `freeze.json`。
-
-Simple 单图模式下 `frames.jsonl` 保持 `frame_id`、`timestamp`、`frame`、`caption` 格式；Simple 多图模式的每行包含窗口信息、`frames` 数组和一个窗口 Caption。Dense 每行另外记录 `target_start_timestamp` / `target_end_timestamp`，`events` 中每个段落包含窗口时间线上的 `start`、`end`、`kind` 和 Caption。原始窗口回答完整保留。Query 侧 `wiki.md` 按 30 秒分组，每个段落压缩成一行，不再重复列出窗口和帧路径；帧映射仍可从 `frames.jsonl` 查询。完全相同的时间范围、类型和规范化 Caption 仅显示一次，但不会将重复 Caption 的不同时间范围取并集。跨越 30 秒边界的段落会出现在每个相交分组中，但 `Number of displayed segments` 仍统计唯一段落。
-
-完整 Ingest 再次执行时只核验并复用，不重新 caption。处理中每个抽帧文件、已完成窗口和请求审计原子保存到 `wiki/<dataset>/.ingest-checkpoints/<video_id>/<identity_hash>/`。失败或正常 Ctrl-C 会清除发布用 staging，但保留 checkpoint；重新执行相同 Ingest 命令即可验证并复用已完成的帧和窗口。Checkpoint 身份包含源视频哈希、内容配置、媒体时长和 FFmpeg 版本，损坏记录会报错，身份不同的记录不会复用。成功发布后清理对应 checkpoint，其他身份的旧缓存保留。强制杀进程可能留下锁文件，必须确认没有活跃进程后才可手动移除该视频的锁；也可能重做尚未原子保存的调用，不保证 API 恰好调用一次。
-
-API 对临时网络错误、限流、服务端错误、空响应及损坏的 API JSON 做有限重试。旧版 Simple / Dense / Hierarchical 对 token 截断直接失败；双向模式的修复策略见 2.1。Dense 响应可以包在 Markdown JSON 围栏里，也兼容顶层事件数组和多余字段；事件字段不符、无序、时间越界、非采样时间点或围栏外有其它文字时，会回传拒绝原因，最多按 `wiki.repair_attempts` 重问当前窗口，仍不合法则失败。该修复预算按本次运行的窗口调用计算，历史失败审计保留。并发 Ingest 同一个视频会被锁拒绝。Freeze 后单个视频目录只读，其他 split 仍可在 `videos/` 中新增未处理的视频；跨 split 的共享视频只核验和复用。改变 caption 内容配置或媒体时使用新的 Wiki 根目录。VLM provider、endpoint、认证变量、timeout 和 retry 参数作为 provenance 保留，但不影响 `ingest_content_hash`。Wiki 元数据保留源文件的容器时长，抽帧终点使用主视频流时长，避免音频或附加流较长时采样到最后一帧之后；不额外比较媒体时长与 annotation 时长。
-
-重叠窗口使用每个 VLM client 上限 32 MiB 的图像 Base64 LRU 缓存，减少重复读图和编码；不会减少模型实际接收的图像或 API token。FFmpeg 仍逐采样点 seek，暂不改变抽帧语义。`telemetry.extraction_sec` 汇总保留的成功抽帧耗时，`extraction_sec_this_run` 仅为本次新抽帧耗时；`caption_sec` 包括历史保留的 caption 尝试和重试等待，`reused_frames` / `reused_windows` 显示本次复用量。服务端不返回 usage 时无法推算 token，汇总报告显示 `null`。
-
-批量 Ingest 保留 `--jobs`（默认 4）和 `--verbose`。`--jobs 1` 顺序执行；多个 worker 并发处理当前 split 的不同视频，不会对共享 video_id 重复提交任务。Ingest 与批量 Query 的进度条都会显示已完成数量、平均处理速度和预计剩余时间，结束时显示总耗时。Freeze 也使用相同进度条，分别显示配置预检、冻结/校验两个阶段；每完成一个视频更新一次，已冻结视频的完整性校验同样计入进度。非交互输出只打印各阶段的结束摘要，失败或中断时保留实际完成数量。收到 Ctrl-C 时，尚未开始的 Ingest 任务立即取消，运行中的 worker 在当前 FFmpeg/VLM 调用结束后的下一个检查点退出并清理 staging 目录；主进程等待 worker 收敛，不会让后台线程继续发布 Wiki。
-
-## 3. 单 Query / 批量 Query
-
-```bash
-python harness/run_query.py \
-  --dataset qvhighlights \
-  --split val \
-  --agent-profile codex_default \
-  --experiment codex_wiki_val \
-  --query-id 7803
-
-python harness/run_all_queries.py \
-  --dataset qvhighlights \
-  --split val \
-  --agent-profile codex_default \
-  --jobs 4 \
-  --experiment codex_wiki_val
-```
-
-运行 Claude Code 时用独立实验名，并设置相应模型：
-
-```bash
-python harness/run_all_queries.py \
-  --dataset qvhighlights \
-  --split val \
-  --agent-profile claude_default \
-  --model YOUR_CLAUDE_MODEL \
-  --jobs 4 \
-  --experiment claude_wiki_val
-```
-
-批量 Query 的 `--jobs` 默认为 1、最大为 16；大于 1 时，每个 worker 同时运行一条独立 Query，
-并各自创建 Agent 容器、出网代理、workspace、metadata、stdout/stderr 和 trace。
-实现只维持最多一波 `jobs` 个在途任务；遇到 Harness/基础设施错误后不再提交新 Query，
-已启动的容器完成清理后退出。Agent 自身的 timeout、invalid output 等作为该次运行的失败结果，
-不会阻止其他 Query，并会在下次运行同一实验时重试。收到 Ctrl-C 或 Harness 错误后会通过共享取消信号
-终止在途 Agent，并等待容器、代理和网络清理完成；清理期间再次按 Ctrl-C 不会跳过清理。
-并发数应同时受宿主 CPU/内存和模型 endpoint 容量约束。
-
-Ingest/Freeze/Query 使用显式 `--split`，也可设置 `dataset.split`；这些阶段不会使用 `default_eval_split` 猜测子集。每个实验只运行所选 split，且不要求其他 split 已 Ingest。
-
-每条 Query 创建唯一临时 workspace，内容严格为：
-
-```text
-AGENTS.md
-task.json
-wiki/wiki.md
-wiki/frames.jsonl
-wiki/frames/
-output/
-```
-
-当 endpoint 只支持文本时，设置 `query.input_mode: text`。此时 workspace 不复制 `wiki/frames/`，
-只保留 Wiki、结构化 JSONL 和 `frames.jsonl` 中的已有文字与 timestamp，并使用独立的纯文本 AGENTS/prompt
-模板；模板中不会同时出现要求查看图片的冲突指令。
-
-### 不透明标识符
-
-公开 VMR benchmark 就在被测模型的训练数据里，而官方的 `qid`、`vid`（QVHighlights 是 YouTube ID，UCA-VMR 是 UCF-Crimes 文件名）和 split 名是**精确的查表键**。只读挂载和 internal network 能阻止 Agent *读取* GT，但阻止不了它认出标签后凭记忆作答，或者拿这个键去问模型 API。
-
-因此 workspace 里不出现真实标识符。每个实验铸造一次随机 `alias_secret`（存在 `experiment.json`，Agent 读不到），`task.json` 里的三个标识符是 `HMAC(secret, kind:value)` 截断后的令牌：
-
-```json
-{
-  "query_id": "q4f2a91c0d7b83e15",
-  "video_id": "v8c17de40ab926f3d",
-  "split": "s15a0d1954e686b4c",
-  "query": "When does the man open the refrigerator?",
-  "max_predictions": 5,
-  "duration": 43.93
-}
-```
-
-Agent 照旧原样复制这三个值，Harness 按令牌校验后**翻译回真实 ID 再落盘**，所以 `predictions/*.json`、`aggregate` 和 `evaluate` 完全不接触别名。`run_metadata` 同时记录 `task_query_id` / `task_video_id` 以便追溯。别名按实验隔离：同一条 Query 在两个实验里得到不同令牌，无法跨实验关联；恢复同一实验会复用已铸造的 secret，令牌不会中途改变。承载 workspace 的临时目录也用别名命名，因为容器能通过 `/proc` 读到 bind mount 的宿主路径。
-
-Wiki 也不再标注自己的 video id：`wiki.md` 标题固定为 `# Video`。Query 阶段会拒绝仍然写着 `# Video: <video_id>` 的旧 Wiki。
-
-> **这条措施缩小了通道，但没有关闭它。** `query` 文本本身就是任务输入，无法遮蔽，而公开 benchmark 的 query 文本同样可检索。采样帧里若出现视频自带的标题字幕也会泄露。把别名理解为「移除了精确查表键」，不要当成去污染的保证；报告结果时应当说明这一点。
-
-`task.json` 保留 `query_id`、`video_id`、`split`、`query`、固定的 `max_predictions` 和权威预测上限 `duration`（ID 字段为别名形式）。
-`duration` 是冻结 Wiki 媒体时长与数据集标注时长的较小值，Agent 必须用它而不是 Wiki 中可能更精确的媒体尾点。Agent 必须在预测中原样复制 split；示例中为可读性使用真实 ID：
-
-```json
-{
-  "query_id": "q1",
-  "video_id": "v1",
-  "split": "validation",
-  "moments": [
-    {"start_sec": 2.0, "end_sec": 4.0, "score": 0.91},
-    {"start_sec": 12.0, "end_sec": 15.0, "score": 0.42}
-  ],
-  "evidence": "Visual evidence from the frozen timeline."
-}
-```
-
-`moments` 按 score 降序排列，可为空。每个 moment 必含 start/end/score；顶层和 moment 内的 `evidence` 都是可选字符串。不同 split 的实验必须使用不同 experiment 名称。
-
-宿主仓库、视频、GT、其他 Query、其他预测都不挂载进容器。容器以非 root 用户运行，根文件系统和整个 workspace 只读，唯一的任务输出挂载点 `output/` 可写。容器 Home 和临时目录每次新建且退出销毁，CLI 禁用 session 持久化，不使用 resume。Claude 显式加载同一份 `AGENTS.md`。
-
-Agent 容器只连接每次运行新建的 Docker internal network，没有直接公网路由。另一个不持有 API key、也不挂载 workspace 的最小代理 sidecar 同时连接 internal network 和 Docker bridge，仅允许 HTTPS CONNECT 到所选 Agent profile 的 `egress_allowed_hosts` 中的精确主机名和 443 端口；运行结束后 Agent、代理和网络都会被删除。模板仍明确禁止联网检索，Claude 仅开放 `Bash,Read,Write,Edit,Glob,Grep` 六个内置工具，不启用额外 MCP；`WebSearch`、`WebFetch`、`Agent`、`Task*`、`Cron*` 等工具不会声明给模型。配置了 profile 的 `base_url` 时，endpoint 以 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 传入容器，并作为 `runtime.api_base_url` 记入每次运行的 provenance。修改 allowlist 或 endpoint 会改变实验配置哈希，应使用新实验名。
-
-Harness 等待进程结束、验证输入未变、校验输出，再保存结果并清除 workspace。超时会强制删除整个容器和进程。若 Agent 的 `end_sec` 因尾点精度仅比 `task.json.duration` 大 0.05 秒以内，Harness 会将它截断到权威上限，并在 `run_metadata.output_adjustments` 和 CLI `[adjusted]` 状态中记录有意义的修正；浮点 ULP 噪声会静默归一化。更大的越界以及截断后无法形成正长区间的预测仍按 `invalid_output` 失败。
-
-JSON 缺失、解析失败、字段多余/缺失、错误 ID、布尔值冒充数字、NaN、其他时间越界、分数越界、排序错误、预测数量超限、额外输出文件等均记录为 `invalid_output`；本次批处理不会原地自动修复，但再次运行同一实验时会重新调用 Agent。`moments: []` 是成功的 abstention。
-
-每次运行都记录 `failure_kind`，把"Agent 没做好"和"Harness / 基础设施坏了"分开：
-
-| failure_kind | 含义 | 归属 | 是否重跑 |
-| --- | --- | --- | --- |
-| `timeout` | Agent 超时 | Agent | 下次批处理重跑 |
-| `agent_error` | Agent 进程非零退出 | Agent | 下次批处理重跑 |
-| `invalid_output` | 输出缺失、无法解析、schema 不合法、多余产物 | Agent | 下次批处理重跑 |
-| `tampered` | Agent 改动了冻结输入 | Agent | 下次批处理重跑 |
-| `harness_error` | Docker 不可用、磁盘错误、Harness 不变量被破坏 | Harness | 下次批处理重跑 |
-| `interrupted` | Ctrl-C 或进程未收尾 | Harness | 下次批处理重跑 |
-
-再次使用同一实验名运行 `run_all_queries.py` 时，会按数据集顺序检查已有记录：成功 Query 校验 prediction 后直接跳过，所有失败 Query（包括 timeout、agent_error、invalid_output、tampered、harness_error、interrupted 以及没有 `failure_kind` 的旧记录）都会重新运行，并覆盖该 Query 的当前 prediction、日志和状态。`attempts` 与 `superseded_failures` 会保留简短审计痕迹。Harness 侧失败仍会**立即中止整批**，而不是把尚未运行的 Query 记成零分。配置、模型、Agent、代码、模板、manifest 或镜像 ID 变化时，必须使用新实验名。
-
-```text
-results/<experiment>/
-├── predictions/<query_id>.json
-├── run_metadata/<query_id>.json
-├── logs/<query_id>.stdout.log
-├── logs/<query_id>.stderr.log
-├── logs/<query_id>.trace.jsonl
-├── templates/
-├── experiment.json
-└── config.yaml
-```
-
-每个 Query 默认保存 `trace.jsonl` 原始 CLI 事件流；`stdout.log` 流式扫描 trace，只保留最后一条最终回答。
-若超时前没有最终事件，则保留最后一条 assistant 文本，或至少写入最后事件类型的诊断，不会留下无说明的空文件。
-元数据包含 dataset、split、agent、时间、exit code、失败原因、轨迹路径、Wiki/config/template/source/manifest 哈希、镜像 ID 和 Git commit；目录不是 Git 仓库时 commit 为 `null`，代码仍有内容哈希。
-
-若宿主进程被 `SIGKILL` 或机器断电，正常的 `finally` 清理无法执行。确认没有相关进程/容器继续运行后，可人工移除对应 `.experiment.lock`、`.ingest.lock` 和残留临时目录；不要删除已记录的 Query 结果来假装首次执行。
-
-## 4. 聚合与评测
-
-批量运行因部分 Query 的 **Agent 侧**失败而返回非零 exit code 时，应继续聚合与评测——这些失败是有效的零分。但若批量运行是因 Harness 侧失败而**中止**（输出中带 `harness/interrupted query failure`），应先修好原因重跑，否则评测会拒绝这批结果。
-
-```bash
-python harness/aggregate.py \
-  --dataset qvhighlights \
-  --split val \
-  --input results/codex_wiki_val/predictions \
-  --output results/codex_wiki_val/predictions.jsonl
-
-python harness/evaluate.py \
-  --dataset qvhighlights \
-  --split val \
-  --pred results/codex_wiki_val/predictions.jsonl
-```
-
-聚合会验证所有预测的 schema、split、Query ID、video 映射，以及实验/逐 Query 元数据中的 dataset 身份；不同 split 不会被筛掉后静默评测，而是明确拒绝。独立预测目录必须通过配置指定 dataset 和 split，以查询 manifest 核验归属。输出保留全部 moments 和 evidence，并生成 `predictions.jsonl.metadata.json`，记录 dataset、split、annotation 哈希及聚合文件 SHA256。移动结果时一起保留这个 provenance 文件；评测默认强制要求 sidecar，缺失时不会静默降级。确需评测未经 `aggregate.py` 生成的外部原始 submission 时，必须显式传入 `--allow-unverified-predictions`，同时指定正确的 dataset/split。
-
-评测首先读取 `dataset.json` 并检查 `has_ground_truth`。若为 false，在打开 GT 或预测文件之前就拒绝本地评测，提示该 split 只能生成 prediction。为 true 时只选择该 split 的 GT；其他 split 的 GT 不计入分母。
-
-未显式指定 `--split` 时，聚合使用保存的实验 split。评测按保存配置/指定配置的 `dataset.split`，再按可选 `default_eval_split` 选择；缺少选择依据时报错。`default_eval_split` 必须声明且有 GT。可用 `--gt` 显式指定同一数据集目录内的 GT 文件，但它不能绕过 metadata 的无 GT 限制。
-
-默认写入相邻的 `metrics.json`；可通过 `--output` 指定位置。评测读取实验保存的配置和 run metadata；数据集元数据选择 QVHighlights evaluator，或显式使用 `--evaluator generic`。UCA-VMR 的 `dataset.json` 中 `evaluator` 为 `generic`，因此直接使用通用 evaluator，无需 `--evaluator` 参数。
-
-**所有指标的单位为百分数，范围 0–100。** 分母是所选 split 的全部带标签 Query，缺失/失败结果按零命中处理；不因某个 Query 失败就从评测集删除它。只跑一个 Query 时评测该 split，其余同 split 内未运行的 Query 也会计入失败；需要子集实验时应先准备对应子集的 manifests。
-
-若 run metadata 中存在 `harness_error` 或 `interrupted`，评测**直接拒绝**并列出对应 Query：这些 Query 根本没有测量值，把它们当成零分会让一次 Docker 故障看起来像 Agent 不会做 VMR。修好原因后重跑即可（所有失败记录都会自动重试）；确实要按零分计入时显式传 `--allow-harness-failures`。
-
-通用 evaluator 输出配置的 `R@K,IoU=T`，语义为前 K 个预测命中任意一个 GT 即成功。UCA-VMR 使用此 evaluator（每个 Query 只有一个 GT moment，属于 `any_acceptable_moment` 语义）。QVHighlights adapter 额外输出：
-
-- `MR-full-mAP`：主指标，IoU 0.50 到 0.95、间隔 0.05 的平均 AP。
-- `MR-full-mAP@0.5`、`MR-full-mAP@0.75`，以及 R1@0.5 / R1@0.7。
-- short `(0,10]`、middle `(10,30]`、long `(30,150]` 秒的分组 mAP。
-
-QVHighlights AP 使用前 10 个预测，按置信度逐一与尚未匹配的 GT 做匹配；重复命中同一个 GT 不能重复加分。实现遵循官方 moment retrieval 语义，不计算与本任务无关的 highlight/saliency 指标。没有 Query 的长度组返回 JSON `null`。
-
-输出同时包括 `failed_runs`、失败 ID、缺失数量、abstention 数量、每条 Query 平均预测数、top K 和 IoU thresholds。提供 run metadata 时额外输出 `run_failures`：按 `failure_kind` 分类计数，外加 `unattempted`（从未启动）和 `unclassified`（历史记录）。聚合保留所有预测和 evidence，不会静默降成 top-1，也不会重排或修复不合法结果。
-
-当存在未作答的 Query 时，metrics.json 追加一个 `successful_only` 块，用**同一套指标**重算仅覆盖已作答 Query 的分数。顶层数字始终以整个 split 为分母，是对外汇报的口径；`successful_only` 用来判断差距来自检索质量还是来自格式遵从率与覆盖率。对比 Codex 与 Claude Code 时必须同时看这两个数——否则 JSON 合规性的差异会被读成 VMR 能力的差异。
-
-```json
-{
-  "num_queries": 6,
-  "failed_runs": 2,
-  "run_failures": {"timeout": 1, "invalid_output": 1, "harness_error": 0,
-                   "interrupted": 0, "agent_error": 0, "tampered": 0,
-                   "unclassified": 0, "unattempted": 0},
-  "primary_metric": "MR-full-mAP",
-  "primary_score": 33.33,
-  "successful_only": {"num_queries": 4, "primary_score": 50.0}
-}
-```
-
-### 使用官方代码
-
-优先使用官方 evaluator 时，提供本地 [moment_detr](https://github.com/jayleicn/moment_detr) checkout：
-
-```bash
-python -m pip install -e '.[official]'
-python harness/evaluate.py \
-  --dataset qvhighlights \
-  --split val \
-  --pred results/codex_wiki_val/predictions.jsonl \
-  --official-root /path/to/moment_detr
-```
-
-此路径在独立 evaluator 进程中调用官方 `compute_mr_ap` / `compute_mr_r1`，记录官方源码 SHA256；官方执行失败会明确报错，不静默降级。未指定官方 checkout 时使用本地 dataset adapter，指标中标注 `implementation`。
-
-上游 R1 不能处理空预测，AP 会遗漏空列表。因此官方桥接仅在评测器内将缺失/空预测表示成零长度、零分数、不可能命中 GT 的 sentinel，以保留全体 Query 分母；原始预测文件不变。空长度分组返回 `null`，不产生非法 JSON NaN。
-
-## 5. Caption 小规模对照实验
-
-先从有 GT 的 split 确定性抽取带 Query 的视频子集，生成四组配置。`prepare` 不调用模型 API，但会读取并计算所选视频的哈希；输出目录必须是新目录：
-
-```bash
-python harness/ablation.py prepare \
-  --config /path/to/local.yaml --dataset uca --split dev \
+python harness/ablation.py prepare --config config.yaml --dataset monitor --split dev \
   --limit-videos 10 --seed 0 --output experiments/caption_dev
-
-python harness/ablation.py run --suite experiments/caption_dev --stage ingest --jobs 4
+python harness/ablation.py run --suite experiments/caption_dev --stage compile --jobs 4
 python harness/ablation.py run --suite experiments/caption_dev --stage query --jobs 4
 python harness/ablation.py run --suite experiments/caption_dev --stage evaluate
 python harness/ablation.py summarize --suite experiments/caption_dev
 ```
 
-`run` 的 Ingest 和 Query 阶段会实际调用配置中的模型并产生费用；`--stage all` 可以依次完成全部阶段。
-`--jobs` 同时控制 Ingest 视频并发和 Query Agent 并发。Query 阶段复用与普通批处理相同的成功跳过、失败重跑和取消规则；
-重跑失败 Query 会产生新的 API 花费，并在该 Query 的 `attempts` / `superseded_failures` 中标记。
+每个 variant 生成独立 WikiSet，共享 content-addressed store。历史报告的 `ingested_videos` 和 `stage_wall_sec.ingest` 字段继续保留，避免静默改变消费者 schema。
 
-四组分别是 Simple 1/1、Simple 5/1、Dense 5/1、Dense 9/4（window/stride）。它们使用相同的视频、Query、GT、采样间隔、模型、token 上限和 Query Agent 配置，但独立生成 Wiki；Simple 与 Dense 使用各自格式的固定 prompt。5/1 与 9/4 同时改变窗口和步长，只能判断组合效果，不能把差异单独归因于窗口大小。配置、数据快照、源视频、模板及代码哈希固定，Agent runtime 也必须一致；输入变化时要求重新准备 suite。
+## 迁移和扩展
 
-`comparison.json` 汇总每组检索指标、失败情况、完成视频/Query 数、阶段累计 wall time、Caption 尝试数与耗时，以及可用时的 Caption token 总量。未完成组标为 `complete: false`，未开始的统计和不可用的 token 用量为 `null`。成本只覆盖已完成视频保留下来的工作（包括其历史失败 caption），不包含仍失败视频的 checkpoint 或 Query Agent token，不换算价格。真实模型的效果和提速幅度需运行后比较，离线模拟测试不代表模型效果。
+旧 Wiki 必须显式转换，原目录保持不变：
 
-## 旧数据迁移（方案 A）
+```bash
+vmr artifact migrate /old/wiki/video --artifact-store artifacts
+```
 
-旧 manifest 缺少 split 或没有 `dataset.json` 时，程序明确提示重新运行 Dataset Adapter；不自动补 `default`，也不猜测 train/val/test。请在新目录重新转换后切换配置，保留原始 annotation 名称。旧实验和不含 split 的预测不能与新实验混用。
+通过 `vmr.artifact.wikiset.write_wikiset()` 将返回的 Artifact 按真实 video ID 关联到新 WikiSet。Host manifest 和 private files 永不进入 Agent workspace。迁移器不重新调用模型或重新解释旧配置。
 
-Wiki 不包含 annotation split；原有有效 Video Wiki 可由用户迁移至 `wiki/<dataset>/videos/<video_id>/`，保持目录内容及哈希不变后重新核验。无需为了新 split 重新 caption。旧数据集根目录若被置为只读，需要为新的 `videos/` 布局准备可写父目录；本实现不自动移动或删除旧产物。
+旧 `harness/` Python 导入和 CLI 保留兼容窗口，其历史流程集中在 `vmr.compat`；采样、VLM 和进度条由对应的新模块实现。旧 CLI 发出 deprecation warning；新实验以 `vmr` CLI 为准。至少保留整个 0.2 系列，0.3 以后经过独立 release 决策和迁移验收再删除，当前不删除旧产物或旧实验。
+
+新增方法实现 `WikiCompiler` 的 `parse_config / content_identity / compile` 并向 registry 注册即可。`CompileResult` 声明自身 public files，Query 和 Artifact 无需改动。直接产生符合 Artifact v1/v2 的外部系统也能使用相同 QueryEngine。协议、schema 和依赖边界见 [架构文档](docs/architecture.md)。
 
 ## 测试
 
-无需视频数据集或 API key：
-
 ```bash
-python -m pytest -q
-```
-
-Split 测试覆盖任意名称、unknown split、严格布尔类型、默认 eval split、视频/Query 筛选、共享 Wiki 增量冻结、跨 split Query ID、预测隔离、无 GT 拒绝和混合 provenance。
-
-测试通过 FFmpeg 生成三秒视频，使用明确的测试 captioner 与短生命周期子进程模拟模型输出。覆盖完整链路、Query/GT 不被 Ingest 读取、GT 不被 Query 读取、隔离输入结构、篡改检测、失败重跑与成功跳过、超时/非法输出、AP 匹配和排名语义。没有 FFmpeg 时媒体集成测试会明确跳过。模拟 runner 只存在于测试，不是正式实验选项。
-
-Agentic 模式由 [tests/test_agentic.py](tests/test_agentic.py) 用一个不联网的 fixture runner 扮演 Coding Agent，覆盖 ingest → freeze → query 完整链路、`task.json` 不含 Query/Split/视频身份、已完成 Wiki 只核验不重编译、十七种契约违规逐项拒绝、身份泄漏检测的长度下界、指令模板与模型属于内容身份而容器预算不是，以及只读视频挂载与凭据不进命令行。
-
-新增测试覆盖显式 Dense 时间坐标、窗口续跑与缓存损坏、内容版本隔离、编码缓存和请求遥测，以及四组对照实验的离线完整链路。GitHub Actions 在 Python 3.10 / 3.12 上安装 FFmpeg，运行聚焦错误级别的 Ruff 检查和 pytest。Query 失败日志直接显示失败类别、简短原因及 metadata/stdout/stderr 文件路径。
-
-构建镜像后可执行真实容器检查，测试不调用模型 API：
-
-```bash
+python -m pytest -q                         # 全部离线测试
+python -m pytest -q -m 'unit or compatibility'
+python -m pytest -q -m integration
 VMR_TEST_DOCKER=1 python -m pytest -q tests/test_docker_integration.py
+VMR_OFFICIAL_ROOT=/path/to/moment_detr python -m pytest -q tests/test_official_parity.py
 ```
 
-与官方源码做随机多 GT / 多预测对照，包括失败和空预测：
+默认测试不调用模型 API；媒体测试使用 FFmpeg 生成短视频。覆盖五种 compiler 的同一 QueryEngine、无 compiler 安装的 Artifact portability、import boundaries、路径和 symlink 拒绝、tamper detection、resume 和 legacy config migration。Docker / 官方源码检查分别显式启用。
+
+新包和新增测试统一使用 Ruff 0.15.16 格式化，CI 会检查格式：
 
 ```bash
-VMR_OFFICIAL_ROOT=/path/to/moment_detr \
-  python -m pytest -q tests/test_official_parity.py
+ruff format vmr tests/unit tests/integration tests/compatibility
+ruff format --check vmr tests/unit tests/integration tests/compatibility
 ```
-
-## 代码入口与参考
-
-| 阶段 | 入口 |
-| --- | --- |
-| Split / Dataset metadata | `harness/dataset.py`、`harness/results.py` |
-| Dataset Adapter | `adapters/base.py`、`adapters/qvhighlights.py`、`adapters/uca.py` |
-| Ingest | `harness/ingest.py`、`harness/ingest_all.py`、`harness/vlm.py` |
-| Agentic Ingest | `harness/agentic.py`、`harness/agentic_config.py`、`harness/agentic_validate.py`、`templates/wiki_agents.md` |
-| Freeze | `harness/freeze.py` |
-| Query | `harness/run_query.py`、`harness/run_all_queries.py`、`harness/workspace.py` |
-| Agent | `agents/codex.py`、`agents/claude_code.py`、`agents/runner.py` |
-| Validate / Eval | `harness/validate.py`、`harness/aggregate.py`、`harness/evaluate.py` |
-| Caption ablation | `harness/ablation.py` |
-
-同样支持 `python -m harness.ingest` 等模块形式。第一版不提供 embedding、ASR、重新抽帧、query-specific Wiki、跨 Query memory 或训练。
-
-实现核对的来源：[Codex 非交互模式](https://developers.openai.com/codex/noninteractive)、[OpenAI 图像输入](https://developers.openai.com/api/docs/guides/images-vision)、[Claude Code CLI](https://code.claude.com/docs/en/cli-reference)、[QVHighlights 官方评测](https://github.com/jayleicn/moment_detr/tree/main/standalone_eval)。

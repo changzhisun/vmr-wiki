@@ -1,0 +1,34 @@
+# Coding-agent compiler. compile.kind selects codex or claude_code.
+# Model, API key, and base URL come from AGENT_MODEL, AGENT_API_KEY, and AGENT_BASE_URL.
+compile:
+  compiler: agentic
+  kind: claude_code
+  method_config:
+    timeout_sec: 3600
+    max_frames: 500
+    frame_extraction:
+      strategy: adaptive
+      initial_interval_sec: 5.0
+      min_interval_sec: 0.25
+    wiki:
+      levels: [chapter, event, moment]
+      include_entities: true
+      include_objects: true
+      include_locations: true
+      include_temporal_relations: true
+      include_retrieval_aliases: true
+    templates:
+      agents: wiki_agents.md
+      prompt: wiki_prompt.md
+profiles:
+  agent:
+    model: AGENT_MODEL
+    container_image: vmr-wiki-agents:local
+    api_key_env: AGENT_API_KEY
+    base_url: AGENT_BASE_URL
+    egress_allowed_hosts:
+    - api.example.com
+    - chat.example.com
+    - api.example.net
+    - note3-prev-api.askdiandian.com
+    - api.anthropic.com

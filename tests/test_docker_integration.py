@@ -19,6 +19,14 @@ class ContainerProbeRunner(DockerRunner):
 import os
 import socket
 from pathlib import Path
+import shutil
+import subprocess
+assert shutil.which("ffmpeg") == "/usr/local/bin/ffmpeg"
+assert "-nostdin -y" in Path(shutil.which("ffmpeg")).read_text()
+for _ in range(2):
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "color=c=red:s=16x16", "-frames:v", "1", "/tmp/frame.bmp"],
+                   check=True, timeout=15)
 assert os.getuid() == 1000
 assert not Path("/var/run/docker.sock").exists()
 assert sorted(p.name for p in Path("/home/node").iterdir()) == []
@@ -49,7 +57,7 @@ Path("/workspace/output/prediction.json").write_text("{}")
 
 
 def test_actual_container_readonly_mounts_fresh_home_and_cli_flags(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_API_KEY", "fake-key-no-api-call")
+    monkeypatch.setenv("AGENT_API_KEY", "fake-key-no-api-call")
     workspace = tmp_path / "workspace"
     workspace.mkdir(mode=0o755)
     (workspace / "wiki").mkdir()
@@ -71,7 +79,7 @@ def test_actual_container_readonly_mounts_fresh_home_and_cli_flags(cfg, tmp_path
             Path(__file__).resolve().parents[1] / "config.yaml", query_agent=agent)["query"]
         selected["model"] = "fixture-agent"
         cfg["query"].update(selected)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-no-api-call")
+        monkeypatch.setenv("AGENT_API_KEY", "fake-key-no-api-call")
         adapter = DockerRunner(cfg)
         network = f"vmr-cli-{agent}-network"
         proxy = f"vmr-cli-{agent}-proxy"
@@ -89,7 +97,7 @@ def test_actual_container_readonly_mounts_fresh_home_and_cli_flags(cfg, tmp_path
 
 
 def test_actual_timeout_removes_container(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_API_KEY", "fake-key-no-api-call")
+    monkeypatch.setenv("AGENT_API_KEY", "fake-key-no-api-call")
     cfg["query"]["timeout_sec"] = 1
     (tmp_path / "output").mkdir()
     runner = ContainerProbeRunner(cfg)
@@ -110,7 +118,7 @@ def test_actual_timeout_removes_container(cfg, tmp_path, monkeypatch):
 
 
 def test_actual_cooperative_cancel_removes_container_proxy_and_network(cfg, tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_API_KEY", "fake-key-no-api-call")
+    monkeypatch.setenv("AGENT_API_KEY", "fake-key-no-api-call")
     cfg["query"]["timeout_sec"] = 60
     (tmp_path / "output").mkdir()
     runner = ContainerProbeRunner(cfg)

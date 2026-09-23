@@ -1,0 +1,23 @@
+# Default config for `vmr compile`. Switch method by changing `extends`.
+# Dataset, storage, batch, and shared media live here. Model, endpoint,
+# credentials, and prompts live in the selected methods/*.yaml.
+version: 3
+extends: methods/agentic.yaml
+dataset:
+  name: monitor
+  split: dev
+storage:
+  # Resolved from this file. Method fragments do not change storage paths.
+  root: ../..
+  datasets: datasets
+  runs: runs
+  results: results
+  templates: templates
+  artifacts: artifacts
+batch:
+  consecutive_failure_limit: 3
+compile:
+  media:
+    sample_interval_sec: 1.0
+    image_max_size: 768
+    jpeg_quality: 2

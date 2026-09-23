@@ -1,0 +1,111 @@
+version: 2
+
+dataset:
+  name: qvhighlights
+  split: null  # Use --split with an exact name from dataset.json.
+
+# All relative storage paths are resolved from storage.root. storage.root is
+# itself resolved relative to this top-level config file.
+storage:
+  root: .
+  datasets: datasets
+  wikis: wiki-bidirectional
+  runs: runs
+  results: results
+  templates: templates
+
+# Reusable deployment profiles. Roles below select one named profile instead
+# of repeating model, credential, endpoint, allowlist, and container settings.
+profiles:
+  agents:
+    codex_default:
+      kind: codex
+      model: REPLACE_WITH_AGENT_MODEL
+      container_image: vmr-wiki-agents:local
+      api_key_env: CODEX_API_KEY
+      base_url: null
+      egress_allowed_hosts: [api.example.com, chat.example.com]
+
+    claude_default:
+      kind: claude_code
+      model: REPLACE_WITH_AGENT_MODEL
+      container_image: vmr-wiki-agents:local
+      api_key_env: ANTHROPIC_API_KEY
+      base_url: null
+      egress_allowed_hosts: [api.example.net]
+
+  vlms:
+    qwen_default:
+      provider: openai-compatible
+      model: Qwen3-VL-8B-Instruct
+      base_url: https://vlm.example.com/v1
+      api_key_env: OPENAI_API_KEY
+      prompt: |-
+        Describe observable activities at the requested semantic level. Use concise,
+        specific titles and summaries. Keep stable actor/object descriptions across
+        levels when supported by the images. Do not infer invisible details.
+      generation:
+        temperature: 0
+        max_tokens: 8192
+      transport:
+        timeout_sec: 120
+        max_retries: 3
+        max_concurrent_requests: 4
+        max_retry_delay_sec: 60
+        queue_timeout_sec: 300
+
+# Wiki content/build configuration. Only the selected method's settings live
+# here; switch method_config together with method.
+wiki:
+  method: bidirectional
+  captioner_profile: qwen_default
+  media:
+    sample_interval_sec: 1.0
+    image_max_size: 768
+    jpeg_quality: 2
+  repair_attempts: 2
+  method_config:
+    max_frames_per_call: 100
+    topdown:
+      enabled: true
+      max_depth: 4
+      min_segment_duration_sec: 8.0
+      max_children_per_node: 12
+    bottomup:
+      enabled: true
+      window_sec: 45.0
+      overlap_ratio: 0.25
+      independent_observation: true
+    reconciliation:
+      window_sec: 180.0
+      max_records: 128
+      max_chars: 48000
+    boundary_refinement:
+      enabled: true
+      context_expand_ratio: 0.25
+      max_rounds: 2
+      uncertainty_sec: 2.0
+      endpoint_context_sec: 4.0
+    confidence:
+      self_consistency_for_low_confidence: true
+      max_review_rounds: 2
+    budget:
+      requests_per_hour: 1000
+      nodes_per_hour: 2000
+      max_requests: null
+      max_nodes: null
+    shared_cache_dir: null
+
+query:
+  agent_profile: codex_default
+  input_mode: multimodal  # text | multimodal
+  max_predictions: 5
+  timeout_sec: 600
+
+batch:
+  consecutive_failure_limit: 3
+
+evaluation:
+  evaluator: qvhighlights
+  top_k: [1, 5]
+  iou_thresholds: [0.3, 0.5, 0.7]

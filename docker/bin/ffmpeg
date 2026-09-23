@@ -1,0 +1,5 @@
+#!/bin/sh
+# Agents inherit an open stdin pipe. ffmpeg then waits forever on
+# "Overwrite? [y/N]" when the output file already exists, and the agent
+# process will not exit while that child is alive.
+exec /usr/bin/ffmpeg -nostdin -y "$@"

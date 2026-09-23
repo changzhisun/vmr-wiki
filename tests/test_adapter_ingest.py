@@ -382,7 +382,7 @@ def test_freeze_reports_which_ingest_setting_changed(prepared):
 def test_probe_duration_prefers_container_over_stream(monkeypatch, tmp_path):
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"not-a-real-video")
-    monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: (
+    monkeypatch.setattr("vmr.media.probe.media_command", lambda _cmd: (
         '{"streams":[{"codec_type":"video","duration":"10.366667"}],'
         '"format":{"duration":"12.020000"}}'
     ))
@@ -397,7 +397,7 @@ def test_ingest_samples_only_within_video_stream(cfg, monkeypatch, tmp_path):
     cfg["ingest"]["sample_interval_sec"] = 5.0
     monkeypatch.setattr("harness.ingest.probe_durations", lambda _path: (12.02, 10.0))
     monkeypatch.setattr(
-        "harness.ingest.extract_frame",
+        "vmr.compiler.methods.window.extract_frame",
         lambda _video, _timestamp, path, _cfg: path.write_bytes(b"jpeg"),
     )
     monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: "ffmpeg version test")
@@ -423,7 +423,7 @@ def test_ingest_captions_overlapping_multi_frame_windows(cfg, monkeypatch, tmp_p
     })
     monkeypatch.setattr("harness.ingest.probe_durations", lambda _path: (21.0, 21.0))
     monkeypatch.setattr(
-        "harness.ingest.extract_frame",
+        "vmr.compiler.methods.window.extract_frame",
         lambda _video, _timestamp, path, _cfg: path.write_bytes(b"jpeg"),
     )
     monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: "ffmpeg version test")
@@ -465,7 +465,7 @@ def test_ingest_writes_validated_dense_events(cfg, monkeypatch, tmp_path):
     cfg["ingest"]["vlm"]["prompt"] = "{{FRAME_TIMESTAMPS}}"
     monkeypatch.setattr("harness.ingest.probe_durations", lambda _path: (21.0, 21.0))
     monkeypatch.setattr(
-        "harness.ingest.extract_frame",
+        "vmr.compiler.methods.window.extract_frame",
         lambda _video, _timestamp, path, _cfg: path.write_bytes(b"jpeg"),
     )
     monkeypatch.setattr("harness.ingest.media_command", lambda _cmd: "ffmpeg version test")
