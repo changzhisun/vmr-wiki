@@ -2,8 +2,27 @@
 
 import ast
 from pathlib import Path
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_vmr_source_files_are_not_hidden_by_gitignore():
+    if not (ROOT / ".git").exists():
+        return
+    paths = [
+        str(path.relative_to(ROOT)) for path in sorted((ROOT / "vmr").rglob("*.py"))
+    ]
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--stdin"],
+        cwd=ROOT,
+        input="\n".join(paths) + "\n",
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, (
+        "Source files are hidden by .gitignore:\n" + result.stdout
+    )
 
 
 def imports(path):

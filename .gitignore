@@ -3,7 +3,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.egg-info/
-datasets/
+/datasets/
 videos/
 wiki/
 wiki-hierarchical/
