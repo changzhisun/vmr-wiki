@@ -7,8 +7,18 @@ ARG CLAUDE_VERSION
 # agent cannot use them to re-extract anything: its workspace holds the frozen
 # wiki only, and no video is ever mounted into it.
 RUN test -n "$CODEX_VERSION" && test -n "$CLAUDE_VERSION" \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git ripgrep python3 \
+    && apt-get \
+       -o Acquire::ForceIPv4=true \
+       -o Acquire::Retries=3 \
+       -o Acquire::http::Timeout=30 \
+       -o Acquire::https::Timeout=30 \
+       update \
+    && apt-get \
+       -o Acquire::ForceIPv4=true \
+       -o Acquire::Retries=3 \
+       -o Acquire::http::Timeout=30 \
+       -o Acquire::https::Timeout=30 \
+       install -y --no-install-recommends ca-certificates git ripgrep python3 \
        ffmpeg jq python3-numpy \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
