@@ -6,7 +6,7 @@ import pytest
 
 from agents.runner import AgentCancelled
 from harness.common import HarnessError
-from harness.run_all_queries import MAX_QUERY_JOBS, run_queries
+from harness.run_all_queries import run_queries
 
 
 class Bar:
@@ -116,8 +116,10 @@ def test_parallel_drain_reports_all_started_harness_failures():
 def test_jobs_must_be_positive():
     with pytest.raises(HarnessError, match="positive integer"):
         run_queries(ParallelExperiment(0), 0, Bar())
-    with pytest.raises(HarnessError, match=f"must not exceed {MAX_QUERY_JOBS}"):
-        run_queries(ParallelExperiment(0), MAX_QUERY_JOBS + 1, Bar())
+
+
+def test_jobs_have_no_fixed_upper_limit():
+    assert run_queries(ParallelExperiment(0), 32, Bar()) == (0, 0)
 
 
 def test_main_rejects_jobs_before_creating_experiment(monkeypatch):

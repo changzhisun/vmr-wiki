@@ -8,7 +8,6 @@ from vmr.core.progress import ProgressBar
 from vmr.core.validation import positive_int
 from vmr.core.errors import HarnessError
 
-MAX_QUERY_JOBS = 16
 _active_bar = None
 _active_cancel = None
 
@@ -22,10 +21,7 @@ def _handle_interrupt(signum: int, frame: object) -> None:
 
 
 def validate_jobs(jobs: int) -> int:
-    positive_int(jobs, "jobs")
-    if jobs > MAX_QUERY_JOBS:
-        raise HarnessError(f"jobs must not exceed {MAX_QUERY_JOBS}")
-    return jobs
+    return positive_int(jobs, "jobs")
 
 
 def _record(result: dict, experiment: Experiment, bar: ProgressBar) -> bool:

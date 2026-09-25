@@ -354,7 +354,7 @@ python harness/run_all_queries.py \
   --experiment claude_wiki_val
 ```
 
-批量 Query 的 `--jobs` 默认为 1、最大为 16；大于 1 时，每个 worker 同时运行一条独立 Query，
+批量 Query 的 `--jobs` 默认为 1，且没有固定上限；大于 1 时，每个 worker 同时运行一条独立 Query，
 并各自创建 Agent 容器、出网代理、workspace、metadata、stdout/stderr 和 trace。
 实现只维持最多一波 `jobs` 个在途任务；遇到 Harness/基础设施错误后不再提交新 Query，
 已启动的容器完成清理后退出。Agent 自身的 timeout、invalid output 等作为该次运行的失败结果，

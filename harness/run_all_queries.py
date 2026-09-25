@@ -14,7 +14,6 @@ from harness.progress import ProgressBar
 from harness.run_query import Experiment, arguments, configured, run_status
 
 
-MAX_QUERY_JOBS = 16
 _active_bar: "ProgressBar | None" = None
 _active_cancel: "threading.Event | None" = None
 
@@ -28,10 +27,7 @@ def _handle_interrupt(signum: int, frame: object) -> None:
 
 
 def validate_jobs(jobs: int) -> int:
-    positive_int(jobs, "jobs")
-    if jobs > MAX_QUERY_JOBS:
-        raise HarnessError(f"jobs must not exceed {MAX_QUERY_JOBS}")
-    return jobs
+    return positive_int(jobs, "jobs")
 
 
 def _record(result: dict, experiment: Experiment, bar: ProgressBar) -> bool:
