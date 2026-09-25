@@ -11,7 +11,9 @@ from vmr.query.templates import query_templates
 def from_legacy_query(q, templates=None):
     agent = q["agent"]
     spec = templates if templates is not None else q.get("templates")
-    names = query_templates(spec, text_only=False)
+    names = query_templates(
+        spec, text_only=False, query_type=q.get("type", "video-wiki")
+    )
     text_names = query_templates(spec, text_only=True)
     return QueryConfig(
         agent=agent,
@@ -21,6 +23,7 @@ def from_legacy_query(q, templates=None):
         base_url=q.get("base_url", {}).get(agent),
         egress_allowed_hosts=tuple(q["egress_allowed_hosts"][agent]),
         input_mode="text" if q.get("text_only", False) else "multimodal",
+        type=q.get("type", "video-wiki"),
         max_predictions=q["max_predictions"],
         timeout_sec=q["timeout_sec"],
         agents_template=names["agents"],
@@ -57,6 +60,7 @@ def load_query_config(path):
             {
                 "agent_profile" if named else "kind",
                 "input_mode",
+                "type",
                 "max_predictions",
                 "timeout_sec",
                 "templates",
@@ -69,7 +73,9 @@ def load_query_config(path):
         else:
             kind = agent_kind(q["kind"], "query.kind")
             profile = agent_settings(profiles["agent"])
-        names = query_templates(q.get("templates"), text_only=False)
+        names = query_templates(
+            q.get("templates"), text_only=False, query_type=q.get("type", "video-wiki")
+        )
         text_names = query_templates(q.get("templates"), text_only=True)
         query = QueryConfig(
             agent=kind,
@@ -79,6 +85,7 @@ def load_query_config(path):
             base_url=profile["base_url"],
             egress_allowed_hosts=tuple(profile["egress_allowed_hosts"]),
             input_mode=q.get("input_mode", "multimodal"),
+            type=q.get("type", "video-wiki"),
             max_predictions=q.get("max_predictions", 5),
             timeout_sec=q.get("timeout_sec", 600),
             agents_template=names["agents"],

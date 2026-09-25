@@ -124,10 +124,10 @@ def test_shipped_compile_entry_extends_agentic(monkeypatch):
 def test_shipped_query_entry_loads():
     cfg = load_query_config(ROOT / "configs/query/base.yaml")
     assert cfg.query.agent == "claude_code"
-    assert cfg.query.agents_template == "query_agents.md"
-    assert cfg.query.prompt_template == "query_prompt.md"
-    assert cfg.query.text_agents_template == "query_agents_text_only.md"
-    assert cfg.query.text_prompt_template == "query_prompt_text_only.md"
+    assert cfg.query.agents_template == "query_agents.video_wiki.md"
+    assert cfg.query.prompt_template == "query_prompt.video_wiki.md"
+    assert cfg.query.text_agents_template == "query_agents.video_wiki.text_only.md"
+    assert cfg.query.text_prompt_template == "query_prompt.video_wiki.text_only.md"
     assert cfg.dataset.split == "dev"
     assert cfg.compile is None
     assert cfg.storage.root == ROOT

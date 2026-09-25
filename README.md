@@ -1,16 +1,16 @@
 # VMR Wiki
 
-将视频编译为与 Query 无关的不可变 Wiki Artifact，再让每条 Query 在独立 Codex / Claude Code 容器中定位视频片段。
+支持两种 Query 模式：`video-wiki` 先将视频编译为不可变 Wiki Artifact；`video-only` 直接让独立 Codex / Claude Code 容器读取原视频并定位片段。
 
 ```text
-Video → Compiler → Sealed Wiki Artifact → WikiSet → Query → Prediction → Evaluate
+Video → [Compiler → Sealed Wiki Artifact → WikiSet] → Query → Prediction → Evaluate
 ```
 
-支持 `simple`、`dense`、`hierarchical`、`bidirectional`、`agentic` 五种 compiler。不同方法共享 Artifact v2（兼容读取 v1） 和同一个 QueryEngine；Query 不需要 compiler 代码、compile 配置或原始视频。数据集支持 Monitor、QVHighlights 和 UCA-VMR，下文以 Monitor 为例。
+支持 `simple`、`dense`、`hierarchical`、`bidirectional`、`agentic` 五种 compiler。不同方法共享 Artifact v2（兼容读取 v1）和同一个 QueryEngine。`video-wiki` 查询不需要 compiler 代码、compile 配置或原始视频；`video-only` 查询不需要 WikiSet。数据集支持 Monitor、QVHighlights 和 UCA-VMR，下文以 Monitor 为例；编译示例默认使用 agentic，Query 示例默认使用 Claude Code。
 
 ## 安装
 
-需要 Python 3.10+；Compile 内置方法需要 FFmpeg / FFprobe，真实 Agent 运行需要 Docker。运行时依赖 PyYAML。
+需要 Python 3.10+；Compile 内置方法需要 FFmpeg / FFprobe，`video-only` 查询需要宿主机 FFprobe，真实 Agent 运行需要 Docker。运行时依赖 PyYAML。
 
 ```bash
 python3 -m venv .venv
@@ -76,23 +76,36 @@ vmr wikiset validate wiki_sets/monitor-dev-agentic.json
 
 默认配置是 [configs/query/base.yaml](configs/query/base.yaml)，只包含 Query 所需的 profile、运行参数和路径。填写真实 Agent model/endpoint/白名单并设置凭据。
 
+在配置的 `query.type` 中选择 `video-wiki`（默认）或 `video-only`。两种模式都直接用 `query.templates.agents` 和 `query.templates.prompt` 指定自己的模板：[video-wiki AGENTS 模板](templates/query_agents.video_wiki.md)、[video-wiki prompt](templates/query_prompt.video_wiki.md)；[video-only AGENTS 模板](templates/query_agents.video_only.md)、[video-only prompt](templates/query_prompt.video_only.md)。自定义 video-only 模板的两个文件都须以 `<!-- vmr-query-type: video-only -->` 声明开头，并明确引用 `video.mp4`。
+
 ```bash
 vmr query --dataset datasets/monitor \
   --wiki-set wiki_sets/monitor-dev-agentic.json \
-  --experiment results/bidirectional-codex-01 --jobs 4
+  --experiment results/agentic-cc-01 --jobs 4
 ```
+
+直接查询视频时，在配置中设置 `query.type: video-only`，然后省略 `--wiki-set`：
+
+```bash
+vmr query --config configs/query/video-only.yaml \
+  --dataset datasets/monitor \
+  --video-root /path/to/videos \
+  --experiment results/video-only-cc-01 --jobs 4
+```
+
+上例使用仓库提供的 [video-only 配置](configs/query/video-only.yaml)，其中明确设置了 `query.templates.agents` 和 `query.templates.prompt`，并继承 base 配置中的 Agent 设置。`--video-root` 必须指向数据集视频所在目录，`videos.jsonl` 中的所有 `video_path` 必须位于该目录内。Harness 先验证并复制当前查询的视频到 `/tmp` 下随机命名的私有 workspace（macOS 上解析为 `/private/tmp`），再将其随 workspace 只读挂载为容器中的 `/workspace/video.mp4`；原视频路径不进入容器。预测时长上限取视频容器时长与数据集标注时长的较小值，与 Wiki 查询一致。`task.json`、`AGENTS.md` 和 `output/` 仍用于传递查询、指令和接收结果。
 
 切换构建方法只需切换 WikiSet。`--query-id` 可以只执行一条查询。`query.input_mode: text` 只复制 manifest 的 `text_files`；`multimodal` 额外复制 `multimodal_files`。路径使用显式文件列表，不支持 glob。
 
-每条 Query 使用独立 workspace 和 Agent 进程，真实 video/query/split ID 通过 HMAC 别名隐藏；只将 `public/` 的声明文件提供给 Agent。运行前、复制后和接受结果前检查完整性，保持严格 Prediction 校验与失败分类。源 Artifact 不会被修改。
+每条 Query 使用独立 workspace 和 Agent 进程，真实 video/query/split ID 通过 HMAC 别名隐藏。`video-wiki` 只将 `public/` 的声明文件提供给 Agent；`video-only` 只提供当前查询对应的经哈希校验的视频副本。运行前和接受结果前检查输入完整性，保持相同的 Prediction 校验、失败分类、stdout/stderr 和 trace 输出。
 
-实验 pin WikiSet、Artifact IDs、manifest hashes、Query 配置、模板和执行代码；构建配置不参与 Query resume。成功记录校验后复用，失败记录保留历史并重试。旧实验不能直接 resume 为新版实验，必须使用新目录。
+`video-wiki` 实验 pin WikiSet、Artifact IDs 和 manifest hashes；`video-only` 实验 pin 原视频哈希。两者都 pin Query 配置、模板和执行代码；构建配置不参与 Query resume。成功记录校验后复用，失败记录保留历史并重试。旧实验不能直接 resume 为新版实验，必须使用新目录。
 
 ## Evaluate
 
 ```bash
 vmr evaluate --dataset datasets/monitor \
-  --experiment results/bidirectional-codex-01
+  --experiment results/agentic-cc-01
 ```
 
 生成 `predictions.jsonl`、provenance sidecar 和 `metrics.json`。evaluator 由 Adapter 声明，Monitor 使用 `generic`；保持原来的 evaluator 输入输出和全 split 分母，基础设施错误不会静默算成模型零分。仅 QVHighlights 数据集可通过 `--official-root /path/to/moment_detr` 改用官方 evaluator，需安装 `.[official]`。

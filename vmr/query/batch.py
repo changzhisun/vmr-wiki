@@ -124,7 +124,9 @@ def run_batch(experiment, *, jobs=1, query_id=None):
     old = signal.signal(signal.SIGINT, _handle_interrupt)
     bar = ProgressBar(
         len(experiment.queries),
-        desc="Querying artifacts",
+        desc="Querying videos"
+        if experiment.config.type == "video-only"
+        else "Querying artifacts",
         unit="queries",
         log_stream="stdout",
     )

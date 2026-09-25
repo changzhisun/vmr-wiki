@@ -3,9 +3,8 @@ FROM node:22-bookworm-slim
 # Explicit versions are required. Record the built image ID in experiment metadata.
 ARG CODEX_VERSION
 ARG CLAUDE_VERSION
-# ffmpeg and jq serve agentic ingest, which extracts its own frames. A query
-# agent cannot use them to re-extract anything: its workspace holds the frozen
-# wiki only, and no video is ever mounted into it.
+# ffmpeg and jq serve agentic ingest and raw-video queries. Wiki queries still
+# receive only their frozen public artifact.
 RUN test -n "$CODEX_VERSION" && test -n "$CLAUDE_VERSION" \
     && apt-get \
        -o Acquire::ForceIPv4=true \

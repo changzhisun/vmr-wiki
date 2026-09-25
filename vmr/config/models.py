@@ -33,16 +33,37 @@ class QueryConfig:
     egress_allowed_hosts: tuple[str, ...]
     base_url: str | None = None
     input_mode: str = "multimodal"
+    type: str = "video-wiki"
     max_predictions: int = 5
     timeout_sec: float = 600
-    agents_template: str = "query_agents.md"
-    prompt_template: str = "query_prompt.md"
-    text_agents_template: str = "query_agents_text_only.md"
-    text_prompt_template: str = "query_prompt_text_only.md"
+    agents_template: str | None = None
+    prompt_template: str | None = None
+    text_agents_template: str = "query_agents.video_wiki.text_only.md"
+    text_prompt_template: str = "query_prompt.video_wiki.text_only.md"
 
     def __post_init__(self):
         if self.input_mode not in ("text", "multimodal"):
             raise HarnessError("query.input_mode must be text or multimodal")
+        if self.type not in ("video-wiki", "video-only"):
+            raise HarnessError("query.type must be video-wiki or video-only")
+        if self.type == "video-only" and self.input_mode != "multimodal":
+            raise HarnessError("query.type video-only requires input_mode multimodal")
+        if self.agents_template is None:
+            object.__setattr__(
+                self,
+                "agents_template",
+                "query_agents.video_only.md"
+                if self.type == "video-only"
+                else "query_agents.video_wiki.md",
+            )
+        if self.prompt_template is None:
+            object.__setattr__(
+                self,
+                "prompt_template",
+                "query_prompt.video_only.md"
+                if self.type == "video-only"
+                else "query_prompt.video_wiki.md",
+            )
         positive_int(self.max_predictions, "max_predictions")
         if number(self.timeout_sec, "timeout_sec") <= 0:
             raise HarnessError("timeout_sec must be positive")

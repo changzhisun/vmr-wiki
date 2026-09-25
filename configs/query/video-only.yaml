@@ -1,0 +1,8 @@
+extends: base.yaml
+
+query:
+  type: video-only
+  timeout_sec: 1800
+  templates:
+    agents: query_agents.video_only.md
+    prompt: query_prompt.video_only.md

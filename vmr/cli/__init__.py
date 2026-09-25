@@ -41,7 +41,8 @@ def main(argv=None):
     query.add_argument(
         "--split", help="dataset split (default: dataset.split from the config)"
     )
-    query.add_argument("--wiki-set", required=True, type=Path)
+    query.add_argument("--wiki-set", type=Path)
+    query.add_argument("--video-root", type=Path)
     query.add_argument("--experiment", required=True, type=Path)
     query.add_argument("--query-id")
     query.add_argument("-j", "--jobs", type=int, default=1)
@@ -94,6 +95,7 @@ def main(argv=None):
             dataset=args.dataset,
             split=args.split or cfg.dataset.split,
             wiki_set=args.wiki_set,
+            video_root=args.video_root,
             root=args.experiment,
             templates=cfg.storage.templates,
             runs=cfg.storage.runs,

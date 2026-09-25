@@ -8,6 +8,9 @@ import pytest
 
 from agents.runner import AgentCancelled, DockerRunner, trace_path
 from harness.config import load_config
+from vmr.query.workspace import video_query_workspace
+from vmr.query.video import VideoSource
+from vmr.core.hashing import file_hash
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("VMR_TEST_DOCKER") != "1", reason="Docker integration is opt-in")
@@ -94,6 +97,46 @@ def test_actual_container_readonly_mounts_fresh_home_and_cli_flags(cfg, tmp_path
             adapter._remove_container(proxy)
             subprocess.run(["docker", "network", "rm", network],
                            capture_output=True, text=True)
+
+
+def test_actual_video_only_container_sees_one_readonly_video(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_API_KEY", "fake-key-no-api-call")
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video fixture")
+    source = VideoSource(video, file_hash(video), 3.0)
+
+    class VideoProbeRunner(DockerRunner):
+        def agent_command(self):
+            return ["python3", "-c", '''
+from pathlib import Path
+assert sorted(p.name for p in Path("/workspace").iterdir()) == ["AGENTS.md", "output", "task.json", "video.mp4"]
+assert Path("/workspace/video.mp4").read_bytes() == b"video fixture"
+assert not Path("/workspace/wiki").exists()
+assert "source.mp4" not in Path("/proc/self/mountinfo").read_text()
+try:
+    Path("/workspace/video.mp4").write_bytes(b"changed")
+except OSError:
+    pass
+else:
+    raise AssertionError("video mount is writable")
+Path("/workspace/output/prediction.json").write_text("{}")
+''']
+
+    runner = VideoProbeRunner(cfg)
+    with video_query_workspace(
+        {"query_id": "fixture"}, {"AGENTS.md": "video task"}, source
+    ) as workspace:
+        assert workspace.is_relative_to(Path("/tmp").resolve())
+        assert (workspace / "video.mp4").read_bytes() == b"video fixture"
+        result = runner.run(
+            workspace, "probe", tmp_path / "stdout", tmp_path / "stderr"
+        )
+        assert result.exit_code == 0, (tmp_path / "stderr").read_text()
+        assert (workspace / "output/prediction.json").read_text() == "{}"
+        assert (workspace / "video.mp4").read_bytes() == b"video fixture"
+    assert not workspace.exists()
+    assert video.read_bytes() == b"video fixture"
+    assert trace_path(tmp_path / "stdout").exists()
 
 
 def test_actual_timeout_removes_container(cfg, tmp_path, monkeypatch):

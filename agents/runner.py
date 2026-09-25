@@ -37,6 +37,7 @@ from vmr.runtime.trace import _event_label
 from vmr.runtime.trace import readable_trace
 from vmr.runtime.trace import redact_trace_line
 
+
 class _ContainerRunner:
     """Shared Docker lifecycle: the host repository, credentials directory, and
     Docker socket are never mounted, and the agent gets no direct network route."""
@@ -445,7 +446,7 @@ class _ContainerRunner:
 
 
 class DockerRunner(_ContainerRunner):
-    """Query agent: one frozen wiki in, one prediction out."""
+    """Query agent: one read-only input in, one prediction out."""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg

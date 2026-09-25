@@ -6,12 +6,12 @@ from vmr.core.jsonio import read_json, write_json
 from vmr.core.time import now
 from vmr.runtime.docker import AgentCancelled, trace_path
 from vmr.datasets.validation import validate_prediction
-from .workspace import query_workspace
+from .workspace import query_workspace, video_query_workspace
 from .prediction import clamp_prediction_ends
 
 
 class QueryEngine:
-    """Execute a single isolated query against pinned artifacts."""
+    """Execute a single isolated query against a pinned Wiki or video."""
 
     def __init__(
         self,
@@ -23,6 +23,7 @@ class QueryEngine:
         split,
         videos,
         wiki_set,
+        video_sources,
         metadata,
         templates,
         runtime,
@@ -31,6 +32,7 @@ class QueryEngine:
         self.config, self.root, self.runs = config, root, runs
         self.query_index, self.split, self.videos = query_index, split, videos
         self.wiki_set, self.metadata = wiki_set, metadata
+        self.video_sources = video_sources
         self.templates, self.runner, self.aliases = templates, runtime, aliases
 
     def run(self, query: dict, *, cancel_event=None) -> dict:
@@ -44,9 +46,15 @@ class QueryEngine:
         stdout_path = self.root / "logs" / f"{qid}.stdout.log"
         stderr_path = self.root / "logs" / f"{qid}.stderr.log"
         trace_file = trace_path(stdout_path)
-        artifact = self.wiki_set.artifact(query["video_id"])
-        if artifact.artifact_id() != self.metadata["artifacts"][query["video_id"]]:
-            raise HarnessError("Artifact changed after experiment initialization")
+        artifact = None
+        source = None
+        if self.wiki_set is not None:
+            artifact = self.wiki_set.artifact(query["video_id"])
+            if artifact.artifact_id() != self.metadata["artifacts"][query["video_id"]]:
+                raise HarnessError("Artifact changed after experiment initialization")
+        else:
+            source = self.video_sources[query["video_id"]]
+            source.verify()
         attempts, superseded = 1, []
         if metadata_path.exists():
             previous = read_json(metadata_path)
@@ -83,8 +91,11 @@ class QueryEngine:
                 path.unlink(missing_ok=True)
         elif prediction_path.exists():
             raise HarnessError(f"Prediction exists without run metadata: {qid}")
-        visible_duration = artifact.duration_sec()
-        duration = min(visible_duration, self.videos[query["video_id"]]["duration"])
+        duration = self.videos[query["video_id"]]["duration"]
+        if artifact is not None:
+            duration = min(artifact.duration_sec(), duration)
+        else:
+            duration = min(source.duration, duration)
         task = self.aliases.task(query, self.config.max_predictions, duration)
         # The secret lives in experiment.json only; per-run records do not repeat it.
         metadata = {
@@ -96,8 +107,6 @@ class QueryEngine:
                 "video_id": query["video_id"],
                 "task_query_id": task["query_id"],
                 "task_video_id": task["video_id"],
-                "artifact_id": artifact.artifact_id(),
-                "artifact_manifest_hash": artifact.manifest_hash(),
                 "trace_path": str(trace_file.relative_to(self.root)),
                 "effective_duration": duration,
                 "output_adjustments": [],
@@ -111,17 +120,29 @@ class QueryEngine:
                 "finished_at": None,
             }
         )
+        if artifact is not None:
+            metadata.update(
+                artifact_id=artifact.artifact_id(),
+                artifact_manifest_hash=artifact.manifest_hash(),
+            )
+        else:
+            metadata["video_hash"] = source.digest
         write_json(metadata_path, metadata)
         try:
             prediction = None
-            with query_workspace(
-                query,
-                task,
-                artifact,
-                self.templates,
-                self.runs,
-                text_only=self.config.input_mode == "text",
-            ) as workspace:
+            context = (
+                query_workspace(
+                    query,
+                    task,
+                    artifact,
+                    self.templates,
+                    self.runs,
+                    text_only=self.config.input_mode == "text",
+                )
+                if artifact is not None
+                else video_query_workspace(task, self.templates, source)
+            )
+            with context as workspace:
                 cancel = (
                     {"cancel_event": cancel_event} if cancel_event is not None else {}
                 )

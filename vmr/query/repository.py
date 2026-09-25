@@ -24,7 +24,9 @@ class RunRepository:
             path = self.root / "experiment.json"
             if path.exists():
                 saved = read_json(path)
-                if saved.get("version") != 3 or "artifacts" not in saved:
+                if saved.get("version") != 3 or not (
+                    "artifacts" in saved or "video_hashes" in saved
+                ):
                     raise HarnessError(
                         "Legacy experiment cannot resume; create a new experiment"
                     )

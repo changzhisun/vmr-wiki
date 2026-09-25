@@ -1,10 +1,11 @@
-"""Experiment identity pins artifacts and query inputs, never a build pipeline."""
+"""Experiment identity pins Wiki artifacts or raw videos and query inputs."""
 
 from pathlib import Path
 import subprocess
 from vmr.core.errors import HarnessError
 from vmr.core.hashing import object_hash, file_hash
 from vmr.artifact.wikiset import WikiSet
+from .video import video_sources
 from vmr.runtime.docker import query_runtime
 from vmr.runtime.protocol import AgentRuntime
 from vmr.datasets.manifest import load_dataset, select_split, load_query_inputs
@@ -21,7 +22,8 @@ class Experiment:
         *,
         dataset,
         split,
-        wiki_set,
+        wiki_set=None,
+        video_root=None,
         root,
         templates,
         runs,
@@ -35,20 +37,38 @@ class Experiment:
             self.dataset, self.split, metadata
         )
         self.query_index = {q["query_id"]: q for q in self.queries}
-        self.wiki_set = (
-            wiki_set if isinstance(wiki_set, WikiSet) else WikiSet.open(wiki_set)
-        )
-        if (self.wiki_set.data["dataset"], self.wiki_set.data["split"]) != (
-            metadata["name"],
-            self.split,
-        ):
-            raise HarnessError("WikiSet dataset/split mismatch")
-        if self.wiki_set.data["artifacts"].keys() != self.videos.keys():
-            raise HarnessError("WikiSet must contain exactly the selected split videos")
-        self.wiki_set.verify()
+        self.wiki_set = None
+        self.video_sources = None
+        self.video_root = None
+        if config.type == "video-wiki":
+            if wiki_set is None:
+                raise HarnessError("Wiki query requires --wiki-set")
+            self.wiki_set = (
+                wiki_set if isinstance(wiki_set, WikiSet) else WikiSet.open(wiki_set)
+            )
+            if (self.wiki_set.data["dataset"], self.wiki_set.data["split"]) != (
+                metadata["name"],
+                self.split,
+            ):
+                raise HarnessError("WikiSet dataset/split mismatch")
+            if self.wiki_set.data["artifacts"].keys() != self.videos.keys():
+                raise HarnessError(
+                    "WikiSet must contain exactly the selected split videos"
+                )
+            self.wiki_set.verify()
+        else:
+            if wiki_set is not None:
+                raise HarnessError("Video query does not use --wiki-set")
+            if video_root is None:
+                raise HarnessError("Video query requires --video-root")
+            self.video_root = Path(video_root).resolve()
+            self.video_sources = video_sources(
+                self.dataset, self.videos, self.video_root
+            )
         self.templates = load_query_templates(
             Path(templates),
             text_only=config.input_mode == "text",
+            query_type=config.type,
             templates={
                 "agents": config.agents_template,
                 "prompt": config.prompt_template,
@@ -65,6 +85,7 @@ class Experiment:
             for d in (
                 "vmr/query",
                 "vmr/runtime",
+                "vmr/media",
                 "vmr/artifact",
                 "vmr/core",
                 "vmr/datasets",
@@ -83,6 +104,7 @@ class Experiment:
         )
         self.metadata = dict(
             version=3,
+            query_type=config.type,
             dataset=metadata["name"],
             split=self.split,
             agent=config.agent,
@@ -93,11 +115,22 @@ class Experiment:
             dataset_hash=object_hash(metadata),
             videos_hash=object_hash(self.videos),
             queries_hash=object_hash(self.queries),
-            wiki_set_hash=self.wiki_set.fingerprint(),
-            artifacts=dict(self.wiki_set.data["artifacts"]),
-            artifact_manifest_hashes=dict(self.wiki_set.data["manifest_hashes"]),
             runtime=self.runner.provenance,
         )
+        if self.wiki_set is not None:
+            self.metadata.update(
+                wiki_set_hash=self.wiki_set.fingerprint(),
+                artifacts=dict(self.wiki_set.data["artifacts"]),
+                artifact_manifest_hashes=dict(self.wiki_set.data["manifest_hashes"]),
+            )
+        else:
+            self.metadata["video_hashes"] = {
+                vid: source.digest for vid, source in self.video_sources.items()
+            }
+            self.metadata["video_durations"] = {
+                vid: source.duration for vid, source in self.video_sources.items()
+            }
+            self.metadata["video_root"] = str(self.video_root)
         # Git commit is provenance, not an execution dependency on compiler edits.
         self.snapshot = dict(
             schema_version=1,
@@ -120,6 +153,7 @@ class Experiment:
             split=self.split,
             videos=self.videos,
             wiki_set=self.wiki_set,
+            video_sources=self.video_sources,
             metadata=self.metadata,
             templates=self.templates,
             runtime=self.runner,

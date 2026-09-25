@@ -24,12 +24,13 @@ profiles:
     - api.anthropic.com
 query:
   kind: claude_code
+  type: video-wiki  # video-wiki | video-only；video-only 不需要 --wiki-set
   input_mode: multimodal
   max_predictions: 5
   timeout_sec: 600
   templates:
-    agents: query_agents.md
-    prompt: query_prompt.md
+    agents: query_agents.video_wiki.md
+    prompt: query_prompt.video_wiki.md
     text:
-      agents: query_agents_text_only.md
-      prompt: query_prompt_text_only.md
+      agents: query_agents.video_wiki.text_only.md
+      prompt: query_prompt.video_wiki.text_only.md
